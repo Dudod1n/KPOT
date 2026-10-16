@@ -63,13 +63,16 @@ def chunk(kind, data):
         '>I', zlib.crc32(kind + data))
 
 
-def png(size):
-    rows = b''.join(b'\0' + b''.join(
+def scanlines(size):
+    return b''.join(b'\0' + b''.join(
         bytes(PALETTE[PIXELS[y * 16 // size][x * 16 // size]])
         for x in range(size)) for y in range(size))
+
+
+def png(size):
     return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack(
         '>2I5B', size, size, 8, 6, 0, 0, 0))
-        + chunk(b'IDAT', zlib.compress(rows, 9)) + chunk(b'IEND', b''))
+        + chunk(b'IDAT', zlib.compress(scanlines(size), 9)) + chunk(b'IEND', b''))
 
 
 def svg():
@@ -126,6 +129,7 @@ def validate_png(data, size):
     assert len(raw) == size * (size * 4 + 1), 'Invalid PNG pixel count'
     assert all(raw[y * (size * 4 + 1)] == 0 for y in range(size)), 'Invalid PNG filter'
     assert raw[1:5] == bytes(4), 'Icon background must be transparent'
+    assert raw == scanlines(size), 'Icon pixels are out of date'
 
 
 def validate_ico(data):
@@ -155,7 +159,13 @@ def main():
     for name, content in assets.items():
         path = ROOT / 'assets' / name
         if args.check:
-            assert path.read_bytes() == content, f'{path} is out of date; run scripts/build_icons.py'
+            stored = path.read_bytes()
+            if name.endswith('.png'):
+                validate_png(stored, 256 if name == 'krot.png' else 32)
+            elif name.endswith('.ico'):
+                validate_ico(stored)
+            else:
+                assert stored == content, f'{path} is out of date; run scripts/build_icons.py'
         else:
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(content)
