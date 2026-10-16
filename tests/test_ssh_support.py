@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest.mock import Mock
 
-from ssh_support import Client, Config, Endpoint, Store, Tunnel, _metadata, _receive_line
+from ssh_support import Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _metadata, _receive_line
 
 
 class FixtureTests(unittest.TestCase):
@@ -99,6 +99,41 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(result, ValueError)
                 else:
                     self.assertEqual(result, expected)
+
+
+class ListenerTests(unittest.IsolatedAsyncioTestCase):
+    assert_closed = SSHFixtures.assert_closed
+
+    async def close_connection(self, reader, writer):
+        self.connected.set()
+        writer.close()
+        await writer.wait_closed()
+
+    async def test_listener_close_can_finish_after_the_first_probe(self):
+        self.connected = asyncio.Event()
+        server = await asyncio.start_server(self.close_connection, '127.0.0.1', 0)
+        port = server.sockets[0].getsockname()[1]
+
+        async def stop_after_probe():
+            await self.connected.wait()
+            server.close()
+            await server.wait_closed()
+
+        stopping = asyncio.create_task(stop_after_probe())
+        try:
+            await self.assert_closed(port)
+            await stopping
+        finally:
+            server.close()
+            await server.wait_closed()
+            stopping.cancel()
+            await asyncio.gather(stopping, return_exceptions=True)
+
+    async def test_persistent_listener_is_rejected(self):
+        self.connected = asyncio.Event()
+        async with await asyncio.start_server(self.close_connection, '127.0.0.1', 0) as server:
+            with self.assertRaisesRegex(AssertionError, 'still open'):
+                await self.assert_closed(server.sockets[0].getsockname()[1])
 
 
 if __name__ == '__main__':

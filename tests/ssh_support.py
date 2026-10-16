@@ -3,6 +3,7 @@
 Configuration objects only describe test input; the Rust executable validates it.
 """
 import asyncio
+import contextlib
 from dataclasses import asdict, dataclass, field
 import hmac
 import json
@@ -252,9 +253,16 @@ class SSHFixtures:
 
     async def assert_closed(self, port):
         try:
-            _, writer = await asyncio.open_connection('127.0.0.1', port)
-        except OSError:
-            return
-        writer.close()
-        await writer.wait_closed()
-        self.fail(f'Listener on port {port} is still open')
+            # Remote teardown completes after SSH disconnect reaches the test server.
+            async with asyncio.timeout(3):
+                while True:
+                    try:
+                        _, writer = await asyncio.open_connection('127.0.0.1', port)
+                    except OSError:
+                        return
+                    writer.close()
+                    with contextlib.suppress(OSError):
+                        await writer.wait_closed()
+                    await asyncio.sleep(.025)
+        except TimeoutError:
+            self.fail(f'Listener on port {port} is still open')
