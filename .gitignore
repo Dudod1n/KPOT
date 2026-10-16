@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.spec
+.local/
+target/
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+/tunnels.json
+/tunnels.json.*

@@ -1,0 +1,14 @@
+Embedded fonts from epaint_default_fonts 0.33.3
+
+Hack-Regular.ttf: Copyright (c) 2018 Source Foundry Authors;
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
+License: MIT and Bitstream Vera; see Hack-Regular.txt.
+
+NotoEmoji-Regular.ttf: Copyright 2013 Google Inc. All Rights Reserved.
+License: SIL Open Font License 1.1; see OFL.txt.
+
+Ubuntu-Light.ttf: Copyright 2011 Canonical Ltd.
+License: Ubuntu Font Licence 1.0; see UFL.txt.
+
+emoji-icon-font.ttf: Copyright (c) 2014 John Slegers.
+License: MIT; see emoji-icon-font-mit-license.txt.

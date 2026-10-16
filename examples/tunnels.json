@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "settings": {
+    "theme": "dark",
+    "motion": true,
+    "splash": true
+  },
+  "tunnels": [
+    {
+      "id": "71b39abbe9c046c68c0bda7ff492a917",
+      "name": "Database",
+      "kind": "L",
+      "server": {
+        "host": "ssh.example.com",
+        "port": 22,
+        "user": "deploy",
+        "auth": "agent",
+        "key": "~/.ssh/id_ed25519"
+      },
+      "bind": "127.0.0.1",
+      "port": 15432,
+      "target": "127.0.0.1",
+      "target_port": 5432,
+      "reconnect": true,
+      "jumps_enabled": false,
+      "jumps": [],
+      "enabled": false
+    }
+  ]
+}
