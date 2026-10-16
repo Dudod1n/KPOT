@@ -57,7 +57,31 @@ enum Command {
     ApplyUpdate { manifest: PathBuf },
 }
 
+#[cfg(windows)]
+fn disable_stdio_inheritance() -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation},
+        System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+    };
+    // Detached children must not keep a caller's redirected pipes open.
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(stream) };
+        if !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            anyhow::bail!(
+                "Не удалось настроить ввод и вывод: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
+    #[cfg(windows)]
+    disable_stdio_inheritance()?;
     let args = Args::parse();
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
