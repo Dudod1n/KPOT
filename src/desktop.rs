@@ -96,7 +96,7 @@ pub(crate) fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(crate::icons::app_icon())
-            .with_inner_size([1000.0, 720.0])
+            .with_inner_size([1000.0, 800.0])
             .with_min_inner_size([700.0, 500.0]),
         ..Default::default()
     }
@@ -2670,6 +2670,36 @@ mod tests {
         changed.verified = true;
         assert!(changed.may_accept());
         assert_eq!(changed.answer(), Value::Bool(true));
+    }
+    #[test]
+    fn default_window_shows_last_form_row_and_buttons_without_scrolling() {
+        let size = native_options().viewport.inner_size.unwrap();
+        for editing in [false, true] {
+            let ctx = egui::Context::default();
+            configure(&ctx, "dark");
+            let mut app = Desktop::new(None, true);
+            app.snapshot = Some(snapshot());
+            app.initialized = true;
+            app.dialog = Some(Dialog::Form(Box::new(TunnelForm::new(
+                editing.then(tunnel),
+            ))));
+            for _ in 0..10 {
+                render(&mut app, &ctx, size.into());
+            }
+            let output = render(&mut app, &ctx, size.into());
+            for label in ["Подключаться через jump-хосты", "Отмена", "Сохранить"]
+            {
+                let rect = text_rect(&output, label).unwrap_or_else(|| panic!("Missing {label}"));
+                assert!(
+                    output.shapes.iter().any(|shape| {
+                        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+                            && shape.clip_rect.contains_rect(rect)
+                    }),
+                    "{label} is clipped at the default window size: {rect:?}"
+                );
+                assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect));
+            }
+        }
     }
     #[test]
     fn native_views_render_headlessly_at_minimum_window_size() {
