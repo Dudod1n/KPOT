@@ -70,7 +70,10 @@ def package(tag, builds, output, notes_path):
             with tarfile.open(output / f'krot-{version}-linux-x64.tar.gz', 'w:gz') as archive:
                 prefix = f'krot-{version}/'
                 for path, name in files:
-                    archive.add(path, arcname=prefix + name)
+                    entry = archive.gettarinfo(path, arcname=prefix + name)
+                    entry.mode = 0o755 if name in ('krot', 'krot-cli') else 0o644
+                    with path.open('rb') as content:
+                        archive.addfile(entry, content)
                 content = readme.encode('utf-8')
                 entry = tarfile.TarInfo(prefix + 'README.txt')
                 entry.size, entry.mode = len(content), 0o644

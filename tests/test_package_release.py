@@ -34,7 +34,8 @@ class PackageTests(unittest.TestCase):
                 for name in ['krot', 'krot-cli']:
                     (source / (name + suffix)).write_bytes((runner + name).encode())
                 (source / 'THIRD_PARTY_NOTICES.txt').write_text(runner + ' licenses')
-            with patch.object(packager, 'ROOT', root):
+            # Windows chmod does not set Unix executable permission bits.
+            with patch.object(packager, 'ROOT', root), patch.object(Path, 'chmod'):
                 packager.package('v1.2.3', builds, output, notes)
             self.assertEqual(notes.read_text(), '### Fixed\n- Port cleanup.\n')
             self.assertEqual(len(list(output.iterdir())), 10)
