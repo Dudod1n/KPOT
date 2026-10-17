@@ -61,7 +61,7 @@ pub(crate) fn build(
         no_splash,
     );
     if check_updates {
-        desktop.check_updates(ctx);
+        desktop.check_updates(ctx, false);
     }
     Box::new(desktop)
 }
@@ -96,7 +96,7 @@ pub(crate) fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(crate::icons::app_icon())
-            .with_inner_size([1000.0, 720.0])
+            .with_inner_size([1000.0, 800.0])
             .with_min_inner_size([700.0, 500.0]),
         ..Default::default()
     }
@@ -249,7 +249,10 @@ enum Event {
     AutostartLoaded(Result<bool, String>),
     AutostartChanged(Result<bool, String>),
     ClosePreferenceSaved(Result<(), String>),
-    UpdateChecked(Option<crate::update::Release>),
+    UpdateChecked {
+        manual: bool,
+        result: Result<Option<crate::update::Release>, String>,
+    },
     UpdateSkipped(Result<(), String>),
     UpdatePrepared(Result<crate::update::PreparedUpdate, String>),
     InstallerLaunched(Result<(), String>),
@@ -262,8 +265,15 @@ enum UpdateStage {
     Launching,
     Failed(String),
 }
+enum UpdateCheck {
+    Idle,
+    Checking,
+    Current,
+    Failed,
+}
 struct UpdateDialog {
     release: crate::update::Release,
+    manual: bool,
     stage: UpdateStage,
     error: String,
 }
@@ -297,7 +307,8 @@ pub(crate) struct Desktop {
     allow_close: bool,
     shutdown_busy: bool,
     applied_theme: String,
-    pending_update: Option<crate::update::Release>,
+    pending_update: Option<(crate::update::Release, bool)>,
+    update_check: UpdateCheck,
     update: Option<UpdateDialog>,
     pending_operations: usize,
 }
@@ -510,18 +521,28 @@ impl Desktop {
             shutdown_busy: false,
             applied_theme: "dark".into(),
             pending_update: None,
+            update_check: UpdateCheck::Idle,
             update: None,
             pending_operations: 0,
         }
     }
-    fn check_updates(&mut self, ctx: &egui::Context) {
+    fn check_updates(&mut self, ctx: &egui::Context, manual: bool) {
+        if matches!(self.update_check, UpdateCheck::Checking) || self.update.is_some() {
+            return;
+        }
         let Some(backend) = &self.backend else {
             return;
         };
+        self.update_check = UpdateCheck::Checking;
+        if manual {
+            self.pending_update = None;
+        }
         let (store, tx, ctx) = (backend.store.clone(), self.tx.clone(), ctx.clone());
         backend.runtime.spawn(async move {
-            let release = crate::update::check(&store).await.ok().flatten();
-            let _ = tx.send(Event::UpdateChecked(release));
+            let result = crate::update::check(&store, manual)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(Event::UpdateChecked { manual, result });
             ctx.request_repaint();
         });
     }
@@ -572,7 +593,20 @@ impl Desktop {
     fn drain(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                Event::UpdateChecked(release) => self.pending_update = release,
+                Event::UpdateChecked { manual, result } => {
+                    self.update_check = UpdateCheck::Idle;
+                    match result {
+                        Ok(Some(release)) => {
+                            self.pending_update = Some((release, manual));
+                            if manual && matches!(self.dialog, Some(Dialog::Help)) {
+                                self.dialog = None;
+                            }
+                        }
+                        Ok(None) if manual => self.update_check = UpdateCheck::Current,
+                        Err(_) if manual => self.update_check = UpdateCheck::Failed,
+                        _ => {}
+                    }
+                }
                 Event::UpdateSkipped(result) => {
                     if result.is_ok() {
                         self.update = None;
@@ -843,7 +877,7 @@ impl Desktop {
         let Some(Dialog::Settings(settings)) = &mut self.dialog else {
             return;
         };
-        if settings.autostart == settings.initial_autostart {
+        if settings.autostart == settings.initial_autostart && settings.autostart != Some(true) {
             self.dialog = None;
             return;
         }
@@ -859,7 +893,7 @@ impl Desktop {
         backend.runtime.spawn_blocking(move || {
             let result = crate::autostart::set_enabled(&path, enabled)
                 .map(|_| enabled)
-                .map_err(|error| format!("Настройки сохранены. Автозапуск не изменён: {error}"));
+                .map_err(|error| format!("Настройки сохранены. Ошибка автозапуска: {error}"));
             let _ = tx.send(Event::AutostartChanged(result));
             ctx.request_repaint();
         });
@@ -1346,7 +1380,22 @@ impl Desktop {
                 }
                 Dialog::Help => {
                     ui.heading("Справка");
-                    egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| { ui.label(HELP); });
+                    egui::ScrollArea::vertical().max_height((max_height - 100.0).max(80.0)).show(ui, |ui| { ui.label(HELP); });
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(!matches!(self.update_check, UpdateCheck::Checking), egui::Button::new("Проверить обновление")).clicked() {
+                            action = DialogAction::CheckUpdates;
+                        }
+                        if matches!(self.update_check, UpdateCheck::Checking) {
+                            ui.spinner();
+                            ui.label("Проверяем обновления…");
+                        }
+                    });
+                    match self.update_check {
+                        UpdateCheck::Current => { ui.label("Обновлений нет."); }
+                        UpdateCheck::Failed => { ui.colored_label(tone(ui, RED), "Не удалось проверить обновления. Проверьте подключение к сети и повторите попытку."); }
+                        _ => {}
+                    }
                     if ui.button("Назад").clicked() { action = DialogAction::Close; }
                 }
                 Dialog::Splash => { action = self.splash_view(ui, max_height); }
@@ -1373,6 +1422,10 @@ impl Desktop {
         }
         match action {
             DialogAction::None => self.dialog = Some(dialog),
+            DialogAction::CheckUpdates => {
+                self.dialog = Some(dialog);
+                self.check_updates(ctx, true);
+            }
             DialogAction::Close => {
                 if matches!(&dialog, Dialog::Form(form) if form.dirty()) {
                     self.confirm = Some(Confirm::Discard {
@@ -1753,10 +1806,11 @@ impl Desktop {
             && !self.close_busy()
             && self.busy_tunnels.is_empty()
             && self.pending_operations == 0
-            && let Some(release) = self.pending_update.take()
+            && let Some((release, manual)) = self.pending_update.take()
         {
             self.update = Some(UpdateDialog {
                 release,
+                manual,
                 stage: UpdateStage::Offer,
                 error: String::new(),
             });
@@ -1781,7 +1835,8 @@ impl Desktop {
                         if ui.button("Обновить").clicked() {
                             choice = 1;
                         }
-                        if ui.button("Пропустить версию").clicked() {
+                        if !update.manual && ui.button("Пропустить версию").clicked()
+                        {
                             choice = 2;
                         }
                         if ui.button("Позже").clicked() {
@@ -1876,6 +1931,7 @@ enum DialogAction {
     Close,
     SaveForm(bool),
     SaveSettings,
+    CheckUpdates,
     Answer,
     CancelPrompt,
     Resolve(String),
@@ -2208,6 +2264,166 @@ mod tests {
         }
     }
     #[test]
+    fn manual_update_check_reports_no_updates_and_can_be_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.json")).unwrap();
+        let mut app = desktop_for_store(&store);
+        app.snapshot = Some(snapshot());
+        app.dialog = Some(Dialog::Help);
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        for _ in 0..10 {
+            render(&mut app, &ctx, [700.0, 500.0]);
+        }
+        click_label(&mut app, &ctx, "Проверить обновление");
+        app.tx
+            .send(Event::UpdateChecked {
+                manual: true,
+                result: Ok(None),
+            })
+            .unwrap();
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "Обновлений нет.").is_some());
+        assert!(app.update.is_none());
+        assert!(matches!(app.dialog, Some(Dialog::Help)));
+        click_label(&mut app, &ctx, "Проверить обновление");
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "Обновлений нет.").is_none());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+    #[test]
+    fn manual_update_check_reports_failure_instead_of_no_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.json")).unwrap();
+        let mut app = desktop_for_store(&store);
+        app.snapshot = Some(snapshot());
+        app.dialog = Some(Dialog::Help);
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        for _ in 0..10 {
+            render(&mut app, &ctx, [700.0, 500.0]);
+        }
+        click_label(&mut app, &ctx, "Проверить обновление");
+        app.tx
+            .send(Event::UpdateChecked {
+                manual: true,
+                result: Err("unsafe technical detail".into()),
+            })
+            .unwrap();
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(
+            text_rect(
+                &output,
+                "Не удалось проверить обновления. Проверьте подключение к сети и повторите попытку."
+            )
+            .is_some()
+        );
+        assert!(text_rect(&output, "Обновлений нет.").is_none());
+        assert!(text_rect(&output, "unsafe technical detail").is_none());
+        assert!(!matches!(app.update_check, UpdateCheck::Checking));
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        for label in ["Назад", "Проверить обновление"] {
+            assert!(
+                ctx.content_rect()
+                    .contains_rect(text_rect(&output, label).unwrap())
+            );
+        }
+    }
+    #[test]
+    fn manual_update_offer_shows_version_and_later_preserves_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.json")).unwrap();
+        crate::update::skip_version(&store, "0.6.0").unwrap();
+        let original = std::fs::read(store.sidecar(".updates.json")).unwrap();
+        let mut app = desktop_for_store(&store);
+        app.snapshot = Some(snapshot());
+        app.dialog = Some(Dialog::Help);
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        for _ in 0..10 {
+            render(&mut app, &ctx, [700.0, 500.0]);
+        }
+        click_label(&mut app, &ctx, "Проверить обновление");
+        app.tx
+            .send(Event::UpdateChecked {
+                manual: true,
+                result: Ok(Some(crate::update::Release::for_test("0.6.0"))),
+            })
+            .unwrap();
+        render(&mut app, &ctx, [700.0, 500.0]);
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        for label in ["Доступен КРОТ 0.6.0", "Обновить", "Позже"] {
+            let rect = text_rect(&output, label).unwrap();
+            assert!(ctx.content_rect().contains_rect(rect), "{label}");
+        }
+        assert!(text_rect(&output, "Пропустить версию").is_none());
+        assert!(app.dialog.is_none());
+        click_label(&mut app, &ctx, "Позже");
+        assert!(app.update.is_none());
+        assert_eq!(
+            std::fs::read(store.sidecar(".updates.json")).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn manual_update_result_preserves_a_form_opened_while_checking() {
+        let ctx = egui::Context::default();
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        let mut form = TunnelForm::new(Some(tunnel()));
+        form.draft.name = "unsaved".into();
+        app.dialog = Some(Dialog::Form(Box::new(form)));
+        app.tx
+            .send(Event::UpdateChecked {
+                manual: true,
+                result: Ok(Some(crate::update::Release::for_test("0.6.0"))),
+            })
+            .unwrap();
+        render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(matches!(&app.dialog, Some(Dialog::Form(form)) if form.draft.name == "unsaved"));
+        assert!(app.pending_update.is_some());
+        assert!(app.update.is_none());
+        app.dialog = None;
+        render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(app.update.as_ref().is_some_and(|update| update.manual));
+    }
+    #[test]
+    fn saving_enabled_autostart_refreshes_registration_and_shows_failure() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        app.dialog = Some(Dialog::Settings(SettingsDraft {
+            theme: "dark".into(),
+            motion: true,
+            splash: true,
+            autostart: Some(true),
+            initial_autostart: Some(true),
+            error: String::new(),
+            busy: true,
+        }));
+        for _ in 0..3 {
+            render(&mut app, &ctx, [700.0, 500.0]);
+        }
+        app.tx
+            .send(Event::Complete(Operation::Settings, Ok(())))
+            .unwrap();
+        app.tx
+            .send(Event::AutostartChanged(Err(
+                "Не удалось обновить путь автозапуска.".into(),
+            )))
+            .unwrap();
+        render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(
+            matches!(&app.dialog, Some(Dialog::Settings(settings)) if !settings.busy && !settings.error.is_empty())
+        );
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "Не удалось обновить путь автозапуска.").is_some());
+        assert!(matches!(&app.dialog, Some(Dialog::Settings(settings)) if !settings.busy));
+        assert!(!has_close(&output));
+    }
+    #[test]
     fn update_offer_waits_for_a_dirty_form_and_later_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().join("config.json")).unwrap();
@@ -2217,9 +2433,10 @@ mod tests {
         form.draft.name = "unsaved".into();
         app.dialog = Some(Dialog::Form(Box::new(form)));
         app.tx
-            .send(Event::UpdateChecked(Some(
-                crate::update::Release::for_test("0.6.0"),
-            )))
+            .send(Event::UpdateChecked {
+                manual: false,
+                result: Ok(Some(crate::update::Release::for_test("0.6.0"))),
+            })
             .unwrap();
         let ctx = egui::Context::default();
         configure(&ctx, "dark");
@@ -2258,14 +2475,14 @@ mod tests {
             let mut app = Desktop::new(None, true);
             app.snapshot = Some(snapshot());
             app.dialog = dialog;
-            app.pending_update = Some(crate::update::Release::for_test("0.6.0"));
+            app.pending_update = Some((crate::update::Release::for_test("0.6.0"), false));
             let output = render(&mut app, &ctx, [700.0, 500.0]);
             assert!(text_rect(&output, "Доступен КРОТ 0.6.0").is_none());
             assert!(app.pending_update.is_some());
         }
         let mut app = Desktop::new(None, true);
         app.snapshot = Some(snapshot());
-        app.pending_update = Some(crate::update::Release::for_test("0.6.0"));
+        app.pending_update = Some((crate::update::Release::for_test("0.6.0"), false));
         app.confirm = Some(Confirm::Delete {
             id: "native-tunnel".into(),
             name: "postgres".into(),
@@ -2285,7 +2502,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = Desktop::new(None, true);
         app.snapshot = Some(snapshot());
-        app.pending_update = Some(crate::update::Release::for_test("0.6.0"));
+        app.pending_update = Some((crate::update::Release::for_test("0.6.0"), false));
         render(&mut app, &ctx, [700.0, 500.0]);
         click_label(&mut app, &ctx, "Обновить");
         assert!(matches!(
@@ -2319,7 +2536,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = desktop_for_store(&store);
         app.snapshot = Some(snapshot());
-        app.pending_update = Some(crate::update::Release::for_test("0.6.0"));
+        app.pending_update = Some((crate::update::Release::for_test("0.6.0"), false));
         render(&mut app, &ctx, [700.0, 500.0]);
         click_label(&mut app, &ctx, "Пропустить версию");
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -2332,7 +2549,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(store.sidecar(".updates.json")).unwrap())
                 .unwrap();
         assert_eq!(saved["skipped_version"], "0.6.0");
-        app.pending_update = Some(crate::update::Release::for_test("0.7.0"));
+        app.pending_update = Some((crate::update::Release::for_test("0.7.0"), false));
         render(&mut app, &ctx, [700.0, 500.0]);
         app.tx
             .send(Event::UpdateSkipped(Err("unsafe technical detail".into())))
@@ -2362,6 +2579,7 @@ mod tests {
             app.snapshot = Some(snapshot());
             app.update = Some(UpdateDialog {
                 release: crate::update::Release::for_test("0.6.0"),
+                manual: false,
                 stage,
                 error: String::new(),
             });
@@ -2388,14 +2606,19 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = Desktop::new(None, true);
         app.snapshot = Some(snapshot());
-        app.tx.send(Event::UpdateChecked(None)).unwrap();
+        app.tx
+            .send(Event::UpdateChecked {
+                manual: false,
+                result: Ok(None),
+            })
+            .unwrap();
         let output = render(&mut app, &ctx, [700.0, 500.0]);
         assert!(app.pending_update.is_none());
         assert!(app.update.is_none());
         assert!(app.dialog.is_none());
         assert!(app.error.is_empty());
         assert!(!has_close(&output));
-        app.check_updates(&ctx);
+        app.check_updates(&ctx, false);
         assert!(app.rx.try_recv().is_err());
     }
     #[test]
@@ -2670,6 +2893,36 @@ mod tests {
         changed.verified = true;
         assert!(changed.may_accept());
         assert_eq!(changed.answer(), Value::Bool(true));
+    }
+    #[test]
+    fn default_window_shows_last_form_row_and_buttons_without_scrolling() {
+        let size = native_options().viewport.inner_size.unwrap();
+        for editing in [false, true] {
+            let ctx = egui::Context::default();
+            configure(&ctx, "dark");
+            let mut app = Desktop::new(None, true);
+            app.snapshot = Some(snapshot());
+            app.initialized = true;
+            app.dialog = Some(Dialog::Form(Box::new(TunnelForm::new(
+                editing.then(tunnel),
+            ))));
+            for _ in 0..10 {
+                render(&mut app, &ctx, size.into());
+            }
+            let output = render(&mut app, &ctx, size.into());
+            for label in ["Подключаться через jump-хосты", "Отмена", "Сохранить"]
+            {
+                let rect = text_rect(&output, label).unwrap_or_else(|| panic!("Missing {label}"));
+                assert!(
+                    output.shapes.iter().any(|shape| {
+                        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+                            && shape.clip_rect.contains_rect(rect)
+                    }),
+                    "{label} is clipped at the default window size: {rect:?}"
+                );
+                assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect));
+            }
+        }
     }
     #[test]
     fn native_views_render_headlessly_at_minimum_window_size() {
@@ -2986,6 +3239,7 @@ mod tests {
                 app.snapshot = Some(snapshot());
                 app.update = Some(UpdateDialog {
                     release: crate::update::Release::for_test("0.6.0"),
+                    manual: false,
                     stage,
                     error: String::new(),
                 });

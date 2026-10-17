@@ -1,0 +1,14 @@
+/src/ssh.rs @Dudod1n
+/src/background.rs @Dudod1n
+/src/config.rs @Dudod1n
+/src/update.rs @Dudod1n
+/src/autostart.rs @Dudod1n
+/Cargo.toml @Dudod1n
+/Cargo.lock @Dudod1n
+/build.rs @Dudod1n
+/scripts/package_release.py @Dudod1n
+/scripts/collect_licenses.py @Dudod1n
+/.github/ @Dudod1n
+/SECURITY.md @Dudod1n
+/REVIEW.md @Dudod1n
+/docs/RELEASING.md @Dudod1n

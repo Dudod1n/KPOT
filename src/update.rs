@@ -155,8 +155,10 @@ async fn fetch_release(
     client: &reqwest::Client,
     endpoint: &str,
     current: &str,
-    skip: Option<&str>,
+    store: &Store,
+    manual: bool,
 ) -> Result<Option<Release>> {
+    let skip = if manual { None } else { skipped(store)? };
     let response = client
         .get(endpoint)
         .header("Accept", "application/vnd.github+json")
@@ -167,16 +169,10 @@ async fn fetch_release(
         return Ok(None);
     }
     let data = bounded_body(response.error_for_status()?, MAX_METADATA).await?;
-    parse_release(&data, current, skip)
+    parse_release(&data, current, skip.as_deref())
 }
-pub async fn check(store: &Store) -> Result<Option<Release>> {
-    fetch_release(
-        &client()?,
-        LATEST,
-        env!("CARGO_PKG_VERSION"),
-        skipped(store)?.as_deref(),
-    )
-    .await
+pub async fn check(store: &Store, manual: bool) -> Result<Option<Release>> {
+    fetch_release(&client()?, LATEST, env!("CARGO_PKG_VERSION"), store, manual).await
 }
 fn asset_digest(asset: &Asset) -> Result<String> {
     ensure!(
@@ -947,8 +943,36 @@ mod network_tests {
         (url, task)
     }
     #[tokio::test]
+    async fn manual_check_finds_skipped_version_without_changing_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.json")).unwrap();
+        skip_version(&store, "0.6.0").unwrap();
+        let original = fs::read(store.sidecar(".updates.json")).unwrap();
+        let client = client().unwrap();
+        for manual in [false, true] {
+            let (url, server) = response(
+                200,
+                br#"{"tag_name":"v0.6.0","draft":false,"prerelease":false,"assets":[]}"#,
+                None,
+            )
+            .await;
+            let result = fetch_release(&client, &url, "0.5.0", &store, manual)
+                .await
+                .unwrap();
+            if manual {
+                assert_eq!(result.unwrap().version, "0.6.0");
+            } else {
+                assert!(result.is_none());
+            }
+            server.await.unwrap();
+        }
+        assert_eq!(fs::read(store.sidecar(".updates.json")).unwrap(), original);
+    }
+    #[tokio::test]
     async fn network_statuses_and_size_limit() {
         let client = client().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.json")).unwrap();
         for (status, body, declared, expected) in [
             (404, b"private".as_slice(), None, 0),
             (403, b"rate limited".as_slice(), None, -1),
@@ -964,7 +988,7 @@ mod network_tests {
             ),
         ] {
             let (url, server) = response(status, body, declared).await;
-            let result = fetch_release(&client, &url, "0.5.0", None).await;
+            let result = fetch_release(&client, &url, "0.5.0", &store, true).await;
             match expected {
                 0 => assert!(result.unwrap().is_none()),
                 1 => assert!(result.unwrap().is_some()),
