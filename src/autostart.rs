@@ -151,6 +151,9 @@ fn set_desktop(path: &Path, name: &str, command: &[String], enabled: bool) -> Re
     let content = format!(
         "[Desktop Entry]\nType=Application\nName=КРОТ\nExec={command}\nTerminal=false\nX-Krot-Autostart={name}\n"
     );
+    if existing.is_some() && fs::read(path)? == content.as_bytes() {
+        return Ok(());
+    }
     let parent = path.parent().context("Не указан каталог автозапуска.")?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -274,11 +277,15 @@ mod registry {
     }
 
     pub fn value(name: &str) -> Result<Option<(String, u32)>> {
+        value_at(RUN_KEY, name)
+    }
+
+    fn value_at(path: &str, name: &str) -> Result<Option<(String, u32)>> {
         unsafe {
             let mut handle = std::ptr::null_mut();
             let code = RegOpenKeyExW(
                 HKEY_CURRENT_USER,
-                wide(RUN_KEY).as_ptr(),
+                wide(path).as_ptr(),
                 0,
                 KEY_QUERY_VALUE,
                 &mut handle,
@@ -331,11 +338,19 @@ mod registry {
     }
 
     pub fn set(name: &str, command: Option<&str>) -> Result<()> {
+        set_at(RUN_KEY, name, command)
+    }
+
+    fn set_at(path: &str, name: &str, command: Option<&str>) -> Result<()> {
+        let expected = command.map(|command| (command.to_owned(), REG_SZ));
+        if value_at(path, name)? == expected {
+            return Ok(());
+        }
         unsafe {
             let mut handle = std::ptr::null_mut();
             check(RegCreateKeyExW(
                 HKEY_CURRENT_USER,
-                wide(RUN_KEY).as_ptr(),
+                wide(path).as_ptr(),
                 0,
                 std::ptr::null(),
                 REG_OPTION_NON_VOLATILE,
@@ -363,7 +378,97 @@ mod registry {
                 }
             }
         }
+        ensure!(
+            value_at(path, name)? == expected,
+            "Windows не подтвердила изменение автозапуска. Проверьте разрешения и журнал защиты."
+        );
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{CreateEventW, WaitForSingleObject},
+        };
+
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    RegDeleteTreeW(HKEY_CURRENT_USER, wide(&self.0).as_ptr());
+                }
+            }
+        }
+
+        #[test]
+        fn registry_roundtrip_preserves_unicode_and_does_not_rewrite_unchanged_values() {
+            let path = format!("Software\\KPOT-tests\\{}", uuid::Uuid::new_v4());
+            let _cleanup = Cleanup(path.clone());
+            let name = "test-startup";
+            assert!(value_at(&path, name).unwrap().is_none());
+            set_at(&path, name, None).unwrap();
+            let config = Path::new("C:\\Users\\Alice Smith\\КРОТ\\config.json");
+            let old = windows_command(&[
+                "C:\\old\\krot.exe".into(),
+                "--config".into(),
+                config.to_str().unwrap().into(),
+                "serve".into(),
+            ]);
+            let current = windows_command(&[
+                "C:\\Program Files\\КРОТ\\krot.exe".into(),
+                "--config".into(),
+                config.to_str().unwrap().into(),
+                "serve".into(),
+            ]);
+            assert!(windows_owned(&(old.clone(), REG_SZ), config));
+            set_at(&path, name, Some(&old)).unwrap();
+            set_at(&path, "other", Some("keep")).unwrap();
+            let mut handle = std::ptr::null_mut();
+            check(unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(&path).as_ptr(),
+                    0,
+                    KEY_NOTIFY,
+                    &mut handle,
+                )
+            })
+            .unwrap();
+            let key = Key(handle);
+            let raw = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            assert!(!raw.is_null());
+            let event = unsafe { OwnedHandle::from_raw_handle(raw) };
+            check(unsafe {
+                RegNotifyChangeKeyValue(
+                    key.0,
+                    0,
+                    REG_NOTIFY_CHANGE_LAST_SET,
+                    event.as_raw_handle(),
+                    1,
+                )
+            })
+            .unwrap();
+            set_at(&path, name, Some(&old)).unwrap();
+            assert_eq!(
+                unsafe { WaitForSingleObject(event.as_raw_handle(), 50) },
+                WAIT_TIMEOUT
+            );
+            set_at(&path, name, Some(&current)).unwrap();
+            assert_eq!(
+                unsafe { WaitForSingleObject(event.as_raw_handle(), 1000) },
+                WAIT_OBJECT_0
+            );
+            assert_eq!(value_at(&path, name).unwrap(), Some((current, REG_SZ)));
+            assert_eq!(
+                value_at(&path, "other").unwrap(),
+                Some(("keep".into(), REG_SZ))
+            );
+            set_at(&path, name, None).unwrap();
+            assert!(value_at(&path, name).unwrap().is_none());
+        }
     }
 }
 
@@ -514,6 +619,32 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn unchanged_desktop_registration_keeps_the_original_file() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("autostart/krot-test.desktop");
+        let command = vec![
+            "/opt/krot".into(),
+            "--config".into(),
+            "/tmp/config.json".into(),
+            "serve".into(),
+        ];
+        set_desktop(&path, "krot-test", &command, true).unwrap();
+        let original = fs::metadata(&path).unwrap().ino();
+        set_desktop(&path, "krot-test", &command, true).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), original);
+        let moved = vec![
+            "/opt/new/krot".into(),
+            "--config".into(),
+            "/tmp/config.json".into(),
+            "serve".into(),
+        ];
+        set_desktop(&path, "krot-test", &moved, true).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), original);
+        assert!(desktop_entry(&path).unwrap().unwrap()["Exec"].contains("/opt/new/krot"));
+    }
     #[test]
     fn canonical_configuration_has_one_registration_name() {
         let directory = tempfile::tempdir().unwrap();

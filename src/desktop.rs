@@ -877,7 +877,7 @@ impl Desktop {
         let Some(Dialog::Settings(settings)) = &mut self.dialog else {
             return;
         };
-        if settings.autostart == settings.initial_autostart {
+        if settings.autostart == settings.initial_autostart && settings.autostart != Some(true) {
             self.dialog = None;
             return;
         }
@@ -893,7 +893,7 @@ impl Desktop {
         backend.runtime.spawn_blocking(move || {
             let result = crate::autostart::set_enabled(&path, enabled)
                 .map(|_| enabled)
-                .map_err(|error| format!("Настройки сохранены. Автозапуск не изменён: {error}"));
+                .map_err(|error| format!("Настройки сохранены. Ошибка автозапуска: {error}"));
             let _ = tx.send(Event::AutostartChanged(result));
             ctx.request_repaint();
         });
@@ -2387,6 +2387,41 @@ mod tests {
         app.dialog = None;
         render(&mut app, &ctx, [700.0, 500.0]);
         assert!(app.update.as_ref().is_some_and(|update| update.manual));
+    }
+    #[test]
+    fn saving_enabled_autostart_refreshes_registration_and_shows_failure() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        app.dialog = Some(Dialog::Settings(SettingsDraft {
+            theme: "dark".into(),
+            motion: true,
+            splash: true,
+            autostart: Some(true),
+            initial_autostart: Some(true),
+            error: String::new(),
+            busy: true,
+        }));
+        for _ in 0..3 {
+            render(&mut app, &ctx, [700.0, 500.0]);
+        }
+        app.tx
+            .send(Event::Complete(Operation::Settings, Ok(())))
+            .unwrap();
+        app.tx
+            .send(Event::AutostartChanged(Err(
+                "Не удалось обновить путь автозапуска.".into(),
+            )))
+            .unwrap();
+        render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(
+            matches!(&app.dialog, Some(Dialog::Settings(settings)) if !settings.busy && !settings.error.is_empty())
+        );
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "Не удалось обновить путь автозапуска.").is_some());
+        assert!(matches!(&app.dialog, Some(Dialog::Settings(settings)) if !settings.busy));
+        assert!(!has_close(&output));
     }
     #[test]
     fn update_offer_waits_for_a_dirty_form_and_later_writes_nothing() {
