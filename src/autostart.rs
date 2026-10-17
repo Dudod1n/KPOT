@@ -218,6 +218,8 @@ fn windows_owned(value: &(String, u32), config: &Path) -> bool {
     for (basename, prefix) in [
         ("krot.exe", vec![]),
         ("krot-cli.exe", vec![]),
+        ("krot-windows-x64.exe", vec![]),
+        ("krot-cli-windows-x64.exe", vec![]),
         ("krot-background.exe", vec![]),
         ("pythonw.exe", vec!["-m".into(), "krot".into()]),
     ] {
@@ -587,6 +589,8 @@ mod tests {
         for launcher in [
             "C:\\Program Files\\КРОТ\\krot.exe",
             "C:\\Program Files\\КРОТ\\krot-cli.exe",
+            "C:\\Program Files\\КРОТ\\krot-windows-x64.exe",
+            "C:\\Program Files\\КРОТ\\krot-cli-windows-x64.exe",
             "C:\\old\\krot-background.exe",
             "C:\\Python\\pythonw.exe",
         ] {
