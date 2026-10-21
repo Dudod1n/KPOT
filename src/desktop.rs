@@ -28,6 +28,13 @@ const CYAN: Color32 = Color32::from_rgb(139, 205, 227);
 const GREEN: Color32 = Color32::from_rgb(172, 208, 148);
 const AMBER: Color32 = Color32::from_rgb(227, 188, 124);
 const RED: Color32 = Color32::from_rgb(255, 155, 145);
+const ABOUT_QUOTES: &[&str] = &[
+    "Я не спал. Я держал канал.",
+    "Не зря же мы это всё копали.",
+    "Лопата сегодня отдыхает.",
+    "Каска на месте. Пакеты под присмотром.",
+    "Это не баг. Это запасной выход из туннеля.",
+];
 
 pub fn run(
     store: Store,
@@ -168,6 +175,10 @@ fn tone(ui: &egui::Ui, color: Color32) -> Color32 {
 
 fn mascot(state: &str, frame: usize) -> String {
     match state {
+        "head" => format!(
+            "         _______\n      __/__[{eye}]__\\__\n    _/_____________\\_\n   /    [#]---[#]    \\\n  /      \\     /      \\\n  |  \\====\\   /====/  |\n   \\      \\_v_/      /\n    `----._____.----'",
+            eye = if frame == 0 { "*" } else { "o" }
+        ),
         "running" => {
             let legs = [
                 "   __     __   \n  (__)   (__)  \n    \\ \\_/ /    ",
@@ -311,6 +322,7 @@ pub(crate) struct Desktop {
     update_check: UpdateCheck,
     update: Option<UpdateDialog>,
     pending_operations: usize,
+    about_quote: Option<usize>,
 }
 
 enum Dialog {
@@ -319,6 +331,7 @@ enum Dialog {
     Prompt(Box<PromptDialog>),
     Logs(String),
     Help,
+    About,
     Splash,
 }
 enum Confirm {
@@ -524,6 +537,7 @@ impl Desktop {
             update_check: UpdateCheck::Idle,
             update: None,
             pending_operations: 0,
+            about_quote: None,
         }
     }
     fn check_updates(&mut self, ctx: &egui::Context, manual: bool) {
@@ -1050,7 +1064,24 @@ impl Desktop {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("КРОТ / ДИСПЕТЧЕРСКАЯ").color(tone(ui, CYAN)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
+                    let version_response = ui
+                        .add_enabled(
+                            self.dialog.is_none()
+                                && self.confirm.is_none()
+                                && self.update.is_none(),
+                            egui::Link::new(concat!("v", env!("CARGO_PKG_VERSION"))),
+                        )
+                        .on_hover_text("О программе");
+                    if version_response.clicked() {
+                        self.about_quote = Some(match self.about_quote {
+                            Some(previous) => {
+                                (previous + rand::random_range(1..ABOUT_QUOTES.len()))
+                                    % ABOUT_QUOTES.len()
+                            }
+                            None => rand::random_range(0..ABOUT_QUOTES.len()),
+                        });
+                        self.dialog = Some(Dialog::About);
+                    }
                 });
             });
             ui.add_space(5.0);
@@ -1313,7 +1344,7 @@ impl Desktop {
                         }
                     });
                     ui.checkbox(&mut settings.motion, "Анимация кротов");
-                    ui.checkbox(&mut settings.splash, "Заставка при запуске");
+                    ui.checkbox(&mut settings.splash, "Восстановление туннелей при запуске");
                     if let Some(enabled) = &mut settings.autostart {
                         ui.checkbox(enabled, "Запускать КРОТ в фоне после входа в систему");
                     } else {
@@ -1399,6 +1430,7 @@ impl Desktop {
                     if ui.button("Назад").clicked() { action = DialogAction::Close; }
                 }
                 Dialog::Splash => { action = self.splash_view(ui, max_height); }
+                Dialog::About => { action = self.about_view(ui, max_height); }
             }
         });
         let blocked = self.confirm.is_some()
@@ -1422,6 +1454,11 @@ impl Desktop {
         }
         match action {
             DialogAction::None => self.dialog = Some(dialog),
+            DialogAction::NextAboutQuote => {
+                self.about_quote = Some((self.about_quote.unwrap_or(0) + 1) % ABOUT_QUOTES.len());
+                self.dialog = Some(dialog);
+                ctx.request_repaint();
+            }
             DialogAction::CheckUpdates => {
                 self.dialog = Some(dialog);
                 self.check_updates(ctx, true);
@@ -1521,6 +1558,57 @@ impl Desktop {
             }
         }
     }
+    fn about_view(&mut self, ui: &mut egui::Ui, max_height: f32) -> DialogAction {
+        let mut action = DialogAction::None;
+        ui.horizontal(|ui| {
+            ui.heading("О программе");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("×").on_hover_text("Закрыть").clicked() {
+                    action = DialogAction::Close;
+                }
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("about")
+            .max_height(max_height)
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.label(RichText::new("КРОТ").size(30.0));
+                    ui.colored_label(
+                        tone(ui, CYAN),
+                        concat!("Версия ", env!("CARGO_PKG_VERSION")),
+                    );
+                    ui.weak("Ваши туннели. Наша работа.");
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(mascot("head", self.frame()))
+                            .color(tone(ui, AMBER))
+                            .size(if max_height < 450.0 { 14.0 } else { 18.0 }),
+                    );
+                    ui.add_space(10.0);
+                    let quote = self.about_quote.unwrap_or(0);
+                    ui.colored_label(tone(ui, AMBER), format!("«{}»", ABOUT_QUOTES[quote]));
+                    if ui.button("Ещё фраза").clicked() {
+                        action = DialogAction::NextAboutQuote;
+                    }
+                    ui.add_space(8.0);
+                    ui.weak("Менеджер SSH-туннелей от Dudod1n");
+                    ui.hyperlink_to("github.com/Dudod1n/KPOT", env!("CARGO_PKG_REPOSITORY"));
+                });
+            });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.weak("GPL-3.0-only");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("В диспетчерскую").clicked() {
+                    action = DialogAction::Close;
+                }
+            });
+        });
+        action
+    }
     fn splash_view(&mut self, ui: &mut egui::Ui, max_height: f32) -> DialogAction {
         if ui
             .ctx()
@@ -1567,12 +1655,9 @@ impl Desktop {
             "Все проходы на месте"
         };
         ui.label(title);
-        let art = format!(
-            "         _______\n      __/__[{eye}]__\\__\n    _/_____________\\_\n   /    [#]---[#]    \\\n  /      \\     /      \\\n  |  \\====\\   /====/  |\n   \\      \\_v_/      /\n    `----._____.----'",
-            eye = if self.frame() == 0 { "*" } else { "o" }
-        );
         ui.label(
-            RichText::new(art).color(tone(ui, if waiting + errors > 0 { AMBER } else { GREEN })),
+            RichText::new(mascot("head", self.frame()))
+                .color(tone(ui, if waiting + errors > 0 { AMBER } else { GREEN })),
         );
         ui.label(format!(
             "{} из {} работают · {} ждут вас · {} с ошибкой",
@@ -1928,6 +2013,7 @@ impl eframe::App for Desktop {
 
 enum DialogAction {
     None,
+    NextAboutQuote,
     Close,
     SaveForm(bool),
     SaveSettings,
@@ -2193,7 +2279,7 @@ mod tests {
         fn find(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
             match shape {
                 egui::Shape::Text(text) if text.galley.text() == label => {
-                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    Some(text.galley.rect.translate(text.pos.to_vec2()))
                 }
                 egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
                 _ => None,
@@ -2229,6 +2315,189 @@ mod tests {
             ],
             false,
         )
+    }
+    fn about_quote(output: &egui::FullOutput) -> String {
+        fn find(shape: &egui::Shape) -> Option<String> {
+            match shape {
+                egui::Shape::Text(text) => text
+                    .galley
+                    .text()
+                    .strip_prefix('«')
+                    .and_then(|text| text.strip_suffix('»'))
+                    .map(str::to_owned),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(find),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape))
+            .expect("Visible mole quote")
+    }
+    #[test]
+    fn version_opens_about_with_current_build_and_public_repository() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        app.initialized = true;
+        render(&mut app, &ctx, [700.0, 500.0]);
+        click_label(&mut app, &ctx, concat!("v", env!("CARGO_PKG_VERSION")));
+        assert!(
+            app.about_quote.is_some(),
+            "Version click must select a quote"
+        );
+        assert!(matches!(app.dialog, Some(Dialog::About)));
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "О программе").is_some());
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, concat!("Версия ", env!("CARGO_PKG_VERSION"))).is_some());
+        assert!(text_rect(&output, "Менеджер SSH-туннелей от Dudod1n").is_some());
+        assert!(text_rect(&output, "GPL-3.0-only").is_some());
+        let output = click_label(&mut app, &ctx, "github.com/Dudod1n/KPOT");
+        assert!(output.platform_output.commands.iter().any(|command| matches!(command,
+            egui::OutputCommand::OpenUrl(url) if url.url == "https://github.com/Dudod1n/KPOT"
+        )));
+        click_label(&mut app, &ctx, "В диспетчерскую");
+        assert!(app.dialog.is_none());
+    }
+    #[test]
+    fn about_quotes_change_only_on_open_or_manual_request_without_immediate_repeats() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        app.initialized = true;
+        render(&mut app, &ctx, [700.0, 500.0]);
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        click_label(&mut app, &ctx, version);
+        assert!(matches!(app.dialog, Some(Dialog::About)));
+        render(&mut app, &ctx, [700.0, 500.0]);
+        let mut previous = about_quote(&render(&mut app, &ctx, [700.0, 500.0]));
+        let initial = previous.clone();
+        let mut seen = HashSet::from([initial.clone()]);
+        for _ in 1..ABOUT_QUOTES.len() {
+            click_label(&mut app, &ctx, "Ещё фраза");
+            previous = about_quote(&render(&mut app, &ctx, [700.0, 500.0]));
+            assert!(
+                seen.insert(previous.clone()),
+                "Manual cycle repeated a quote early"
+            );
+        }
+        click_label(&mut app, &ctx, "Ещё фраза");
+        previous = about_quote(&render(&mut app, &ctx, [700.0, 500.0]));
+        assert_eq!(previous, initial);
+        for _ in 0..12 {
+            app.started = Instant::now() - Duration::from_secs(10);
+            app.tx.send(Event::Snapshot(Ok(snapshot()))).unwrap();
+            assert_eq!(
+                about_quote(&render(&mut app, &ctx, [700.0, 500.0])),
+                previous
+            );
+            click_label(&mut app, &ctx, "Ещё фраза");
+            let next = about_quote(&render(&mut app, &ctx, [700.0, 500.0]));
+            assert_ne!(next, previous);
+            previous = next;
+            key_frame(&mut app, &ctx, Key::Escape);
+            assert!(app.dialog.is_none());
+            click_label(&mut app, &ctx, version);
+            let next = about_quote(&render(&mut app, &ctx, [700.0, 500.0]));
+            assert_ne!(next, previous);
+            previous = next;
+        }
+    }
+    #[test]
+    fn closing_about_does_not_remember_an_unseen_quote_from_the_same_frame() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        app.dialog = Some(Dialog::About);
+        app.about_quote = Some(0);
+        render(&mut app, &ctx, [700.0, 500.0]);
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        let previous = about_quote(&output);
+        let pos = text_rect(&output, "Ещё фраза").unwrap().center();
+        let output = input_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            false,
+        );
+        assert!(app.dialog.is_none());
+        assert_eq!(about_quote(&output), previous);
+        assert_eq!(
+            app.about_quote,
+            Some(0),
+            "Only the displayed quote may be excluded on reopen"
+        );
+    }
+    #[test]
+    fn about_link_preserves_an_open_dirty_form() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        let mut form = TunnelForm::new(Some(tunnel()));
+        form.draft.name = "unsaved change".into();
+        app.dialog = Some(Dialog::Form(Box::new(form)));
+        render(&mut app, &ctx, [700.0, 500.0]);
+        click_label(&mut app, &ctx, concat!("v", env!("CARGO_PKG_VERSION")));
+        assert!(
+            matches!(&app.dialog, Some(Dialog::Form(form)) if form.draft.name == "unsaved change" && form.dirty())
+        );
+        assert!(app.about_quote.is_none());
+    }
+    #[test]
+    fn about_fits_both_themes_and_animation_follows_settings() {
+        for theme in ["dark", "light"] {
+            for size in [[700.0, 500.0], [1000.0, 800.0]] {
+                let ctx = egui::Context::default();
+                configure(&ctx, theme);
+                let mut app = Desktop::new(None, true);
+                app.snapshot = Some(snapshot());
+                app.dialog = Some(Dialog::About);
+                app.about_quote = Some(ABOUT_QUOTES.len() - 1);
+                render(&mut app, &ctx, size);
+                render(&mut app, &ctx, size);
+                app.started = Instant::now() - Duration::from_millis(200);
+                let output = render(&mut app, &ctx, size);
+                assert!(text_rect(&output, &mascot("head", 1)).is_some());
+                for label in ["Ещё фраза", "github.com/Dudod1n/KPOT", "В диспетчерскую"]
+                {
+                    assert!(
+                        ctx.content_rect()
+                            .contains_rect(text_rect(&output, label).unwrap()),
+                        "{theme} {size:?}: {label}"
+                    );
+                }
+                app.snapshot.as_mut().unwrap().config.settings.motion = false;
+                let output = render(&mut app, &ctx, size);
+                assert!(text_rect(&output, &mascot("head", 0)).is_some());
+            }
+        }
     }
     fn has_close(output: &egui::FullOutput) -> bool {
         output.viewport_output[&egui::ViewportId::ROOT]
@@ -2471,6 +2740,7 @@ mod tests {
                 busy: false,
             })),
             Some(Dialog::Splash),
+            Some(Dialog::About),
         ] {
             let mut app = Desktop::new(None, true);
             app.snapshot = Some(snapshot());
@@ -2952,6 +3222,7 @@ mod tests {
                 ))))),
                 Some(Dialog::Logs("native-tunnel".into())),
                 Some(Dialog::Help),
+                Some(Dialog::About),
                 Some(Dialog::Splash),
             ] {
                 let has_dialog = dialog.is_some();
