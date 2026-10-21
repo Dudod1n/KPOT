@@ -1454,6 +1454,11 @@ impl Desktop {
         }
         match action {
             DialogAction::None => self.dialog = Some(dialog),
+            DialogAction::NextAboutQuote => {
+                self.about_quote = Some((self.about_quote.unwrap_or(0) + 1) % ABOUT_QUOTES.len());
+                self.dialog = Some(dialog);
+                ctx.request_repaint();
+            }
             DialogAction::CheckUpdates => {
                 self.dialog = Some(dialog);
                 self.check_updates(ctx, true);
@@ -1586,7 +1591,7 @@ impl Desktop {
                     let quote = self.about_quote.unwrap_or(0);
                     ui.colored_label(tone(ui, AMBER), format!("«{}»", ABOUT_QUOTES[quote]));
                     if ui.button("Ещё фраза").clicked() {
-                        self.about_quote = Some((quote + 1) % ABOUT_QUOTES.len());
+                        action = DialogAction::NextAboutQuote;
                     }
                     ui.add_space(8.0);
                     ui.weak("Менеджер SSH-туннелей от Dudod1n");
@@ -2008,6 +2013,7 @@ impl eframe::App for Desktop {
 
 enum DialogAction {
     None,
+    NextAboutQuote,
     Close,
     SaveForm(bool),
     SaveSettings,
@@ -2400,6 +2406,53 @@ mod tests {
             assert_ne!(next, previous);
             previous = next;
         }
+    }
+    #[test]
+    fn closing_about_does_not_remember_an_unseen_quote_from_the_same_frame() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        app.dialog = Some(Dialog::About);
+        app.about_quote = Some(0);
+        render(&mut app, &ctx, [700.0, 500.0]);
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        let previous = about_quote(&output);
+        let pos = text_rect(&output, "Ещё фраза").unwrap().center();
+        let output = input_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            false,
+        );
+        assert!(app.dialog.is_none());
+        assert_eq!(about_quote(&output), previous);
+        assert_eq!(
+            app.about_quote,
+            Some(0),
+            "Only the displayed quote may be excluded on reopen"
+        );
     }
     #[test]
     fn about_link_preserves_an_open_dirty_form() {
