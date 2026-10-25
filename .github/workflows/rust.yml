@@ -28,6 +28,8 @@ jobs:
       - run: cargo +stable test --locked
       - if: runner.os == 'Linux'
         run: dbus-run-session -- cargo +stable test --locked --test tray_linux -- --ignored
+      - if: runner.os == 'Linux'
+        run: dbus-run-session -- cargo +stable test --locked --lib key_portal -- --ignored
       - run: cargo +stable build --release --bins --locked
       - name: Collect third-party notices
         shell: bash
