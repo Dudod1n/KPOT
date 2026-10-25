@@ -41,13 +41,12 @@ rfd = "=0.17.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "=0.11.1", default-features = false, features = ["tokio", "raw_handle", "wayland"] }
+futures-util = "0.3"
 raw-window-handle = "0.6"
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
 winresource = "=0.1.34"
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
 [profile.release]
 lto = "thin"

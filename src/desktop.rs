@@ -529,32 +529,55 @@ fn pick_key_file(
     directory: Option<&std::path::Path>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<Option<PathBuf>> {
-    use ashpd::desktop::{ResponseError, file_chooser::OpenFileRequest};
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
     runtime.block_on(async {
         let window = frame.window_handle()?.as_raw();
         let display = frame.display_handle()?.as_raw();
         let parent = ashpd::WindowIdentifier::from_raw_handle(&window, Some(&display)).await;
-        let request = OpenFileRequest::default()
-            .identifier(parent)
-            .title("Выберите приватный ключ")
-            .multiple(false)
-            .current_folder::<&std::path::Path>(directory)?
-            .send()
-            .await?;
-        match request.response() {
-            Ok(response) => response
-                .uris()
-                .first()
-                .map(|uri| {
-                    uri.to_file_path()
-                        .map_err(|_| anyhow::anyhow!("Диалог вернул недопустимый путь."))
-                })
-                .transpose(),
-            Err(ashpd::Error::Response(ResponseError::Cancelled)) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        portal_key_file(parent, directory).await
     })
+}
+#[cfg(target_os = "linux")]
+async fn portal_key_file(
+    parent: Option<ashpd::WindowIdentifier>,
+    directory: Option<&std::path::Path>,
+) -> anyhow::Result<Option<PathBuf>> {
+    use ashpd::desktop::{ResponseError, file_chooser::OpenFileRequest};
+    use futures_util::StreamExt;
+    let connection = zbus::Connection::session().await?;
+    let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+    let mut owners = bus
+        .receive_name_owner_changed_with_args(&[(0, "org.freedesktop.portal.Desktop")])
+        .await?;
+    let request = OpenFileRequest::default()
+        .identifier(parent)
+        .title("Выберите приватный ключ")
+        .multiple(false)
+        .current_folder::<&std::path::Path>(directory)?;
+    // Portal can disappear without completing its already accepted request.
+    let disappeared = async {
+        while let Some(change) = owners.next().await {
+            if change.args()?.old_owner().is_some() {
+                break;
+            }
+        }
+        anyhow::bail!("Служба выбора файлов завершилась.")
+    };
+    tokio::select! {
+      result = request.send() => match result?.response() {
+        Ok(response) => response
+            .uris()
+            .first()
+            .map(|uri| {
+                uri.to_file_path()
+                    .map_err(|_| anyhow::anyhow!("Диалог вернул недопустимый путь."))
+            })
+            .transpose(),
+        Err(ashpd::Error::Response(ResponseError::Cancelled)) => Ok(None),
+        Err(error) => Err(error.into()),
+      },
+      result = disappeared => result,
+    }
 }
 #[cfg(not(target_os = "linux"))]
 fn pick_key_file(
@@ -2513,6 +2536,59 @@ mod tests {
         assert_eq!(key_directory("id_ed25519"), None);
         assert_eq!(key_directory(""), None);
         assert_eq!(key_directory("keys\0/invalid"), None);
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "dbus-run-session -- cargo test --lib key_portal -- --ignored"]
+    async fn key_portal_disappearance_returns_error_instead_of_blocking_the_form() {
+        struct Portal(tokio::sync::mpsc::UnboundedSender<()>);
+        #[zbus::interface(name = "org.freedesktop.portal.FileChooser")]
+        impl Portal {
+            fn open_file(
+                &self,
+                _parent: &str,
+                _title: &str,
+                _options: HashMap<String, zbus::zvariant::OwnedValue>,
+            ) -> zbus::zvariant::OwnedObjectPath {
+                self.0.send(()).unwrap();
+                "/org/freedesktop/portal/desktop/request/pending"
+                    .try_into()
+                    .unwrap()
+            }
+            #[zbus(property)]
+            fn version(&self) -> u32 {
+                4
+            }
+        }
+        let (tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        let service = zbus::connection::Builder::session()
+            .unwrap()
+            .name("org.freedesktop.portal.Desktop")
+            .unwrap()
+            .serve_at("/org/freedesktop/portal/desktop", Portal(tx))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let selection = portal_key_file(None, None);
+        tokio::pin!(selection);
+        tokio::select! {
+            result = &mut selection => panic!("Request ended before portal accepted it: {result:?}"),
+            _ = accepted.recv() => {},
+            _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("Portal did not receive OpenFile"),
+        }
+        tokio::select! {
+            result = &mut selection => panic!("Request ended without Response: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+        }
+        service
+            .release_name("org.freedesktop.portal.Desktop")
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), selection)
+            .await
+            .expect("Portal disappearance must return control to the form");
+        assert!(result.is_err());
     }
     #[test]
     fn browse_request_is_emitted_only_for_an_editable_key_endpoint() {
