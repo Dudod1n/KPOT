@@ -707,7 +707,7 @@ enum Credential {
     Password(Zeroizing<String>),
     Key(Arc<PrivateKey>),
 }
-fn expand_key_path(path: &str) -> PathBuf {
+pub(crate) fn expand_key_path(path: &str) -> PathBuf {
     if (path == "~" || path.starts_with("~/") || path.starts_with("~\\"))
         && let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
     {

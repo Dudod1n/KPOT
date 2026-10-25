@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     io::Read,
+    path::PathBuf,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -417,6 +418,19 @@ struct TunnelForm {
     error: String,
     busy: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyTarget {
+    Server,
+    Jump(usize),
+}
+impl KeyTarget {
+    fn endpoint(self, draft: &mut Tunnel) -> Option<&mut Endpoint> {
+        match self {
+            Self::Server => Some(&mut draft.server),
+            Self::Jump(index) => draft.jumps.get_mut(index),
+        }
+    }
+}
 impl TunnelForm {
     fn new(tunnel: Option<Tunnel>) -> Self {
         let editing = tunnel.is_some();
@@ -484,11 +498,77 @@ impl TunnelForm {
         self.draft.jumps.swap(index, other);
         self.jump_ports.swap(index, other);
     }
+    fn select_key(&mut self, target: KeyTarget, path: Option<PathBuf>) {
+        let Some(path) = path else { return };
+        let Ok(path) = path.into_os_string().into_string() else {
+            self.error =
+                "Не удалось использовать путь к ключу: имя файла должно быть в Unicode.".into();
+            return;
+        };
+        if let Some(endpoint) = target.endpoint(&mut self.draft) {
+            endpoint.key = path;
+        }
+    }
 }
 fn trim_endpoint(endpoint: &mut Endpoint) {
     endpoint.host = endpoint.host.trim().into();
     endpoint.user = endpoint.user.trim().into();
-    endpoint.key = endpoint.key.trim().into();
+}
+fn key_directory(key: &str) -> Option<PathBuf> {
+    if key.contains('\0') {
+        return None;
+    }
+    crate::ssh::expand_key_path(key)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+}
+#[cfg(target_os = "linux")]
+fn pick_key_file(
+    frame: &eframe::Frame,
+    directory: Option<&std::path::Path>,
+    runtime: &tokio::runtime::Runtime,
+) -> anyhow::Result<Option<PathBuf>> {
+    use ashpd::desktop::{ResponseError, file_chooser::OpenFileRequest};
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+    runtime.block_on(async {
+        let window = frame.window_handle()?.as_raw();
+        let display = frame.display_handle()?.as_raw();
+        let parent = ashpd::WindowIdentifier::from_raw_handle(&window, Some(&display)).await;
+        let request = OpenFileRequest::default()
+            .identifier(parent)
+            .title("Выберите приватный ключ")
+            .multiple(false)
+            .current_folder::<&std::path::Path>(directory)?
+            .send()
+            .await?;
+        match request.response() {
+            Ok(response) => response
+                .uris()
+                .first()
+                .map(|uri| {
+                    uri.to_file_path()
+                        .map_err(|_| anyhow::anyhow!("Диалог вернул недопустимый путь."))
+                })
+                .transpose(),
+            Err(ashpd::Error::Response(ResponseError::Cancelled)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn pick_key_file(
+    frame: &eframe::Frame,
+    directory: Option<&std::path::Path>,
+    _: &tokio::runtime::Runtime,
+) -> anyhow::Result<Option<PathBuf>> {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title("Выберите приватный ключ")
+        .set_parent(frame);
+    if let Some(directory) = directory {
+        dialog = dialog.set_directory(directory);
+    }
+    Ok(dialog.pick_file())
 }
 fn parse_port(value: &str, label: &str) -> anyhow::Result<u16> {
     value
@@ -1324,10 +1404,8 @@ impl Desktop {
             }
         });
     }
-    fn dialog_view(&mut self, ctx: &egui::Context) {
-        let Some(mut dialog) = self.dialog.take() else {
-            return;
-        };
+    fn dialog_view(&mut self, ctx: &egui::Context) -> Option<KeyTarget> {
+        let mut dialog = self.dialog.take()?;
         let max_height = (ctx.content_rect().height() - 140.0).max(180.0);
         let width = (ctx.content_rect().width() - 90.0).min(660.0);
         let mut action = DialogAction::None;
@@ -1454,6 +1532,10 @@ impl Desktop {
         }
         match action {
             DialogAction::None => self.dialog = Some(dialog),
+            DialogAction::BrowseKey(target) => {
+                self.dialog = Some(dialog);
+                return Some(target);
+            }
             DialogAction::NextAboutQuote => {
                 self.about_quote = Some((self.about_quote.unwrap_or(0) + 1) % ABOUT_QUOTES.len());
                 self.dialog = Some(dialog);
@@ -1557,6 +1639,7 @@ impl Desktop {
                 self.request_exit();
             }
         }
+        None
     }
     fn about_view(&mut self, ui: &mut egui::Ui, max_height: f32) -> DialogAction {
         let mut action = DialogAction::None;
@@ -1970,7 +2053,7 @@ impl Desktop {
             _ => {}
         }
     }
-    fn draw(&mut self, ctx: &egui::Context) {
+    fn draw(&mut self, ctx: &egui::Context) -> Option<KeyTarget> {
         self.drain(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1996,23 +2079,43 @@ impl Desktop {
         {
             self.resolve(&tunnel);
         }
-        if self.confirm.is_none() {
-            self.dialog_view(ctx);
-        }
+        let key_target = if self.confirm.is_none() {
+            self.dialog_view(ctx)
+        } else {
+            None
+        };
         self.update_view(ctx);
         self.confirm_view(ctx);
         self.poll(ctx);
         ctx.request_repaint_after(FRAME_TIME);
+        key_target
     }
 }
 impl eframe::App for Desktop {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.draw(ctx);
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(target) = self.draw(ctx)
+            && let Some(Dialog::Form(form)) = &mut self.dialog
+            && let Some(backend) = &self.backend
+        {
+            let directory = target
+                .endpoint(&mut form.draft)
+                .and_then(|endpoint| key_directory(&endpoint.key));
+            match pick_key_file(frame, directory.as_deref(), &backend.runtime) {
+                Ok(path) => form.select_key(target, path),
+                Err(_) => {
+                    form.error =
+                        "Не удалось открыть диалог выбора файла. Введите путь к ключу вручную."
+                            .into()
+                }
+            }
+            ctx.request_repaint();
+        }
     }
 }
 
 enum DialogAction {
     None,
+    BrowseKey(KeyTarget),
     NextAboutQuote,
     Close,
     SaveForm(bool),
@@ -2057,7 +2160,8 @@ fn endpoint_view(
     port: &mut String,
     id: &str,
     title: &str,
-) {
+) -> bool {
+    let mut browse = false;
     ui.push_id(id, |ui| {
         ui.separator();
         ui.label(RichText::new(title).color(tone(ui, CYAN)));
@@ -2075,9 +2179,19 @@ fn endpoint_view(
                 }
             });
         ui.add_enabled_ui(endpoint.auth == "key", |ui| {
-            field(ui, "Файл приватного ключа", &mut endpoint.key);
+            ui.label("Файл приватного ключа");
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    browse = ui.button("Обзор…").clicked();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut endpoint.key)
+                            .desired_width(ui.available_width()),
+                    );
+                });
+            });
         });
     });
+    browse
 }
 fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> DialogAction {
     let mut action = DialogAction::None;
@@ -2099,7 +2213,9 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
                     ui.selectable_value(&mut form.draft.kind, value.into(), label);
                 }
             });
-            endpoint_view(ui, &mut form.draft.server, &mut form.server_port, "server", "Конечный SSH-сервер");
+            if endpoint_view(ui, &mut form.draft.server, &mut form.server_port, "server", "Конечный SSH-сервер") {
+                action = DialogAction::BrowseKey(KeyTarget::Server);
+            }
             ui.separator();
             ui.label(RichText::new("Переадресация").color(tone(ui, CYAN)));
             ui.weak(match form.draft.kind.as_str() {
@@ -2126,7 +2242,9 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
                 let mut jump_action = None;
                 let count = form.draft.jumps.len();
                 for index in 0..count {
-                    endpoint_view(ui, &mut form.draft.jumps[index], &mut form.jump_ports[index], &format!("jump_{index}"), &format!("Jump-хост {}", index + 1));
+                    if endpoint_view(ui, &mut form.draft.jumps[index], &mut form.jump_ports[index], &format!("jump_{index}"), &format!("Jump-хост {}", index + 1)) {
+                        action = DialogAction::BrowseKey(KeyTarget::Jump(index));
+                    }
                     ui.horizontal_wrapped(|ui| {
                         if ui.add_enabled(index > 0, egui::Button::new("↑ Выше")).clicked() { jump_action = Some((index, -1)); }
                         if ui.add_enabled(index + 1 < count, egui::Button::new("↓ Ниже")).clicked() { jump_action = Some((index, 1)); }
@@ -2234,7 +2352,9 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size.into())),
                 ..Default::default()
             },
-            |ctx| app.draw(ctx),
+            |ctx| {
+                app.draw(ctx);
+            },
         )
     }
     fn input_frame(
@@ -2259,7 +2379,9 @@ mod tests {
                 .events
                 .push(egui::ViewportEvent::Close);
         }
-        ctx.run(input, |ctx| app.draw(ctx))
+        ctx.run(input, |ctx| {
+            app.draw(ctx);
+        })
     }
     fn key_frame(app: &mut Desktop, ctx: &egui::Context, key: Key) -> egui::FullOutput {
         input_frame(
@@ -2334,6 +2456,126 @@ mod tests {
             .iter()
             .find_map(|shape| find(&shape.shape))
             .expect("Visible mole quote")
+    }
+    #[test]
+    fn key_file_browse_button_fits_next_to_the_path() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        let mut form = TunnelForm::new(Some(tunnel()));
+        form.draft.server.auth = "key".into();
+        app.dialog = Some(Dialog::Form(Box::new(form)));
+        let _ = render(&mut app, &ctx, [700.0, 900.0]);
+        let output = render(&mut app, &ctx, [700.0, 900.0]);
+        let button = text_rect(&output, "Обзор…").expect("Key path has a browse button");
+        let label = text_rect(&output, "Файл приватного ключа").unwrap();
+        assert!(button.top() > label.bottom());
+        assert!(button.right() < 700.0);
+    }
+    #[test]
+    fn selected_key_changes_only_the_requested_endpoint_and_marks_form_dirty() {
+        let mut draft = tunnel();
+        draft.server.auth = "key".into();
+        draft.server.key = "~/.ssh/server".into();
+        draft.jumps_enabled = true;
+        draft.jumps = vec![draft.server.clone(), draft.server.clone()];
+        draft.jumps[0].host = "jump-one.example".into();
+        draft.jumps[1].host = "jump-two.example".into();
+        let mut form = TunnelForm::new(Some(draft));
+        form.select_key(KeyTarget::Jump(1), Some("/keys/Работа/id_ed25519 ".into()));
+        assert_eq!(form.draft.server.key, "~/.ssh/server");
+        assert_eq!(form.draft.jumps[0].key, "~/.ssh/server");
+        assert_eq!(form.draft.jumps[1].key, "/keys/Работа/id_ed25519 ");
+        assert!(form.dirty());
+        let candidate = form.candidate(&[], false).unwrap();
+        assert_eq!(candidate.jumps[1].key, "/keys/Работа/id_ed25519 ");
+        form.select_key(KeyTarget::Server, Some("/keys/server key".into()));
+        assert_eq!(form.draft.server.key, "/keys/server key");
+        assert_eq!(form.draft.jumps[1].key, "/keys/Работа/id_ed25519 ");
+    }
+    #[test]
+    fn cancelled_key_selection_keeps_the_manual_path_and_clean_form() {
+        let mut draft = tunnel();
+        draft.server.key = "~/.ssh/manual_key".into();
+        let mut form = TunnelForm::new(Some(draft));
+        form.select_key(KeyTarget::Server, None);
+        assert_eq!(form.draft.server.key, "~/.ssh/manual_key");
+        assert!(!form.dirty());
+        assert!(form.error.is_empty());
+    }
+    #[test]
+    fn key_dialog_directory_preserves_paths_and_rejects_nul() {
+        assert_eq!(
+            key_directory("keys/Работа/id_ed25519"),
+            Some("keys/Работа".into())
+        );
+        assert_eq!(key_directory("id_ed25519"), None);
+        assert_eq!(key_directory(""), None);
+        assert_eq!(key_directory("keys\0/invalid"), None);
+    }
+    #[test]
+    fn browse_request_is_emitted_only_for_an_editable_key_endpoint() {
+        for (auth, busy, expected) in [
+            ("key", false, Some(KeyTarget::Server)),
+            ("agent", false, None),
+            ("password", false, None),
+            ("key", true, None),
+        ] {
+            let ctx = egui::Context::default();
+            configure(&ctx, "dark");
+            let mut app = Desktop::new(None, true);
+            app.snapshot = Some(snapshot());
+            let mut form = TunnelForm::new(Some(tunnel()));
+            form.draft.server.auth = auth.into();
+            form.busy = busy;
+            app.dialog = Some(Dialog::Form(Box::new(form)));
+            let _ = render(&mut app, &ctx, [700.0, 900.0]);
+            let output = render(&mut app, &ctx, [700.0, 900.0]);
+            let pos = text_rect(&output, "Обзор…").unwrap().center();
+            let mut request = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 900.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| request = app.draw(ctx),
+            );
+            assert_eq!(request, expected, "auth={auth}, busy={busy}");
+            assert!(matches!(app.dialog, Some(Dialog::Form(_))));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_key_path_reports_error_without_replacing_the_previous_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut form = TunnelForm::new(Some(tunnel()));
+        form.draft.server.key = "~/.ssh/manual_key".into();
+        let before = form.signature();
+        form.select_key(
+            KeyTarget::Server,
+            Some(std::ffi::OsString::from_vec(b"/keys/\xff".to_vec()).into()),
+        );
+        assert_eq!(form.signature(), before);
+        assert!(!form.error.is_empty());
     }
     #[test]
     fn version_opens_about_with_current_build_and_public_repository() {
@@ -3346,7 +3588,9 @@ mod tests {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        let output = ctx.run(input, |ctx| app.draw(ctx));
+        let output = ctx.run(input, |ctx| {
+            app.draw(ctx);
+        });
         assert!(!matches!(app.confirm, Some(Confirm::Exit)));
         assert!(app.confirm.is_some());
         assert!(!app.allow_close);
