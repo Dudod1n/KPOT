@@ -2274,6 +2274,7 @@ version = "0.5.6"
 dependencies = [
  "anyhow",
  "ashpd",
+ "chrono",
  "clap",
  "eframe",
  "fs2",

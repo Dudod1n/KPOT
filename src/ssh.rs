@@ -1,17 +1,18 @@
 //! Native SSH transport, forwarding, and application-owned connection lifetime.
-use crate::config::{Endpoint, Tunnel, atomic_json, validate_tunnel};
+use crate::config::{Endpoint, Tunnel, atomic_json, unbracket, validate_tunnel};
 use anyhow::{Result, anyhow, bail};
 use russh::client::{self, ChannelOpenHandle};
 use russh::keys::{self, HashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate};
 use russh::{Channel, ChannelOpenFailure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +24,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use zeroize::Zeroizing;
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 const CANCELLED: Problem = Problem {
     message: "Подключение отменено.",
     retryable: false,
@@ -192,6 +194,22 @@ impl Manager {
                 .collect(),
         )
     }
+    /// Tunnel states and the tunnels waiting for an answer, without copying logs.
+    pub async fn states(&self) -> (HashMap<String, String>, HashSet<String>) {
+        let state = self.0.state.lock().await;
+        (
+            state
+                .runtimes
+                .iter()
+                .map(|(id, runtime)| (id.clone(), runtime.state.clone()))
+                .collect(),
+            state
+                .prompts
+                .values()
+                .map(|p| p.prompt.request.tunnel_id.clone())
+                .collect(),
+        )
+    }
     pub async fn answer(&self, request_id: &str, value: Value) -> Result<()> {
         let value = match value {
             Value::String(secret) => Answer::Credential(Zeroizing::new(secret)),
@@ -269,7 +287,7 @@ impl Manager {
     ) -> std::result::Result<(), Problem> {
         let identity = format!(
             "[{}]:{}",
-            endpoint.host.trim_matches(['[', ']']).to_lowercase(),
+            unbracket(&endpoint.host).to_lowercase(),
             endpoint.port
         );
         let exported = key
@@ -414,20 +432,24 @@ impl Manager {
             )
             .await;
             let stream: Box<dyn Transport> = if let Some(previous) = attempt.sessions.last() {
-                let channel = timed(previous.channel_open_direct_tcpip(
-                    endpoint.host.trim_matches(['[', ']']),
-                    u32::from(endpoint.port),
-                    "127.0.0.1",
-                    0,
-                ))
+                let channel = interruptible(
+                    &attempt.cancel,
+                    previous.channel_open_direct_tcpip(
+                        unbracket(&endpoint.host),
+                        u32::from(endpoint.port),
+                        "127.0.0.1",
+                        0,
+                    ),
+                )
                 .await??;
                 Box::new(channel.into_stream())
             } else {
+                // DNS and TCP connect do not see the transport token.
                 Box::new(
-                    timed(TcpStream::connect((
-                        endpoint.host.trim_matches(['[', ']']),
-                        endpoint.port,
-                    )))
+                    interruptible(
+                        &attempt.cancel,
+                        TcpStream::connect((unbracket(&endpoint.host), endpoint.port)),
+                    )
                     .await?
                     .map_err(|_| NETWORK)?,
                 )
@@ -482,25 +504,19 @@ impl Manager {
                 address: tunnel.bind.clone(),
                 port: tunnel.port,
             });
-            timed(
-                connection
-                    .tcpip_forward(tunnel.bind.trim_matches(['[', ']']), u32::from(tunnel.port)),
-            )
-            .await?
-            .map_err(|error| match error {
-                russh::Error::RequestDenied => {
-                    Problem::terminal("SSH-сервер не разрешил удалённый порт или порт уже занят.")
-                }
-                _ => NETWORK,
-            })?;
+            timed(connection.tcpip_forward(unbracket(&tunnel.bind), u32::from(tunnel.port)))
+                .await?
+                .map_err(|error| match error {
+                    russh::Error::RequestDenied => Problem::terminal(
+                        "SSH-сервер не разрешил удалённый порт или порт уже занят.",
+                    ),
+                    _ => NETWORK,
+                })?;
         } else {
             attempt.listener = Some(
-                timed(TcpListener::bind((
-                    tunnel.bind.trim_matches(['[', ']']),
-                    tunnel.port,
-                )))
-                .await?
-                .map_err(bind_problem)?,
+                timed(TcpListener::bind((unbracket(&tunnel.bind), tunnel.port)))
+                    .await?
+                    .map_err(bind_problem)?,
             );
         }
         self.state(&tunnel.id, "running", "Туннель работает", None)
@@ -513,7 +529,11 @@ impl Manager {
                 _ = check.tick() => if attempt.sessions.iter().any(|session| session.is_closed()) { return Err(attempt.failure.lock().unwrap().take().unwrap_or(NETWORK)); },
                 Some(_) = attempt.copies.join_next(), if !attempt.copies.is_empty() => {},
                 accepted = accept_optional(attempt.listener.as_ref()), if attempt.listener.is_some() => {
-                    let (socket, origin) = accepted.map_err(|_| NETWORK)?;
+                    // A transient accept error must not tear down the tunnel.
+                    let Ok((socket, origin)) = accepted else {
+                        tokio::time::sleep(ACCEPT_RETRY).await;
+                        continue;
+                    };
                     let connection = connection.clone();
                     let target = tunnel.target.clone();
                     let port = tunnel.target_port;
@@ -526,7 +546,7 @@ impl Manager {
                     let target = tunnel.target.clone();
                     let port = tunnel.target_port;
                     attempt.copies.spawn(async move {
-                        match timed(TcpStream::connect((target.trim_matches(['[', ']']), port))).await {
+                        match timed(TcpStream::connect((unbracket(&target), port))).await {
                             Ok(Ok(mut socket)) => {
                                 reply.accept().await;
                                 let mut stream = channel.into_stream();
@@ -638,16 +658,18 @@ fn now() -> f64 {
 fn update(runtime: &mut Runtime, state: &str, message: &str) {
     runtime.state = state.into();
     runtime.message = message.into();
-    let seconds = now() as u64 % 86400;
-    runtime.logs.push_back(format!(
-        "{:02}:{:02}:{:02}  {message}",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
-    ));
+    runtime
+        .logs
+        .push_back(log_line(&chrono::Local::now(), message));
     while runtime.logs.len() > 300 {
         runtime.logs.pop_front();
     }
+}
+fn log_line<Zone: chrono::TimeZone>(time: &chrono::DateTime<Zone>, message: &str) -> String
+where
+    Zone::Offset: std::fmt::Display,
+{
+    format!("{}  {message}", time.format("%H:%M:%S"))
 }
 fn read_trust(path: &Path) -> std::result::Result<HashMap<String, String>, Problem> {
     let problem =
@@ -697,6 +719,16 @@ async fn timed<T>(operation: impl Future<Output = T>) -> std::result::Result<T, 
             message: "Истекло время ожидания SSH-соединения.",
             retryable: true,
         })
+}
+async fn interruptible<T>(
+    cancel: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> std::result::Result<T, Problem> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(CANCELLED),
+        value = timed(operation) => value,
+    }
 }
 fn bind_problem(_: io::Error) -> Problem {
     Problem::terminal(
@@ -970,8 +1002,8 @@ fn remote_matches(route: &RemoteRoute, address: &str, port: u32) -> bool {
     if port != u32::from(route.port) {
         return false;
     }
-    let configured = route.address.trim_matches(['[', ']']).to_lowercase();
-    let address = address.trim_matches(['[', ']']).to_lowercase();
+    let configured = unbracket(&route.address).to_lowercase();
+    let address = unbracket(address).to_lowercase();
     configured == address
         || (configured == "localhost" && address.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()))
 }
@@ -1006,25 +1038,79 @@ async fn agent_auth(
         let identities = agent.request_identities().await.map_err(|_| AUTH)?;
         let hash = session.best_supported_rsa_hash().await?.flatten();
         for identity in identities {
-            let result = match identity {
+            let unsigned = AtomicBool::new(false);
+            let mut signer = SkippingSigner {
+                signer: &mut agent,
+                unsigned: &unsigned,
+            };
+            let outcome = match identity {
                 keys::agent::AgentIdentity::PublicKey { key, .. } => {
-                    session
-                        .authenticate_publickey_with(user, key, hash, &mut agent)
-                        .await
+                    skip_unsigned(
+                        session.authenticate_publickey_with(user, key, hash, &mut signer),
+                        &unsigned,
+                    )
+                    .await
                 }
                 keys::agent::AgentIdentity::Certificate { certificate, .. } => {
-                    session
-                        .authenticate_certificate_with(user, certificate, hash, &mut agent)
-                        .await
+                    skip_unsigned(
+                        session.authenticate_certificate_with(user, certificate, hash, &mut signer),
+                        &unsigned,
+                    )
+                    .await
                 }
-            }
-            .map_err(|_| AUTH)?;
-            if result.success() {
-                return Ok(true);
+            };
+            match outcome {
+                Some(Ok(result)) if result.success() => return Ok(true),
+                Some(Err(_)) => return Err(AUTH),
+                // Rejected or unsigned: try the next key.
+                _ => {}
             }
         }
         Ok(false)
     }
+}
+/// Hands back the unsigned request so russh skips a key the agent cannot sign with.
+#[cfg(any(unix, windows))]
+struct SkippingSigner<'a, S> {
+    signer: &'a mut S,
+    unsigned: &'a AtomicBool,
+}
+#[cfg(any(unix, windows))]
+impl<S: russh::Signer + Send> russh::Signer for SkippingSigner<'_, S> {
+    type Error = S::Error;
+    async fn auth_sign(
+        &mut self,
+        key: &keys::agent::AgentIdentity,
+        hash: Option<HashAlg>,
+        request: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, S::Error> {
+        let untouched = request.clone();
+        match self.signer.auth_sign(key, hash, request).await {
+            Ok(signed) => Ok(signed),
+            Err(_) => {
+                self.unsigned.store(true, Ordering::Release);
+                Ok(untouched)
+            }
+        }
+    }
+}
+/// Ends with `None` once the signer has given up on this key.
+#[cfg(any(unix, windows))]
+async fn skip_unsigned<T>(attempt: impl Future<Output = T>, unsigned: &AtomicBool) -> Option<T> {
+    tokio::pin!(attempt);
+    let mut delivered = false;
+    std::future::poll_fn(|cx| match attempt.as_mut().poll(cx) {
+        Poll::Ready(value) => Poll::Ready(Some(value)),
+        Poll::Pending if !unsigned.load(Ordering::Acquire) => Poll::Pending,
+        Poll::Pending if delivered => Poll::Ready(None),
+        Poll::Pending => {
+            // One more poll lets the pending channel send complete.
+            delivered = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 async fn accept_optional(
     listener: Option<&TcpListener>,
@@ -1050,7 +1136,7 @@ async fn local_connection(
         (target, port)
     };
     let channel = match timed(connection.channel_open_direct_tcpip(
-        target.trim_matches(['[', ']']),
+        unbracket(&target),
         u32::from(port),
         origin.ip().to_string(),
         u32::from(origin.port()),
@@ -1390,6 +1476,63 @@ mod tests {
             &read_trust(&path).unwrap()["[first.example]:22"],
             &key
         ));
+    }
+    #[test]
+    fn log_lines_use_the_wall_clock_of_the_given_time_zone() {
+        use chrono::TimeZone;
+        let moscow = chrono::FixedOffset::east_opt(3 * 3600).unwrap();
+        let time = moscow.timestamp_opt(11 * 3600 + 5 * 60 + 7, 0).unwrap();
+        assert_eq!(log_line(&time, "Подключение…"), "14:05:07  Подключение…");
+        assert_eq!(
+            log_line(&time.with_timezone(&chrono::Utc), "x"),
+            "11:05:07  x"
+        );
+    }
+    #[tokio::test]
+    async fn cancellation_interrupts_an_operation_that_ignores_the_transport() {
+        let cancel = CancellationToken::new();
+        let waiting = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { interruptible(&cancel, std::future::pending::<()>()).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        cancel.cancel();
+        let problem = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(!problem.retryable);
+        assert_eq!(
+            interruptible(&CancellationToken::new(), async { 7 })
+                .await
+                .unwrap(),
+            7
+        );
+    }
+    #[tokio::test]
+    async fn stop_returns_promptly_while_a_silent_server_holds_the_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Manager::new(directory.path().join("hosts.json"));
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut tunnel = tunnel();
+        tunnel.server.host = "127.0.0.1".into();
+        tunnel.server.port = silent.local_addr().unwrap().port();
+        manager.start(tunnel.clone()).await.unwrap();
+        // Hold the socket open without an SSH banner.
+        let (_held, _) = tokio::time::timeout(Duration::from_secs(3), silent.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (states, waiting) = manager.states().await;
+        assert_eq!(states[&tunnel.id], "connecting");
+        assert!(waiting.is_empty());
+        tokio::time::timeout(Duration::from_secs(2), manager.stop(&tunnel.id))
+            .await
+            .expect("stop must not wait for the network timeout")
+            .unwrap();
+        assert_eq!(manager.states().await.0[&tunnel.id], "stopped");
     }
     #[test]
     fn runtime_log_is_bounded() {

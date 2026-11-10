@@ -118,11 +118,15 @@ pub fn run() -> Result<()> {
             Some(command @ (Command::Background | Command::Status | Command::Stop)) => runtime.block_on(async {
                 if !matches!(command,Command::Background) && !store.sidecar(".background.json").exists() { println!("Фоновый КРОТ не запущен."); return Ok(()); }
                 let client = if matches!(command,Command::Background) { background::ensure_running(&store).await? } else { Client::new(&store) };
-                if matches!(command,Command::Stop) {
-                    client.request("shutdown",Value::Null).await?;
-                    println!("КРОТ остановлен. Все туннели закрыты; выбор для следующего запуска сохранён.");
-                } else {
-                    let snapshot = client.snapshot().await?;
+                let reply = if matches!(command,Command::Stop) { client.request("shutdown",Value::Null).await.map(|_| None) }
+                    else { client.snapshot().await.map(Some) };
+                let snapshot = match reply {
+                    // A killed daemon leaves its address but holds no lease.
+                    Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|cause| cause.kind() == std::io::ErrorKind::ConnectionRefused)
+                        && background::try_lease(&store)?.is_some() => { println!("Фоновый КРОТ не запущен."); return Ok(()); }
+                    reply => reply?,
+                };
+                if let Some(snapshot) = snapshot {
                     println!("КРОТ работает в фоне.");
                     for tunnel in snapshot.config.tunnels {
                         let status = if snapshot.prompts.contains_key(&tunnel.id) {"ждёт вашего участия"}
@@ -131,6 +135,8 @@ pub fn run() -> Result<()> {
                         }};
                         println!("{}\t{}",tunnel.name,status);
                     }
+                } else {
+                    println!("КРОТ остановлен. Все туннели закрыты; выбор для следующего запуска сохранён.");
                 }
                 Ok(())
             }),

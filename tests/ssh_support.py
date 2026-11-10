@@ -198,7 +198,8 @@ class Server(asyncssh.SSHServer):
         return self.client_key is not None
 
     def validate_public_key(self, username, key):
-        return key == self.client_key
+        accepted = self.client_key if isinstance(self.client_key, (list, tuple)) else [self.client_key]
+        return key in accepted
 
     def connection_requested(self, host, port, orig_host, orig_port):
         self.owner.forwarded.append(port)

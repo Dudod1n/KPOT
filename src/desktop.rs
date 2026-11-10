@@ -21,6 +21,8 @@ const POLL_TIME: Duration = Duration::from_millis(450);
 const MAX_DESKTOP_PREFERENCES_BYTES: usize = 4096;
 const CLOSE_PREFERENCE_ERROR: &str =
     "Не удалось запомнить выбор. Повторите попытку или нажмите «Назад».";
+const KEY_DIALOG_ERROR: &str =
+    "Не удалось открыть диалог выбора файла. Введите путь к ключу вручную.";
 const SKIP_UPDATE_ERROR: &str =
     "Не удалось запомнить пропущенную версию. Повторите попытку или нажмите «Позже».";
 const INK: Color32 = Color32::from_rgb(225, 232, 232);
@@ -268,6 +270,11 @@ enum Event {
     UpdateSkipped(Result<(), String>),
     UpdatePrepared(Result<crate::update::PreparedUpdate, String>),
     InstallerLaunched(Result<(), String>),
+    #[cfg(target_os = "linux")]
+    KeyPicked {
+        id: u64,
+        result: Result<Option<PathBuf>, ()>,
+    },
 }
 
 enum UpdateStage {
@@ -324,6 +331,8 @@ pub(crate) struct Desktop {
     update: Option<UpdateDialog>,
     pending_operations: usize,
     about_quote: Option<usize>,
+    #[cfg(target_os = "linux")]
+    key_picks: u64,
 }
 
 enum Dialog {
@@ -417,6 +426,21 @@ struct TunnelForm {
     editing: bool,
     error: String,
     busy: bool,
+    #[cfg(target_os = "linux")]
+    picking: Option<KeyPick>,
+}
+/// A file dialog running off the window thread; dropping it cancels the wait.
+#[cfg(target_os = "linux")]
+struct KeyPick {
+    id: u64,
+    target: KeyTarget,
+    task: tokio::task::AbortHandle,
+}
+#[cfg(target_os = "linux")]
+impl Drop for KeyPick {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum KeyTarget {
@@ -449,6 +473,8 @@ impl TunnelForm {
             editing,
             error: String::new(),
             busy: false,
+            #[cfg(target_os = "linux")]
+            picking: None,
         };
         form.original = form.signature();
         form
@@ -494,6 +520,16 @@ impl TunnelForm {
         crate::config::validate_tunnel(&tunnel, tunnels)?;
         Ok(tunnel)
     }
+    fn picking(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.picking.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
     fn swap_jump(&mut self, index: usize, other: usize) {
         self.draft.jumps.swap(index, other);
         self.jump_ports.swap(index, other);
@@ -523,18 +559,23 @@ fn key_directory(key: &str) -> Option<PathBuf> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
 }
+/// Exports the window handle for the portal; the dialog itself runs off this thread.
 #[cfg(target_os = "linux")]
-fn pick_key_file(
+fn window_identifier(
     frame: &eframe::Frame,
-    directory: Option<&std::path::Path>,
     runtime: &tokio::runtime::Runtime,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> Option<ashpd::WindowIdentifier> {
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+    let window = frame.window_handle().ok()?.as_raw();
+    let display = frame.display_handle().ok()?.as_raw();
     runtime.block_on(async {
-        let window = frame.window_handle()?.as_raw();
-        let display = frame.display_handle()?.as_raw();
-        let parent = ashpd::WindowIdentifier::from_raw_handle(&window, Some(&display)).await;
-        portal_key_file(parent, directory).await
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            ashpd::WindowIdentifier::from_raw_handle(&window, Some(&display)),
+        )
+        .await
+        .ok()
+        .flatten()
     })
 }
 #[cfg(target_os = "linux")]
@@ -583,7 +624,6 @@ async fn portal_key_file(
 fn pick_key_file(
     frame: &eframe::Frame,
     directory: Option<&std::path::Path>,
-    _: &tokio::runtime::Runtime,
 ) -> anyhow::Result<Option<PathBuf>> {
     let mut dialog = rfd::FileDialog::new()
         .set_title("Выберите приватный ключ")
@@ -641,6 +681,8 @@ impl Desktop {
             update: None,
             pending_operations: 0,
             about_quote: None,
+            #[cfg(target_os = "linux")]
+            key_picks: 0,
         }
     }
     fn check_updates(&mut self, ctx: &egui::Context, manual: bool) {
@@ -749,6 +791,17 @@ impl Desktop {
                     }
                     Err(error) => self.update_failed("Не удалось подготовить обновление.", error),
                 },
+                #[cfg(target_os = "linux")]
+                Event::KeyPicked { id, result } => {
+                    if let Some(Dialog::Form(form)) = &mut self.dialog
+                        && let Some(pick) = form.picking.take_if(|pick| pick.id == id)
+                    {
+                        match result {
+                            Ok(path) => form.select_key(pick.target, path),
+                            Err(()) => form.error = KEY_DIALOG_ERROR.into(),
+                        }
+                    }
+                }
                 Event::InstallerLaunched(result) => match result {
                     Ok(()) => self.close_window(ctx),
                     Err(error) => self.update_failed("Не удалось запустить установщик.", error),
@@ -1535,7 +1588,7 @@ impl Desktop {
             }
         });
         let blocked = self.confirm.is_some()
-            || matches!(&dialog, Dialog::Form(form) if form.busy)
+            || matches!(&dialog, Dialog::Form(form) if form.busy || form.picking())
             || matches!(&dialog, Dialog::Settings(settings) if settings.busy);
         if response.should_close() && !blocked {
             action = DialogAction::Close;
@@ -1874,7 +1927,7 @@ impl Desktop {
                 }
                 Confirm::Exit => {
                     ui.heading("Закрыть диспетчерскую?");
-                    ui.label("В фоне КРОТ продолжит держать туннели. Повторный запуск откроет их текущее состояние.");
+                    ui.label("В фоне КРОТ продолжит держать туннели. Значок в трее или повторный запуск откроет их текущее состояние.");
                     ui.weak("«Остановить КРОТ» закроет все соединения. Включённые туннели восстановятся при следующем запуске.");
                     ui.add_enabled_ui(!self.shutdown_busy, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -2123,12 +2176,31 @@ impl eframe::App for Desktop {
             let directory = target
                 .endpoint(&mut form.draft)
                 .and_then(|endpoint| key_directory(&endpoint.key));
-            match pick_key_file(frame, directory.as_deref(), &backend.runtime) {
-                Ok(path) => form.select_key(target, path),
-                Err(_) => {
-                    form.error =
-                        "Не удалось открыть диалог выбора файла. Введите путь к ключу вручную."
-                            .into()
+            #[cfg(target_os = "linux")]
+            {
+                let parent = window_identifier(frame, &backend.runtime);
+                self.key_picks += 1;
+                let (id, tx, ctx) = (self.key_picks, self.tx.clone(), ctx.clone());
+                let task = backend.runtime.spawn(async move {
+                    let result = portal_key_file(parent, directory.as_deref())
+                        .await
+                        .map_err(|_| ());
+                    let _ = tx.send(Event::KeyPicked { id, result });
+                    ctx.request_repaint();
+                });
+                form.picking = Some(KeyPick {
+                    id,
+                    target,
+                    task: task.abort_handle(),
+                });
+            }
+            // The native dialog runs its own modal loop.
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = backend;
+                match pick_key_file(frame, directory.as_deref()) {
+                    Ok(path) => form.select_key(target, path),
+                    Err(_) => form.error = KEY_DIALOG_ERROR.into(),
                 }
             }
             ctx.request_repaint();
@@ -2227,7 +2299,7 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
         ui.colored_label(tone(ui, RED), &form.error);
     }
     let content_height = max_height - if form.error.is_empty() { 0.0 } else { 45.0 };
-    ui.add_enabled_ui(!form.busy, |ui| {
+    ui.add_enabled_ui(!form.busy && !form.picking(), |ui| {
         egui::ScrollArea::vertical().id_salt("form_scroll").max_height(content_height).show(ui, |ui| {
             field(ui, "Название туннеля", &mut form.draft.name);
             ui.label("Тип туннеля");
@@ -2295,10 +2367,19 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
     if form.busy {
         ui.weak("Сохраняем…");
     }
+    #[cfg(target_os = "linux")]
+    if form.picking.is_some() {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Выберите файл ключа в открывшемся диалоге…");
+            if ui.button("Отменить выбор").clicked() {
+                form.picking = None;
+            }
+        });
+    }
     action
 }
 
-const HELP: &str = "Диспетчерская\n↑ / ↓  Выбрать туннель\nSpace  Запуск / остановка / отмена подключения\nEnter  Открыть запрос ожидающего туннеля\nN / E  Создать / изменить\nL      Журнал\nDelete Удалить\nS      Настройки\n? / F1 Справка\nQ      Меню выхода\n\nВ формах\nTab / Shift+Tab  Следующее / предыдущее поле\nCtrl+S / Ctrl+Enter  Сохранить\nEsc  Назад / отмена\n\nL: локальный порт → сервис со стороны SSH-сервера.\nR: порт на SSH-сервере → сервис со стороны вашего устройства.\nD: локальный SOCKS5-прокси → сеть SSH-сервера.\n\nJump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.\n\nПароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.\n\nКрестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.\n\nВ настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.\n\nНа заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.";
+const HELP: &str = "Диспетчерская\n↑ / ↓  Выбрать туннель\nSpace  Запуск / остановка / отмена подключения\nEnter  Открыть запрос ожидающего туннеля\nN / E  Создать / изменить\nL      Журнал\nDelete Удалить\nS      Настройки\n? / F1 Справка\nQ      Меню выхода\n\nВ формах\nTab / Shift+Tab  Следующее / предыдущее поле\nCtrl+S / Ctrl+Enter  Сохранить\nEsc  Назад / отмена\n\nL: локальный порт → сервис со стороны SSH-сервера.\nR: порт на SSH-сервере → сервис со стороны вашего устройства.\nD: локальный SOCKS5-прокси → сеть SSH-сервера.\n\nJump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.\n\nПароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.\n\nКрестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее или повторным запуском КРОТа. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.\n\nВ настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.\n\nНа заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.";
 
 #[cfg(test)]
 mod tests {
@@ -2589,6 +2670,74 @@ mod tests {
             .await
             .expect("Portal disappearance must return control to the form");
         assert!(result.is_err());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_dialog_result_arrives_as_an_event_and_stale_or_cancelled_picks_are_ignored() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        let pick = |id| KeyPick {
+            id,
+            target: KeyTarget::Server,
+            task: runtime.spawn(std::future::pending::<()>()).abort_handle(),
+        };
+        let mut form = TunnelForm::new(Some(tunnel()));
+        form.draft.server.auth = "key".into();
+        form.picking = Some(pick(2));
+        app.dialog = Some(Dialog::Form(Box::new(form)));
+        let picked = |app: &mut Desktop, id, result| {
+            app.tx.send(Event::KeyPicked { id, result }).unwrap();
+            let _ = render(app, &ctx, [700.0, 900.0]);
+            let output = render(app, &ctx, [700.0, 900.0]);
+            let Some(Dialog::Form(form)) = &app.dialog else {
+                panic!("The form stays open");
+            };
+            (
+                form.draft.server.key.clone(),
+                form.picking(),
+                form.error.clone(),
+                text_rect(&output, "Отменить выбор").is_some(),
+            )
+        };
+        // The window keeps drawing while the dialog is open.
+        let _ = render(&mut app, &ctx, [700.0, 900.0]);
+        let output = render(&mut app, &ctx, [700.0, 900.0]);
+        assert!(text_rect(&output, "Отменить выбор").is_some());
+        assert_eq!(
+            picked(&mut app, 1, Ok(Some("/keys/stale".into()))),
+            (String::new(), true, String::new(), true),
+            "an answer to an earlier dialog must not touch the form"
+        );
+        assert_eq!(
+            picked(&mut app, 2, Ok(Some("/keys/id_ed25519".into()))),
+            ("/keys/id_ed25519".into(), false, String::new(), false)
+        );
+        let Some(Dialog::Form(form)) = &mut app.dialog else {
+            unreachable!()
+        };
+        form.picking = Some(pick(3));
+        let (key, picking, error, _) = picked(&mut app, 3, Err(()));
+        assert_eq!((key.as_str(), picking), ("/keys/id_ed25519", false));
+        assert_eq!(error, KEY_DIALOG_ERROR);
+        let Some(Dialog::Form(form)) = &mut app.dialog else {
+            unreachable!()
+        };
+        let abandoned = runtime.spawn(std::future::pending::<()>());
+        form.picking = Some(KeyPick {
+            id: 4,
+            target: KeyTarget::Server,
+            task: abandoned.abort_handle(),
+        });
+        form.picking = None;
+        assert!(
+            runtime.block_on(abandoned).unwrap_err().is_cancelled(),
+            "cancelling the choice abandons the portal request"
+        );
     }
     #[test]
     fn browse_request_is_emitted_only_for_an_editable_key_endpoint() {

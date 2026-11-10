@@ -60,6 +60,15 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         await self.echo.wait_closed()
         self.temp.cleanup()
 
+    @property
+    def endpoint(self):
+        return self.store.path.with_name('config.json.background.json')
+
+    async def connections_closed(self):
+        async with asyncio.timeout(5):
+            while self.connections:
+                await asyncio.sleep(.02)
+
     async def request(self, command, payload=None):
         return await asyncio.to_thread(self.client.request, command, payload)
 
@@ -169,9 +178,7 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, self.store.path.read_text())
         await self.request('stop', tunnel.id)
         await self.assert_closed(tunnel.port)
-        async with asyncio.timeout(5):
-            while self.connections:
-                await asyncio.sleep(.02)
+        await self.connections_closed()
 
     @unittest.skipUnless(os.name != 'nt' and shutil.which('ssh-agent') and shutil.which('ssh-add'),
                          'Requires local OpenSSH agent executables')
@@ -206,6 +213,80 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         finally:
             agent.terminate()
             await agent.wait()
+
+    @unittest.skipIf(os.name == 'nt', 'The agent double listens on a Unix socket')
+    async def test_agent_key_that_cannot_sign_does_not_hide_the_next_key(self):
+        broken = asyncssh.generate_private_key('ssh-ed25519')
+        usable = asyncssh.generate_private_key('ssh-ed25519')
+        signed = []
+
+        def string(data):
+            return len(data).to_bytes(4, 'big') + data
+
+        async def agent(reader, writer):
+            try:
+                while True:
+                    message = await reader.readexactly(int.from_bytes(await reader.readexactly(4), 'big'))
+                    if message[0] == 11:  # SSH_AGENTC_REQUEST_IDENTITIES
+                        reply = b'\x0c' + (2).to_bytes(4, 'big') + b''.join(
+                            string(key.public_data) + string(b'test') for key in (broken, usable))
+                    elif message[0] == 13:  # SSH_AGENTC_SIGN_REQUEST
+                        size = int.from_bytes(message[1:5], 'big')
+                        blob, rest = message[5:5 + size], message[5 + size:]
+                        data = rest[4:4 + int.from_bytes(rest[:4], 'big')]
+                        signed.append(blob == usable.public_data)
+                        # The first key fails like a hardware key without its token.
+                        reply = (b'\x0e' + string(usable.sign(data, b'ssh-ed25519'))
+                                 if blob == usable.public_data else b'\x05')
+                    else:
+                        reply = b'\x05'
+                    writer.write(string(reply))
+                    await writer.drain()
+            except (asyncio.IncompleteReadError, ConnectionError):
+                pass
+            finally:
+                writer.close()
+
+        agent_path = str(self.path / 'agent.sock')
+        listener = await asyncio.start_unix_server(agent, agent_path)
+        try:
+            server = await self.server(client_key=[broken.convert_to_public(), usable.convert_to_public()])
+            tunnel = self.tunnel(server)
+            with patch.dict(os.environ, {'SSH_AUTH_SOCK': agent_path}):
+                await self.start(Config(tunnels=[tunnel]))
+            await self.request('start', tunnel.id)
+            await self.wait(tunnel)
+            await self.exchange(tunnel.port)
+            self.assertEqual(signed, [False, True], 'Both keys are offered in agent order')
+        finally:
+            listener.close()
+            await listener.wait_closed()
+
+    @unittest.skipIf(os.name == 'nt', 'Windows has no SIGTERM')
+    async def test_sigterm_closes_tunnels_and_removes_the_daemon_address(self):
+        server = await self.server()
+        tunnel = self.tunnel(server)
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        self.assertTrue(self.endpoint.exists())
+        self.process.terminate()
+        self.assertEqual(await asyncio.wait_for(self.process.wait(), 8), 0)
+        self.assertFalse(self.endpoint.exists(), 'A graceful stop removes the daemon address')
+        await self.assert_closed(tunnel.port)
+        await self.connections_closed()
+        self.assertTrue(self.store.load().tunnels[0].enabled, 'SIGTERM keeps the restore choice')
+
+    @unittest.skipIf(os.name == 'nt', 'Windows retries a refused loopback connection past the client timeout')
+    async def test_cli_reports_a_killed_daemon_as_not_running(self):
+        await self.start(Config())
+        self.process.kill()
+        await self.process.wait()
+        self.assertTrue(self.endpoint.exists(), 'A killed daemon cannot remove its address')
+        for command in ('status', 'stop'):
+            code, out, err = await self.cli(command)
+            self.assertEqual(code, 0, err)
+            self.assertIn('не запущен', out)
 
     async def test_deferred_password_does_not_block_other_tunnel(self):
         protected = await self.server(password='only-in-memory')
@@ -266,7 +347,7 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         await self.wait(tunnel)
         await self.request('shutdown')
         await asyncio.wait_for(self.process.wait(),8)
-        self.assertFalse(self.store.path.with_name('config.json.background.json').exists())
+        self.assertFalse(self.endpoint.exists())
         self.assertTrue(self.store.load().tunnels[0].enabled)
         await self.assert_closed(tunnel.port)
 
@@ -309,8 +390,7 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('must-not-echo',str(error.exception))
         self.assertEqual((await self.request('snapshot'))['config']['tunnels'],[])
         if os.name != 'nt':
-            endpoint = self.store.path.with_name('config.json.background.json')
-            self.assertEqual(endpoint.stat().st_mode & 0o777,0o600)
+            self.assertEqual(self.endpoint.stat().st_mode & 0o777,0o600)
 
     async def test_native_client_rejects_fake_server_before_sending_token(self):
         received = []
@@ -327,14 +407,13 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         server = await asyncio.start_server(fake,'127.0.0.1',0)
         self.servers.append(server)
         self.store.save(Config())
-        endpoint = self.store.path.with_name('config.json.background.json')
-        endpoint.write_text(json.dumps({'port':server.sockets[0].getsockname()[1],'token':'a' * 64}))
+        self.endpoint.write_text(json.dumps({'port':server.sockets[0].getsockname()[1],'token':'a' * 64}))
         code, _, _ = await self.cli('status')
         self.assertNotEqual(code,0)
         await asyncio.wait_for(finished.wait(),3)
         self.assertEqual(set(json.loads(received[0])),{'nonce'})
         self.assertEqual(received[1],b'', 'Client must not send its bearer token to an unverified server')
-        endpoint.unlink()
+        self.endpoint.unlink()
 
     async def test_activation_preserves_running_tunnel(self):
         server = await self.server()
