@@ -179,9 +179,34 @@ pub struct Process {
     pub path: String,
 }
 
-/// Executables are matched without regard to letter case, as Windows does.
+/// The identity of an executable for matching: letter case is ignored, as Windows does,
+/// and so is the version that self-updating applications keep in a directory name.
+/// Store packages live in `WindowsApps\Name_Version_Arch_Resource_Publisher`, Squirrel
+/// applications in `app-Version`; both move to a new directory with every update.
 pub fn path_key(path: &str) -> String {
-    path.trim().to_lowercase()
+    let path = path.trim().to_lowercase();
+    let mut packaged = false;
+    let segments: Vec<String> = path
+        .split('\\')
+        .map(|segment| {
+            let parts: Vec<&str> = segment.split('_').collect();
+            let key = if std::mem::take(&mut packaged) && parts.len() == 5 {
+                format!("{}_*_{}", parts[0], parts[4])
+            } else if segment.strip_prefix("app-").is_some_and(|version| {
+                version.starts_with(|first: char| first.is_ascii_digit())
+                    && version
+                        .chars()
+                        .all(|symbol| symbol.is_ascii_digit() || symbol == '.')
+            }) {
+                "app-*".into()
+            } else {
+                segment.to_owned()
+            };
+            packaged = segment == "windowsapps";
+            key
+        })
+        .collect();
+    segments.join("\\")
 }
 
 fn absolute(path: &str) -> bool {
@@ -478,6 +503,49 @@ mod tests {
         let mut unnamed = rule("c", "/bin/app", "socks");
         unnamed.name = "  ".into();
         assert!(validate_rule(&unnamed, &saved, &tunnels).is_err());
+    }
+
+    #[test]
+    fn updated_store_and_squirrel_applications_keep_matching_their_rule() {
+        let store = |version: &str| {
+            format!(
+                r"C:\Program Files\WindowsApps\Claude_{version}_x64__pzs8sxrjxfjjc\app\claude.exe"
+            )
+        };
+        assert_eq!(
+            path_key(&store("4.23118.1.0")),
+            path_key(&store("4.23200.0.0"))
+        );
+        assert_eq!(
+            path_key(r"C:\Users\u\AppData\Local\Discord\app-1.0.9163\Discord.exe"),
+            path_key(r"c:\users\u\appdata\local\discord\APP-1.0.9170\discord.exe")
+        );
+        // Another package, publisher or file is still another application.
+        for other in [
+            r"C:\Program Files\WindowsApps\Other_4.23118.1.0_x64__pzs8sxrjxfjjc\app\claude.exe",
+            r"C:\Program Files\WindowsApps\Claude_4.23118.1.0_x64__0000000000000\app\claude.exe",
+            r"C:\Program Files\WindowsApps\Claude_4.23118.1.0_x64__pzs8sxrjxfjjc\app\other.exe",
+        ] {
+            assert_ne!(path_key(other), path_key(&store("4.23118.1.0")), "{other}");
+        }
+        // Ordinary directories are compared as they are, underscores and dashes included.
+        for (left, right) in [
+            (r"C:\Tools\a_1_b_c_d\x.exe", r"C:\Tools\a_2_b_c_d\x.exe"),
+            (r"C:\Tools\app-beta\x.exe", r"C:\Tools\app-gamma\x.exe"),
+            (r"C:\Tools\app-1.0\x.exe", r"C:\Tools\app-1.0b\x.exe"),
+            ("/opt/app_1/x", "/opt/app_2/x"),
+        ] {
+            assert_ne!(path_key(left), path_key(right), "{left}");
+        }
+        let saved = [rule("a", &store("4.23118.1.0"), "socks")];
+        let error = validate_rule(
+            &rule("b", &store("4.23200.0.0"), "socks"),
+            &saved,
+            &[tunnel("socks", "D")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("уже есть правило"), "{error}");
     }
 
     #[test]
