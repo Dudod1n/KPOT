@@ -16,6 +16,9 @@ use std::{
 };
 use zeroize::Zeroize;
 
+mod apps_view;
+use apps_view::{AppForm, app_form_view};
+
 const FRAME_TIME: Duration = Duration::from_millis(180);
 const POLL_TIME: Duration = Duration::from_millis(450);
 const MAX_DESKTOP_PREFERENCES_BYTES: usize = 4096;
@@ -253,12 +256,14 @@ enum Operation {
     Toggle(String),
     SaveForm(String),
     Delete,
+    ToggleApp(String),
+    SaveApp(String),
     Settings,
     Answer,
     Shutdown,
 }
 enum Event {
-    Snapshot(Result<Snapshot, String>),
+    Snapshot(Result<Box<Snapshot>, String>),
     Complete(Operation, Result<(), String>),
     AutostartLoaded(Result<bool, String>),
     AutostartChanged(Result<bool, String>),
@@ -313,6 +318,11 @@ pub(crate) struct Desktop {
     snapshot: Option<Snapshot>,
     last_activation: u64,
     selected: Option<String>,
+    view: View,
+    selected_app: Option<String>,
+    busy_apps: HashSet<String>,
+    #[cfg(not(target_os = "linux"))]
+    browse_app: bool,
     dialog: Option<Dialog>,
     confirm: Option<Confirm>,
     deferred: HashSet<String>,
@@ -335,8 +345,15 @@ pub(crate) struct Desktop {
     key_picks: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Tunnels,
+    Apps,
+}
+
 enum Dialog {
     Form(Box<TunnelForm>),
+    AppForm(Box<AppForm>),
     Settings(SettingsDraft),
     Prompt(Box<PromptDialog>),
     Logs(String),
@@ -344,8 +361,29 @@ enum Dialog {
     About,
     Splash,
 }
+impl Dialog {
+    fn dirty(&self) -> bool {
+        match self {
+            Dialog::Form(form) => form.dirty(),
+            Dialog::AppForm(form) => form.dirty(),
+            _ => false,
+        }
+    }
+    fn saving(&self) -> bool {
+        match self {
+            Dialog::Form(form) => form.busy,
+            Dialog::AppForm(form) => form.busy,
+            Dialog::Settings(settings) => settings.busy,
+            _ => false,
+        }
+    }
+}
 enum Confirm {
     Delete {
+        id: String,
+        name: String,
+    },
+    DeleteApp {
         id: String,
         name: String,
     },
@@ -727,6 +765,11 @@ impl Desktop {
             snapshot: None,
             last_activation: 0,
             selected: None,
+            view: View::Tunnels,
+            selected_app: None,
+            busy_apps: HashSet::new(),
+            #[cfg(not(target_os = "linux"))]
+            browse_app: false,
             dialog: None,
             confirm: None,
             deferred: HashSet::new(),
@@ -780,7 +823,7 @@ impl Desktop {
         let (client, tx, ctx) = (backend.client.clone(), self.tx.clone(), ctx.clone());
         backend.runtime.spawn(async move {
             let result = client.snapshot().await.map_err(|_| "Нет связи с фоновым КРОТом. Повторяем подключение; последнее состояние сохранено на экране.".into());
-            let _ = tx.send(Event::Snapshot(result));
+            let _ = tx.send(Event::Snapshot(result.map(Box::new)));
             ctx.request_repaint();
         });
     }
@@ -887,6 +930,13 @@ impl Desktop {
                                 self.selected =
                                     snapshot.config.tunnels.first().map(|t| t.id.clone());
                             }
+                            if self
+                                .selected_app
+                                .as_ref()
+                                .is_none_or(|id| !snapshot.apps.iter().any(|rule| &rule.id == id))
+                            {
+                                self.selected_app = snapshot.apps.first().map(|r| r.id.clone());
+                            }
                             self.deferred.retain(|id| {
                                 snapshot.prompts.values().any(|prompt| &prompt.id == id)
                             });
@@ -912,7 +962,7 @@ impl Desktop {
                             {
                                 self.dialog = None;
                             }
-                            self.snapshot = Some(snapshot);
+                            self.snapshot = Some(*snapshot);
                         }
                         Err(error) => {
                             if self.snapshot.is_some()
@@ -938,6 +988,14 @@ impl Desktop {
                     if let Operation::Toggle(id) = &operation {
                         self.busy_tunnels.remove(id);
                     }
+                    if let Operation::ToggleApp(id) = &operation {
+                        self.busy_apps.remove(id);
+                    }
+                    if matches!(operation, Operation::SaveApp(_))
+                        && let Some(Dialog::AppForm(form)) = &mut self.dialog
+                    {
+                        form.busy = false;
+                    }
                     if matches!(operation, Operation::SaveForm(_))
                         && let Some(Dialog::Form(form)) = &mut self.dialog
                     {
@@ -956,6 +1014,11 @@ impl Desktop {
                                 {
                                     form.error = error
                                 }
+                                Some(Dialog::AppForm(form))
+                                    if matches!(operation, Operation::SaveApp(_)) =>
+                                {
+                                    form.error = error
+                                }
                                 Some(Dialog::Settings(settings))
                                     if matches!(operation, Operation::Settings) =>
                                 {
@@ -970,6 +1033,10 @@ impl Desktop {
                             match operation {
                                 Operation::SaveForm(id) => {
                                     self.selected = Some(id);
+                                    self.dialog = None;
+                                }
+                                Operation::SaveApp(id) => {
+                                    self.selected_app = Some(id);
                                     self.dialog = None;
                                 }
                                 Operation::Delete => {
@@ -1135,28 +1202,25 @@ impl Desktop {
     fn close_busy(&self) -> bool {
         self.shutdown_busy
             || self.update.as_ref().is_some_and(UpdateDialog::busy)
-            || matches!(&self.dialog, Some(Dialog::Form(form)) if form.busy)
-            || matches!(&self.dialog, Some(Dialog::Settings(settings)) if settings.busy)
+            || self.dialog.as_ref().is_some_and(Dialog::saving)
     }
     fn request_exit(&mut self) {
         if self.close_busy() || self.confirm.is_some() {
             return;
         }
-        self.confirm = Some(
-            if matches!(&self.dialog, Some(Dialog::Form(form)) if form.dirty()) {
-                Confirm::Discard {
-                    after: AfterDiscard::Exit,
-                }
-            } else {
-                Confirm::Exit
-            },
-        );
+        self.confirm = Some(if self.dialog.as_ref().is_some_and(Dialog::dirty) {
+            Confirm::Discard {
+                after: AfterDiscard::Exit,
+            }
+        } else {
+            Confirm::Exit
+        });
     }
     fn request_background(&mut self, ctx: &egui::Context) {
         if self.close_busy() || self.confirm.is_some() {
             return;
         }
-        if matches!(&self.dialog, Some(Dialog::Form(form)) if form.dirty()) {
+        if self.dialog.as_ref().is_some_and(Dialog::dirty) {
             self.confirm = Some(Confirm::Discard {
                 after: AfterDiscard::Background,
             });
@@ -1236,17 +1300,31 @@ impl Desktop {
             return;
         }
         let pressed = |key| ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key));
-        if pressed(Key::ArrowDown) {
-            self.move_selection(1);
+        if pressed(Key::Num1) {
+            self.view = View::Tunnels;
         }
-        if pressed(Key::ArrowUp) {
-            self.move_selection(-1);
+        if pressed(Key::Num2) {
+            self.view = View::Apps;
+        }
+        let apps = self.view == View::Apps;
+        for (key, delta) in [(Key::ArrowDown, 1), (Key::ArrowUp, -1)] {
+            if pressed(key) {
+                if apps {
+                    self.move_app_selection(delta);
+                } else {
+                    self.move_selection(delta);
+                }
+            }
         }
         if pressed(Key::Q) {
             self.request_exit();
         }
         if pressed(Key::N) && self.snapshot.is_some() {
-            self.dialog = Some(Dialog::Form(Box::new(TunnelForm::new(None))));
+            self.dialog = Some(if apps {
+                Dialog::AppForm(Box::new(AppForm::new(None)))
+            } else {
+                Dialog::Form(Box::new(TunnelForm::new(None)))
+            });
         }
         if pressed(Key::S) {
             self.open_settings(ctx);
@@ -1255,7 +1333,22 @@ impl Desktop {
         {
             self.dialog = Some(Dialog::Help);
         }
-        if let Some(tunnel) = self.selected_tunnel() {
+        if apps {
+            if let Some(rule) = self.selected_app() {
+                if pressed(Key::Space) {
+                    self.toggle_app(ctx, &rule);
+                }
+                if pressed(Key::E) {
+                    self.dialog = Some(Dialog::AppForm(Box::new(AppForm::new(Some(rule.clone())))));
+                }
+                if pressed(Key::Delete) {
+                    self.confirm = Some(Confirm::DeleteApp {
+                        id: rule.id,
+                        name: rule.name,
+                    });
+                }
+            }
+        } else if let Some(tunnel) = self.selected_tunnel() {
             if pressed(Key::Space) {
                 self.toggle(ctx, &tunnel);
             }
@@ -1306,14 +1399,33 @@ impl Desktop {
             });
             ui.add_space(5.0);
             ui.horizontal_wrapped(|ui| {
+                for (view, label) in [(View::Tunnels, "1 Туннели"), (View::Apps, "2 Приложения")]
+                {
+                    if ui
+                        .add(egui::Button::new(label).selected(self.view == view))
+                        .clicked()
+                    {
+                        self.view = view;
+                    }
+                }
+                ui.separator();
+                let apps = self.view == View::Apps;
                 if ui
                     .add_enabled(
                         self.snapshot.is_some(),
-                        egui::Button::new("N Новый туннель"),
+                        egui::Button::new(if apps {
+                            "N Новое правило"
+                        } else {
+                            "N Новый туннель"
+                        }),
                     )
                     .clicked()
                 {
-                    self.dialog = Some(Dialog::Form(Box::new(TunnelForm::new(None))));
+                    self.dialog = Some(if apps {
+                        Dialog::AppForm(Box::new(AppForm::new(None)))
+                    } else {
+                        Dialog::Form(Box::new(TunnelForm::new(None)))
+                    });
                 }
                 if ui
                     .add_enabled(self.snapshot.is_some(), egui::Button::new("S Настройки"))
@@ -1331,10 +1443,25 @@ impl Desktop {
             ui.add_space(5.0);
         });
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            let apps = self.view == View::Apps;
             let (running, waiting, total) = self
                 .snapshot
                 .as_ref()
                 .map(|snapshot| {
+                    if apps {
+                        let count = |states: &[&str]| {
+                            snapshot
+                                .app_runtimes
+                                .values()
+                                .filter(|runtime| states.contains(&runtime.state.as_str()))
+                                .count()
+                        };
+                        return (
+                            count(&["running"]),
+                            count(&["blocked", "direct", "orphan"]),
+                            snapshot.apps.len(),
+                        );
+                    }
                     (
                         snapshot
                             .runtimes
@@ -1351,7 +1478,11 @@ impl Desktop {
                 if waiting > 0 {
                     ui.colored_label(tone(ui, AMBER), format!("Ждут участия: {waiting}"));
                 }
-                ui.weak("↑ ↓ Выбор   Space Пуск / стоп   Enter Запрос   L Журнал");
+                ui.weak(if apps {
+                    "↑ ↓ Выбор   Space Вкл / выкл   1 2 Вкладки"
+                } else {
+                    "↑ ↓ Выбор   Space Пуск / стоп   Enter Запрос   L Журнал   1 2 Вкладки"
+                });
             });
             if !self.error.is_empty() {
                 ui.horizontal_wrapped(|ui| {
@@ -1373,6 +1504,10 @@ impl Desktop {
             .max_width(400.0)
             .resizable(true)
             .show(ctx, |ui| {
+                if self.view == View::Apps {
+                    self.apps_side(ui);
+                    return;
+                }
                 ui.add_space(12.0);
                 ui.weak("Мои туннели");
                 ui.add_space(5.0);
@@ -1415,7 +1550,9 @@ impl Desktop {
             egui::ScrollArea::vertical()
                 .id_salt("detail_scroll")
                 .show(ui, |ui| {
-                    if let Some(tunnel) = self.selected_tunnel() {
+                    if self.view == View::Apps {
+                        self.apps_main(ui, ctx);
+                    } else if let Some(tunnel) = self.selected_tunnel() {
                         self.detail(ui, ctx, &tunnel);
                     } else {
                         ui.heading("На участке");
@@ -1553,6 +1690,10 @@ impl Desktop {
             ui.set_width(width);
             match &mut dialog {
                 Dialog::Form(form) => { action = form_view(ui, form, max_height); }
+                Dialog::AppForm(form) => {
+                    let tunnels = self.snapshot.as_ref().map(|snapshot| snapshot.config.tunnels.as_slice()).unwrap_or_default();
+                    action = app_form_view(ui, form, tunnels, max_height);
+                }
                 Dialog::Settings(settings) => {
                     ui.heading("Настройки");
                     if settings.busy { ui.disable(); }
@@ -1652,22 +1793,25 @@ impl Desktop {
             }
         });
         let blocked = self.confirm.is_some()
-            || matches!(&dialog, Dialog::Form(form) if form.busy || form.picking())
-            || matches!(&dialog, Dialog::Settings(settings) if settings.busy);
+            || dialog.saving()
+            || matches!(&dialog, Dialog::Form(form) if form.picking());
         if response.should_close() && !blocked {
             action = DialogAction::Close;
         }
         if !blocked
-            && matches!(&dialog, Dialog::Form(_) | Dialog::Settings(_))
+            && matches!(
+                &dialog,
+                Dialog::Form(_) | Dialog::AppForm(_) | Dialog::Settings(_)
+            )
             && ctx.input_mut(|input| {
                 input.consume_key(egui::Modifiers::CTRL, Key::S)
                     || input.consume_key(egui::Modifiers::CTRL, Key::Enter)
             })
         {
-            action = if matches!(&dialog, Dialog::Form(_)) {
-                DialogAction::SaveForm(false)
-            } else {
-                DialogAction::SaveSettings
+            action = match &dialog {
+                Dialog::Form(_) => DialogAction::SaveForm(false),
+                Dialog::AppForm(_) => DialogAction::SaveApp,
+                _ => DialogAction::SaveSettings,
             };
         }
         match action {
@@ -1686,7 +1830,7 @@ impl Desktop {
                 self.check_updates(ctx, true);
             }
             DialogAction::Close => {
-                if matches!(&dialog, Dialog::Form(form) if form.dirty()) {
+                if dialog.dirty() {
                     self.confirm = Some(Confirm::Discard {
                         after: AfterDiscard::CloseDialog,
                     });
@@ -1720,6 +1864,31 @@ impl Desktop {
                                 Operation::SaveForm(tunnel.id),
                                 "save_checked",
                                 json!({"before": snapshot.config, "config": config}),
+                            );
+                        }
+                    }
+                }
+                self.dialog = Some(dialog);
+            }
+            DialogAction::BrowseApp => {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.browse_app = true;
+                }
+                self.dialog = Some(dialog);
+            }
+            DialogAction::SaveApp => {
+                if let (Dialog::AppForm(form), Some(snapshot)) = (&mut dialog, &self.snapshot) {
+                    match form.candidate(&snapshot.apps, &snapshot.config.tunnels) {
+                        Err(error) => form.error = error.to_string(),
+                        Ok(rules) => {
+                            form.busy = true;
+                            form.error.clear();
+                            self.request(
+                                ctx,
+                                Operation::SaveApp(form.draft.id.clone()),
+                                "apps_save",
+                                json!({"before": snapshot.apps, "rules": rules}),
                             );
                         }
                     }
@@ -1966,9 +2135,21 @@ impl Desktop {
                         if ui.button(RichText::new("Удалить").color(tone(ui, RED))).clicked() { choice = 2; }
                     });
                 }
+                Confirm::DeleteApp { name, .. } => {
+                    ui.heading("Удалить правило?");
+                    ui.label(format!("«{name}» будет удалено. Приложение снова пойдёт в сеть напрямую."));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Отмена").clicked() { choice = 1; }
+                        if ui.button(RichText::new("Удалить").color(tone(ui, RED))).clicked() { choice = 2; }
+                    });
+                }
                 Confirm::Discard { .. } => {
                     ui.heading("Несохранённые изменения");
-                    ui.label("Отменить изменения в этом туннеле?");
+                    ui.label(if matches!(self.dialog, Some(Dialog::AppForm(_))) {
+                        "Отменить изменения в этом правиле?"
+                    } else {
+                        "Отменить изменения в этом туннеле?"
+                    });
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Продолжить редактирование").clicked() { choice = 1; }
                         if ui.button("Отменить изменения").clicked() { choice = 2; }
@@ -2023,6 +2204,22 @@ impl Desktop {
                             Operation::Delete,
                             "save_checked",
                             json!({"before": snapshot.config, "config": config}),
+                        );
+                    }
+                }
+                Confirm::DeleteApp { id, .. } => {
+                    if let Some(snapshot) = &self.snapshot {
+                        let rules: Vec<_> = snapshot
+                            .apps
+                            .iter()
+                            .filter(|rule| rule.id != id)
+                            .cloned()
+                            .collect();
+                        self.request(
+                            ctx,
+                            Operation::Delete,
+                            "apps_save",
+                            json!({"before": snapshot.apps, "rules": rules}),
                         );
                     }
                 }
@@ -2233,7 +2430,33 @@ impl Desktop {
 }
 impl eframe::App for Desktop {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if let Some(target) = self.draw(ctx)
+        let key_target = self.draw(ctx);
+        // The native dialog runs its own modal loop.
+        #[cfg(not(target_os = "linux"))]
+        if std::mem::take(&mut self.browse_app)
+            && let Some(Dialog::AppForm(form)) = &mut self.dialog
+        {
+            let picked = rfd::FileDialog::new()
+                .set_title("Выберите исполняемый файл")
+                .set_parent(frame)
+                .pick_file();
+            if let Some(path) = picked {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                match path.into_os_string().into_string() {
+                    Ok(path) => form.select_path(path, &name),
+                    Err(_) => {
+                        form.error =
+                            "Не удалось использовать путь: имя файла должно быть в Unicode.".into()
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+        if let Some(target) = key_target
             && let Some(Dialog::Form(form)) = &mut self.dialog
             && let Some(backend) = &self.backend
         {
@@ -2280,6 +2503,8 @@ enum DialogAction {
     NextAboutQuote,
     Close,
     SaveForm(bool),
+    SaveApp,
+    BrowseApp,
     SaveSettings,
     CheckUpdates,
     Answer,
@@ -2445,7 +2670,7 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
     action
 }
 
-const HELP: &str = "Диспетчерская\n↑ / ↓  Выбрать туннель\nSpace  Запуск / остановка / отмена подключения\nEnter  Открыть запрос ожидающего туннеля\nN / E  Создать / изменить\nL      Журнал\nDelete Удалить\nS      Настройки\n? / F1 Справка\nQ      Меню выхода\n\nВ формах\nTab / Shift+Tab  Следующее / предыдущее поле\nCtrl+S / Ctrl+Enter  Сохранить\nEsc  Назад / отмена\n\nL: локальный порт → сервис со стороны SSH-сервера.\nR: порт на SSH-сервере → сервис со стороны вашего устройства.\nD: локальный SOCKS5-прокси → сеть SSH-сервера.\n\nJump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.\n\nПароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.\n\nКрестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее или повторным запуском КРОТа. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.\n\nВ настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.\n\nНа заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.";
+const HELP: &str = "Диспетчерская\n1 / 2  Вкладки «Туннели» и «Приложения»\n↑ / ↓  Выбрать туннель или правило\nSpace  Запуск / остановка / отмена подключения\nEnter  Открыть запрос ожидающего туннеля\nN / E  Создать / изменить\nL      Журнал\nDelete Удалить\nS      Настройки\n? / F1 Справка\nQ      Меню выхода\n\nВ формах\nTab / Shift+Tab  Следующее / предыдущее поле\nCtrl+S / Ctrl+Enter  Сохранить\nEsc  Назад / отмена\n\nL: локальный порт → сервис со стороны SSH-сервера.\nR: порт на SSH-сервере → сервис со стороны вашего устройства.\nD: локальный SOCKS5-прокси → сеть SSH-сервера.\n\nПриложения: правило направляет TCP-трафик выбранного исполняемого файла через туннель типа D. UDP и QUIC такого приложения блокируются. Если туннель не работает, сеть приложения закрыта, пока в правиле не выбрано «Пускать напрямую».\n\nJump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.\n\nПароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.\n\nКрестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее или повторным запуском КРОТа. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.\n\nВ настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.\n\nНа заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.";
 
 #[cfg(test)]
 mod tests {
@@ -2514,6 +2739,7 @@ mod tests {
             prompts: HashMap::new(),
             activation: 0,
             version: None,
+            ..Default::default()
         }
     }
     fn render(app: &mut Desktop, ctx: &egui::Context, size: [f32; 2]) -> egui::FullOutput {
@@ -2995,7 +3221,9 @@ mod tests {
         assert_eq!(previous, initial);
         for _ in 0..12 {
             app.started = Instant::now() - Duration::from_secs(10);
-            app.tx.send(Event::Snapshot(Ok(snapshot()))).unwrap();
+            app.tx
+                .send(Event::Snapshot(Ok(Box::new(snapshot()))))
+                .unwrap();
             assert_eq!(
                 about_quote(&render(&mut app, &ctx, [700.0, 500.0])),
                 previous
@@ -3979,7 +4207,9 @@ mod tests {
         if let Some(Dialog::Prompt(prompt)) = &mut app.dialog {
             prompt.secret = "unfinished".into();
         }
-        app.tx.send(Event::Snapshot(Ok(snapshot.clone()))).unwrap();
+        app.tx
+            .send(Event::Snapshot(Ok(Box::new(snapshot.clone()))))
+            .unwrap();
         app.drain(&ctx);
         assert!(
             matches!(&app.dialog, Some(Dialog::Prompt(prompt)) if prompt.secret == "unfinished")
@@ -3988,7 +4218,9 @@ mod tests {
             "native-tunnel".into(),
             pending("native-tunnel", "replacement", "password"),
         );
-        app.tx.send(Event::Snapshot(Ok(snapshot))).unwrap();
+        app.tx
+            .send(Event::Snapshot(Ok(Box::new(snapshot))))
+            .unwrap();
         app.drain(&ctx);
         assert!(app.dialog.is_none());
         assert!(!app.deferred.contains("first"));
@@ -4007,7 +4239,9 @@ mod tests {
         app.dialog = Some(Dialog::Form(Box::new(form)));
         for (activation, expected_activation) in [(1, true), (1, false), (2, true)] {
             state.activation = activation;
-            app.tx.send(Event::Snapshot(Ok(state.clone()))).unwrap();
+            app.tx
+                .send(Event::Snapshot(Ok(Box::new(state.clone()))))
+                .unwrap();
             let output = ctx.run(egui::RawInput::default(), |ctx| app.drain(ctx));
             let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
             for present in [
@@ -4220,6 +4454,173 @@ mod tests {
         assert_eq!(
             ctx.style_of(egui::Theme::Dark).visuals.panel_fill,
             Color32::from_rgb(21, 27, 30)
+        );
+    }
+    fn app_snapshot(state: &str) -> Snapshot {
+        let mut snapshot = snapshot();
+        let mut socks = tunnel();
+        socks.id = "socks".into();
+        socks.name = "стенд".into();
+        socks.kind = "D".into();
+        socks.port = 1080;
+        snapshot.config.tunnels.push(socks);
+        snapshot.apps = vec![crate::apps::AppRule {
+            id: "rule".into(),
+            name: "браузер".into(),
+            path: r"C:\Program Files\Mozilla Firefox\firefox.exe".into(),
+            tunnel_id: "socks".into(),
+            enabled: true,
+            ..Default::default()
+        }];
+        snapshot.app_runtimes = HashMap::from([(
+            "rule".into(),
+            crate::apps::AppRuntime {
+                state: state.into(),
+                logs: vec!["10:02:11 Правило включено".into()],
+                ..Default::default()
+            },
+        )]);
+        snapshot
+    }
+    #[test]
+    fn apps_tab_renders_every_state_and_its_form_at_minimum_window_size() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        app.view = View::Apps;
+        for (state, label) in [
+            ("running", "↟ Работает"),
+            ("stopped", "○ Остановлено"),
+            ("orphan", "! Туннель удалён"),
+            ("unavailable", "◌ Перехват недоступен"),
+        ] {
+            let mut snapshot = app_snapshot(state);
+            if state == "unavailable" {
+                snapshot.apps_unavailable = "Нет драйвера.".into();
+            }
+            app.snapshot = Some(snapshot);
+            app.selected_app = Some("rule".into());
+            let output = render(&mut app, &ctx, [700.0, 500.0]);
+            assert!(text_rect(&output, label).is_some(), "Missing {label}");
+            assert!(text_rect(&output, "браузер").is_some());
+            assert_eq!(
+                text_rect(&output, "Нет драйвера.").is_some(),
+                state == "unavailable"
+            );
+        }
+        for size in [[700.0, 500.0], [1000.0, 720.0]] {
+            let mut form = AppForm::new(None);
+            form.error = "Укажите путь к исполняемому файлу.".into();
+            app.dialog = Some(Dialog::AppForm(Box::new(form)));
+            // The modal is measured on its first frame and shown on the next.
+            render(&mut app, &ctx, size);
+            let output = render(&mut app, &ctx, size);
+            let rect = egui::AreaState::load(&ctx, egui::Id::new("dialog"))
+                .unwrap()
+                .rect();
+            assert!(rect.width() <= size[0] && rect.height() <= size[1]);
+            assert!(text_rect(&output, "Сохранить").is_some());
+        }
+        app.dialog = None;
+        app.confirm = Some(Confirm::DeleteApp {
+            id: "rule".into(),
+            name: "браузер".into(),
+        });
+        assert!(!render(&mut app, &ctx, [700.0, 500.0]).shapes.is_empty());
+    }
+    #[test]
+    fn apps_tab_without_socks_tunnels_offers_one_and_keys_follow_the_active_tab() {
+        let ctx = egui::Context::default();
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        app.snapshot = Some(snapshot());
+        key_frame(&mut app, &ctx, Key::Num2);
+        assert!(app.view == View::Apps);
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "Создать туннель D").is_some());
+        click_label(&mut app, &ctx, "Создать туннель D");
+        assert!(app.view == View::Tunnels);
+        assert!(
+            matches!(&app.dialog, Some(Dialog::Form(form)) if form.draft.kind == "D" && !form.dirty())
+        );
+        app.dialog = None;
+
+        app.view = View::Apps;
+        key_frame(&mut app, &ctx, Key::N);
+        assert!(matches!(&app.dialog, Some(Dialog::AppForm(form)) if !form.editing));
+        app.dialog = None;
+        app.snapshot = Some(app_snapshot("running"));
+        app.selected_app = Some("rule".into());
+        key_frame(&mut app, &ctx, Key::Delete);
+        assert!(matches!(&app.confirm, Some(Confirm::DeleteApp { id, .. }) if id == "rule"));
+        app.confirm = None;
+        key_frame(&mut app, &ctx, Key::E);
+        assert!(matches!(&app.dialog, Some(Dialog::AppForm(form)) if form.editing));
+        app.dialog = None;
+        key_frame(&mut app, &ctx, Key::Num1);
+        key_frame(&mut app, &ctx, Key::N);
+        assert!(matches!(&app.dialog, Some(Dialog::Form(_))));
+    }
+    #[test]
+    fn dirty_app_form_asks_before_discard_and_reports_validation_in_place() {
+        let ctx = egui::Context::default();
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        app.view = View::Apps;
+        app.snapshot = Some(app_snapshot("running"));
+        let mut form = AppForm::new(None);
+        form.draft.name = "curl".into();
+        assert!(form.dirty());
+        app.dialog = Some(Dialog::AppForm(Box::new(form)));
+        render(&mut app, &ctx, [700.0, 500.0]);
+        click_label(&mut app, &ctx, "Сохранить");
+        assert!(
+            matches!(&app.dialog, Some(Dialog::AppForm(form)) if form.error.contains("Укажите путь") && !form.busy)
+        );
+        click_label(&mut app, &ctx, "Отмена");
+        assert!(matches!(app.confirm, Some(Confirm::Discard { .. })));
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "Отменить изменения в этом правиле?").is_some());
+        assert!(matches!(&app.dialog, Some(Dialog::AppForm(form)) if form.draft.name == "curl"));
+        app.confirm = None;
+        app.request_exit();
+        assert!(matches!(
+            app.confirm,
+            Some(Confirm::Discard {
+                after: AfterDiscard::Exit
+            })
+        ));
+    }
+    #[test]
+    fn app_form_keeps_the_saved_switch_and_fills_the_name_from_the_executable() {
+        let snapshot = app_snapshot("running");
+        let mut form = AppForm::new(Some(snapshot.apps[0].clone()));
+        form.draft.enabled = false;
+        form.draft.on_tunnel_down = "direct".into();
+        let rules = form
+            .candidate(&snapshot.apps, &snapshot.config.tunnels)
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].enabled && rules[0].on_tunnel_down == "direct");
+
+        let mut form = AppForm::new(None);
+        form.select_path(r"C:\Tools\curl.exe".into(), "curl.exe");
+        assert_eq!(form.draft.name, "curl");
+        form.select_path(r"C:\Tools\wget.exe".into(), "wget.exe");
+        assert_eq!(form.draft.name, "curl", "a typed name is kept");
+        form.draft.tunnel_id = "native-tunnel".into();
+        let error = form
+            .candidate(&snapshot.apps, &snapshot.config.tunnels)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("типа D"), "{error}");
+        form.draft.tunnel_id = "socks".into();
+        assert_eq!(
+            form.candidate(&snapshot.apps, &snapshot.config.tunnels)
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

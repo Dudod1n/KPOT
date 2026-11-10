@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    apps::{AppRule, AppRuntime, Apps},
     config::{Config, Store, atomic_json},
     ssh::{Manager, PendingPrompt, Runtime},
 };
@@ -64,6 +65,20 @@ pub struct Snapshot {
     pub prompts: HashMap<String, PendingPrompt>,
     #[serde(default)]
     pub activation: u64,
+    #[serde(default)]
+    pub apps: Vec<AppRule>,
+    #[serde(default)]
+    pub app_runtimes: HashMap<String, AppRuntime>,
+    /// Why application traffic cannot be intercepted; empty when it can.
+    #[serde(default)]
+    pub apps_unavailable: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckedApps {
+    before: Vec<AppRule>,
+    rules: Vec<AppRule>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +393,7 @@ pub async fn ensure_running(store: &Store) -> Result<Client> {
 
 struct Owned {
     config: Config,
+    apps: Apps,
     manager: Manager,
 }
 
@@ -400,7 +416,31 @@ impl Service {
         match command {
             "snapshot" if payload.is_null() => {
                 let (runtimes, prompts) = owned.manager.snapshot().await;
+                let states = runtimes
+                    .iter()
+                    .map(|(id, runtime)| (id.clone(), runtime.state.clone()))
+                    .collect();
+                let unavailable = crate::apps::unavailable();
+                let app_runtimes = owned
+                    .apps
+                    .rules
+                    .iter()
+                    .map(|rule| {
+                        let state =
+                            crate::apps::state(rule, &owned.config.tunnels, &states, unavailable);
+                        (
+                            rule.id.clone(),
+                            AppRuntime {
+                                state: state.into(),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect();
                 Ok(serde_json::to_value(Snapshot {
+                    apps: owned.apps.rules.clone(),
+                    app_runtimes,
+                    apps_unavailable: unavailable.into(),
                     version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     config: owned.config.clone(),
                     runtimes,
@@ -467,6 +507,41 @@ impl Service {
                 } else {
                     owned.manager.stop(id).await?;
                 }
+                Ok(Value::Null)
+            }
+            "apps_save" => {
+                let update: CheckedApps =
+                    serde_json::from_value(payload).context("Некорректные правила приложений.")?;
+                if update.before != owned.apps.rules {
+                    return Err(StaleConfig.into());
+                }
+                for rule in &update.rules {
+                    // Untouched rules may wait for a deleted tunnel; new and edited ones may not.
+                    if !owned.apps.rules.contains(rule) {
+                        crate::apps::validate_rule(rule, &update.rules, &owned.config.tunnels)?;
+                    }
+                }
+                let next = Apps {
+                    version: 1,
+                    rules: update.rules,
+                };
+                crate::apps::save(&self.store, &next)?;
+                owned.apps = crate::apps::load(&self.store)?;
+                Ok(Value::Null)
+            }
+            "app_start" | "app_stop" => {
+                let id = payload
+                    .as_str()
+                    .context("Укажите ID сохранённого правила.")?;
+                let mut next = owned.apps.clone();
+                let rule = next
+                    .rules
+                    .iter_mut()
+                    .find(|rule| rule.id == id)
+                    .context("Сохранённое правило не найдено.")?;
+                rule.enabled = command == "app_start";
+                crate::apps::save(&self.store, &next)?;
+                owned.apps = next;
                 Ok(Value::Null)
             }
             "answer" => {
@@ -548,12 +623,15 @@ pub async fn serve(store: Store) -> Result<()> {
     let guard = crate::update::startup_guard().await?;
     let _lease: File = store.lock()?;
     let config = store.load()?;
+    // Broken application rules must not keep the tunnels from starting.
+    let apps = crate::apps::load(&store).unwrap_or_default();
     let manager = Manager::new(store.known_hosts_path());
     let service = Arc::new(Service {
         store: store.clone(),
         token: hex::encode(rand::random::<[u8; 32]>()),
         owned: Mutex::new(Owned {
             config: config.clone(),
+            apps,
             manager: manager.clone(),
         }),
         shutdown: CancellationToken::new(),
@@ -778,5 +856,101 @@ mod startup_tests {
         );
         stop_and_wait(&store).await.unwrap();
         second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_rules_are_saved_beside_the_config_and_survive_their_tunnel() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("tunnels.json")).unwrap();
+        let socks = crate::config::Tunnel {
+            id: "socks".into(),
+            name: "socks".into(),
+            kind: "D".into(),
+            ..Default::default()
+        };
+        let config = Config {
+            tunnels: vec![socks],
+            ..Default::default()
+        };
+        let service = Service {
+            store: store.clone(),
+            token: String::new(),
+            owned: Mutex::new(Owned {
+                config: config.clone(),
+                apps: Apps::default(),
+                manager: Manager::new(store.known_hosts_path()),
+            }),
+            shutdown: CancellationToken::new(),
+            closed: CancellationToken::new(),
+            activation: AtomicU64::new(0),
+        };
+        let rule = AppRule {
+            id: "rule".into(),
+            name: "curl".into(),
+            path: "/usr/bin/curl".into(),
+            tunnel_id: "socks".into(),
+            ..Default::default()
+        };
+        let stray = AppRule {
+            id: "stray".into(),
+            path: "/usr/bin/wget".into(),
+            tunnel_id: "missing".into(),
+            ..rule.clone()
+        };
+        assert!(
+            service
+                .execute("apps_save", json!({"before": [], "rules": [stray]}))
+                .await
+                .is_err(),
+            "a new rule needs an existing SOCKS5 tunnel"
+        );
+        service
+            .execute("apps_save", json!({"before": [], "rules": [rule]}))
+            .await
+            .unwrap();
+        let stale = service
+            .execute("apps_save", json!({"before": [], "rules": []}))
+            .await
+            .unwrap_err();
+        assert!(stale.is::<StaleConfig>());
+        service.execute("app_start", json!("rule")).await.unwrap();
+        assert!(service.execute("app_start", json!("gone")).await.is_err());
+        let saved = crate::apps::load(&store).unwrap();
+        assert!(saved.rules[0].enabled);
+        assert!(
+            !store.path.exists(),
+            "the main configuration is not rewritten"
+        );
+
+        // Deleting the tunnel keeps the rule and reports why it does nothing.
+        service
+            .execute(
+                "save_checked",
+                json!({"before": config, "config": Config::default()}),
+            )
+            .await
+            .unwrap();
+        let snapshot: Snapshot =
+            serde_json::from_value(service.execute("snapshot", Value::Null).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot.apps, saved.rules);
+        assert_eq!(snapshot.apps_unavailable, crate::apps::unavailable());
+        assert_eq!(
+            snapshot.app_runtimes["rule"].state,
+            crate::apps::state(
+                &saved.rules[0],
+                &[],
+                &HashMap::new(),
+                crate::apps::unavailable()
+            )
+        );
+        // An untouched orphan does not block saving the rest.
+        service
+            .execute(
+                "apps_save",
+                json!({"before": saved.rules, "rules": saved.rules}),
+            )
+            .await
+            .unwrap();
     }
 }
