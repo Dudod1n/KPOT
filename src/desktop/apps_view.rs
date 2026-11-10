@@ -70,6 +70,7 @@ pub(super) fn app_state_label(state: &str) -> (&'static str, Color32) {
         "blocked" => ("! Туннель не работает, сеть приложения закрыта", AMBER),
         "direct" => ("! Туннель не работает, трафик идёт напрямую", AMBER),
         "orphan" => ("! Туннель удалён", RED),
+        "elevation" => ("! Нужны права администратора, трафик идёт напрямую", AMBER),
         "unavailable" => ("◌ Перехват недоступен", DIM),
         _ => ("○ Остановлено", DIM),
     }
@@ -78,7 +79,7 @@ pub(super) fn app_state_label(state: &str) -> (&'static str, Color32) {
 fn app_mascot(state: &str) -> &'static str {
     match state {
         "running" => "running",
-        "blocked" | "direct" => "waiting",
+        "blocked" | "direct" | "elevation" => "waiting",
         "orphan" => "error",
         _ => "idle",
     }
@@ -205,8 +206,26 @@ impl Desktop {
         };
         let unavailable = snapshot.apps_unavailable.clone();
         let has_socks = snapshot.config.tunnels.iter().any(|t| t.kind == "D");
+        let detached = unavailable.is_empty() && !snapshot.divert_attached;
+        let failure = snapshot.divert_error.clone();
         if !unavailable.is_empty() {
             ui.colored_label(tone(ui, AMBER), &unavailable);
+            ui.add_space(8.0);
+        }
+        if detached {
+            ui.colored_label(
+                tone(ui, AMBER),
+                "Перехват не запущен: приложения ходят в сеть напрямую. Для перехвата нужны права администратора.",
+            );
+            if !failure.is_empty() {
+                ui.colored_label(tone(ui, RED), &failure);
+            }
+            if ui.button("Предоставить права…").clicked()
+                && let Some(backend) = &self.backend
+                && let Err(error) = crate::divert::launch(&backend.store.path)
+            {
+                self.error = error.to_string();
+            }
             ui.add_space(8.0);
         }
         if let Some(rule) = self.selected_app() {

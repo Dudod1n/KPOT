@@ -1458,7 +1458,7 @@ impl Desktop {
                         };
                         return (
                             count(&["running"]),
-                            count(&["blocked", "direct", "orphan"]),
+                            count(&["blocked", "direct", "orphan", "elevation"]),
                             snapshot.apps.len(),
                         );
                     }

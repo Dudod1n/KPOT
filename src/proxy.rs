@@ -100,13 +100,34 @@ async fn handshake(
 
 /// Pipes `inbound` to `destination` through the proxy and accounts the traffic.
 pub async fn relay(
-    mut inbound: impl AsyncRead + AsyncWrite + Unpin,
+    inbound: impl AsyncRead + AsyncWrite + Unpin,
     proxy: SocketAddr,
     destination: &Destination,
     counters: &Counters,
 ) -> io::Result<()> {
     counters.total.fetch_add(1, Ordering::Relaxed);
-    let mut outbound = connect(proxy, destination).await?;
+    let outbound = connect(proxy, destination).await?;
+    pipe(inbound, outbound, counters).await
+}
+
+/// Pipes `inbound` straight to `destination`, bypassing the tunnel.
+pub async fn direct(
+    inbound: impl AsyncRead + AsyncWrite + Unpin,
+    destination: SocketAddr,
+    counters: &Counters,
+) -> io::Result<()> {
+    counters.total.fetch_add(1, Ordering::Relaxed);
+    let outbound = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(destination))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))??;
+    pipe(inbound, outbound, counters).await
+}
+
+async fn pipe(
+    mut inbound: impl AsyncRead + AsyncWrite + Unpin,
+    mut outbound: TcpStream,
+    counters: &Counters,
+) -> io::Result<()> {
     counters.connections.fetch_add(1, Ordering::Relaxed);
     let result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
     counters.connections.fetch_sub(1, Ordering::Relaxed);

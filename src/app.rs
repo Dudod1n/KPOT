@@ -53,6 +53,9 @@ enum Command {
     },
     #[command(hide = true)]
     Serve,
+    /// Перехват трафика приложений; запускается с правами администратора
+    #[command(hide = true)]
+    Divert,
     #[command(hide = true)]
     ApplyUpdate { manifest: PathBuf },
 }
@@ -109,6 +112,7 @@ pub fn run() -> Result<()> {
             Some(Command::Check) => { let config = store.load()?; println!("Конфигурация корректна. Туннелей: {}. SSH не запускается.",config.tunnels.len()); Ok(()) }
             Some(Command::Path) => { println!("{}",store.path.display()); Ok(()) }
             Some(Command::Serve) => runtime.block_on(background::serve(store)),
+            Some(Command::Divert) => crate::divert::run(store),
             Some(Command::ApplyUpdate { manifest }) => runtime.block_on(crate::update::apply_install(&manifest)),
             Some(Command::Autostart {action}) => {
                 if action != "status" { store.load()?; autostart::set_enabled(&store.path,action == "enable")?; }

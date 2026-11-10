@@ -23,3 +23,9 @@ The default egui fonts are Hack, Noto Emoji, Ubuntu Light, and emoji-icon-font.
 Their original license texts and copyright notices are in `licenses/fonts`.
 These fonts remain under their respective licenses; GPL-3.0-only does not
 replace their licensing terms.
+
+Windows release archives also include the official signed WinDivert 2.2.2
+driver and library (`WinDivert64.sys`, `WinDivert.dll`), unmodified and loaded
+at run time. WinDivert is licensed under LGPL-3.0-or-later or GPL-2.0-or-later;
+its license text ships as `WinDivert-LICENSE.txt`. `scripts/fetch_windivert.py`
+downloads the files from the upstream release and checks pinned SHA-256 hashes.

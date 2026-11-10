@@ -32,10 +32,13 @@ def package(tag, builds, output, notes_path):
     notes = release_notes(version)
     platforms = [('linux', 'Linux', ''), ('windows', 'Windows', '.exe')]
     common = [ROOT / 'LICENSE', ROOT / 'assets/krot.png', ROOT / 'assets/krot.ico']
+    # Official signed WinDivert files: the elevated helper refuses any other build.
+    windivert = ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt']
     for platform, runner, suffix in platforms:
         source = builds / f'krot-rust-{runner}-X64'
         for path in [source / ('krot' + suffix), source / ('krot-cli' + suffix),
-                     source / 'THIRD_PARTY_NOTICES.txt', *common]:
+                     source / 'THIRD_PARTY_NOTICES.txt', *common,
+                     *(source / name for name in windivert if platform == 'windows')]:
             if not path.is_file() or not path.stat().st_size:
                 raise ValueError(f'Missing release input: {path}')
     output.mkdir(parents=True)
@@ -43,9 +46,11 @@ def package(tag, builds, output, notes_path):
               'Распакуйте оба бинарника в каталог с правом записи.\n'
               'Запустите krot.exe на Windows или ./krot на Linux.\n'
               'Перед ручной заменой файлов полностью остановите КРОТ через меню трея.\n'
-              'Конфигурация хранится отдельно от программы.\n\n'
+              'Конфигурация хранится отдельно от программы.\n'
+              'В Windows файлы WinDivert должны лежать рядом с krot.exe: они нужны вкладке «Приложения».\n\n'
               'Код КРОТа распространяется по GNU GPL версии 3: см. LICENSE.\n'
               'Лицензии зависимостей: THIRD_PARTY_NOTICES.txt.\n'
+              'WinDivert (Windows) распространяется по LGPL версии 3: см. WinDivert-LICENSE.txt.\n'
               f'Руководство и соответствующие исходники: https://github.com/Dudod1n/KPOT/tree/{tag}\n')
     for platform, runner, suffix in platforms:
         source = builds / f'krot-rust-{runner}-X64'
@@ -61,6 +66,7 @@ def package(tag, builds, output, notes_path):
         files = [*binaries, (notices, 'THIRD_PARTY_NOTICES.txt'),
                  *((path, path.name) for path in common)]
         if platform == 'windows':
+            files += [(source / name, name) for name in windivert]
             with zipfile.ZipFile(output / f'krot-{version}-windows-x64.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
                 for path, name in files:
                     archive.write(path, name)

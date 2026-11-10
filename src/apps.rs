@@ -84,6 +84,94 @@ pub struct AppRuntime {
     pub logs: Vec<String>,
 }
 
+/// One enabled rule as the elevated helper needs it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DivertRule {
+    pub id: String,
+    pub path: String,
+    pub children: bool,
+    /// Without a tunnel the application connects directly instead of being cut off.
+    pub direct: bool,
+    /// SOCKS5 port of the tunnel while it is running.
+    pub proxy: Option<std::net::SocketAddr>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DivertStats {
+    pub connections: u64,
+    pub total: u64,
+    pub sent: u64,
+    pub received: u64,
+}
+
+/// What the helper tells the background process about once a second.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DivertReport {
+    pub stats: HashMap<String, DivertStats>,
+    /// New journal lines as (rule, text).
+    pub logs: Vec<(String, String)>,
+    /// Set when the helper could not start and is about to exit.
+    pub error: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interceptor {
+    /// This build cannot intercept traffic on this system.
+    Unavailable,
+    /// The elevated helper is not running: traffic is not touched.
+    Detached,
+    Attached,
+}
+
+/// The loopback address of a tunnel's SOCKS5 port, if its bind address allows one.
+pub fn proxy_address(tunnel: &Tunnel) -> Option<std::net::SocketAddr> {
+    let bind = tunnel.bind.trim();
+    let ip = if bind.eq_ignore_ascii_case("localhost") {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        match bind
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .ok()?
+        {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
+            ip => ip,
+        }
+    };
+    Some(std::net::SocketAddr::new(ip, tunnel.port))
+}
+
+/// Rules for the helper: every enabled rule, with a proxy only while its tunnel runs.
+pub fn divert_rules(
+    rules: &[AppRule],
+    tunnels: &[Tunnel],
+    tunnel_states: &HashMap<String, String>,
+) -> Vec<DivertRule> {
+    rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(|rule| DivertRule {
+            id: rule.id.clone(),
+            path: rule.path.clone(),
+            children: rule.children,
+            direct: rule.on_tunnel_down == "direct",
+            proxy: tunnels
+                .iter()
+                .find(|tunnel| tunnel.id == rule.tunnel_id && tunnel.kind == "D")
+                .filter(|tunnel| {
+                    tunnel_states
+                        .get(&tunnel.id)
+                        .is_some_and(|state| state == "running")
+                })
+                .and_then(proxy_address),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Process {
     pub pid: u32,
@@ -228,10 +316,10 @@ pub fn normalize(rules: &mut [AppRule]) {
     }
 }
 
-/// Empty when this build can intercept application traffic, otherwise the reason it cannot.
+/// Why this build cannot intercept application traffic; empty where it can.
 pub fn unavailable() -> &'static str {
     if cfg!(windows) {
-        "Перехват трафика приложений ещё не включён в эту сборку. Правила можно подготовить заранее."
+        ""
     } else {
         "Туннелирование приложений пока работает только в Windows. Правила можно подготовить заранее."
     }
@@ -242,15 +330,16 @@ pub fn state(
     rule: &AppRule,
     tunnels: &[Tunnel],
     tunnel_states: &HashMap<String, String>,
-    unavailable: &str,
+    interceptor: Interceptor,
 ) -> &'static str {
     let tunnel = tunnels
         .iter()
         .find(|tunnel| tunnel.id == rule.tunnel_id && tunnel.kind == "D");
     match tunnel {
-        _ if !unavailable.is_empty() => "unavailable",
+        _ if interceptor == Interceptor::Unavailable => "unavailable",
         None => "orphan",
         Some(_) if !rule.enabled => "stopped",
+        Some(_) if interceptor == Interceptor::Detached => "elevation",
         Some(tunnel)
             if tunnel_states
                 .get(&tunnel.id)
@@ -392,28 +481,68 @@ mod tests {
     }
 
     #[test]
-    fn state_follows_availability_tunnel_and_the_chosen_fallback() {
+    fn state_follows_the_interceptor_the_tunnel_and_the_chosen_fallback() {
+        use Interceptor::{Attached, Detached, Unavailable};
         let tunnels = [tunnel("socks", "D"), tunnel("local", "L")];
         let running = HashMap::from([("socks".to_owned(), "running".to_owned())]);
         let idle = HashMap::new();
         let mut enabled = rule("a", "/bin/app", "socks");
         enabled.enabled = true;
-        assert_eq!(state(&enabled, &tunnels, &running, ""), "running");
-        assert_eq!(state(&enabled, &tunnels, &idle, ""), "blocked");
-        assert_eq!(state(&enabled, &tunnels, &running, "нет"), "unavailable");
+        assert_eq!(state(&enabled, &tunnels, &running, Attached), "running");
+        assert_eq!(state(&enabled, &tunnels, &idle, Attached), "blocked");
+        assert_eq!(state(&enabled, &tunnels, &running, Detached), "elevation");
+        assert_eq!(
+            state(&enabled, &tunnels, &running, Unavailable),
+            "unavailable"
+        );
         enabled.on_tunnel_down = "direct".into();
-        assert_eq!(state(&enabled, &tunnels, &idle, ""), "direct");
+        assert_eq!(state(&enabled, &tunnels, &idle, Attached), "direct");
         enabled.enabled = false;
-        assert_eq!(state(&enabled, &tunnels, &running, ""), "stopped");
+        assert_eq!(state(&enabled, &tunnels, &running, Detached), "stopped");
         // A deleted tunnel and a tunnel that stopped being SOCKS5 both orphan the rule.
+        for orphan in [rule("b", "/bin/b", "gone"), rule("c", "/bin/c", "local")] {
+            assert_eq!(state(&orphan, &tunnels, &running, Attached), "orphan");
+        }
+    }
+
+    #[test]
+    fn helper_gets_enabled_rules_and_a_proxy_only_while_the_tunnel_runs() {
+        let mut socks = tunnel("socks", "D");
+        socks.bind = "0.0.0.0".into();
+        socks.port = 1080;
+        let tunnels = [socks, tunnel("local", "L")];
+        let running = HashMap::from([("socks".to_owned(), "running".to_owned())]);
+        let mut on = rule("on", "/bin/on", "socks");
+        on.enabled = true;
+        on.on_tunnel_down = "direct".into();
+        let mut orphan = rule("orphan", "/bin/orphan", "local");
+        orphan.enabled = true;
+        let rules = [on, orphan, rule("off", "/bin/off", "socks")];
+        let sent = divert_rules(&rules, &tunnels, &running);
+        assert_eq!(sent.len(), 2, "disabled rules are not sent");
+        assert_eq!(sent[0].proxy, Some("127.0.0.1:1080".parse().unwrap()));
+        assert!(sent[0].direct && sent[0].children);
+        // An orphaned rule stays so that its application is cut off, not released.
+        assert_eq!((sent[1].proxy, sent[1].direct), (None, false));
         assert_eq!(
-            state(&rule("b", "/bin/b", "gone"), &tunnels, &running, ""),
-            "orphan"
+            divert_rules(&rules, &tunnels, &HashMap::new())[0].proxy,
+            None
         );
-        assert_eq!(
-            state(&rule("c", "/bin/c", "local"), &tunnels, &running, ""),
-            "orphan"
-        );
+        for (bind, expected) in [
+            ("localhost", Some("127.0.0.1:1080")),
+            ("[::]", Some("[::1]:1080")),
+            ("192.168.1.5", Some("192.168.1.5:1080")),
+            ("proxy.lan", None),
+        ] {
+            let mut socks = tunnel("socks", "D");
+            socks.bind = bind.into();
+            socks.port = 1080;
+            assert_eq!(
+                proxy_address(&socks),
+                expected.map(|address| address.parse().unwrap()),
+                "{bind}"
+            );
+        }
     }
 
     #[test]
