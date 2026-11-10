@@ -429,18 +429,12 @@ struct TunnelForm {
     #[cfg(target_os = "linux")]
     picking: Option<KeyPick>,
 }
-/// A file dialog running off the window thread; dropping it cancels the wait.
+/// A file dialog running off the window thread; dropping it closes the dialog.
 #[cfg(target_os = "linux")]
 struct KeyPick {
     id: u64,
     target: KeyTarget,
-    task: tokio::task::AbortHandle,
-}
-#[cfg(target_os = "linux")]
-impl Drop for KeyPick {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    _cancel: tokio_util::sync::DropGuard,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum KeyTarget {
@@ -579,23 +573,60 @@ fn window_identifier(
     })
 }
 #[cfg(target_os = "linux")]
+const PORTAL: &str = "org.freedesktop.portal.Desktop";
+/// Asks the desktop portal for a key file. Cancelling closes the dialog through
+/// `Request.Close`, so the request is made directly to keep its handle.
+#[cfg(target_os = "linux")]
 async fn portal_key_file(
     parent: Option<ashpd::WindowIdentifier>,
     directory: Option<&std::path::Path>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<Option<PathBuf>> {
-    use ashpd::desktop::{ResponseError, file_chooser::OpenFileRequest};
+    use anyhow::Context;
     use futures_util::StreamExt;
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
     let connection = zbus::Connection::session().await?;
     let bus = zbus::fdo::DBusProxy::new(&connection).await?;
     let mut owners = bus
-        .receive_name_owner_changed_with_args(&[(0, "org.freedesktop.portal.Desktop")])
+        .receive_name_owner_changed_with_args(&[(0, PORTAL)])
         .await?;
-    let request = OpenFileRequest::default()
-        .identifier(parent)
-        .title("Выберите приватный ключ")
-        .multiple(false)
-        .current_folder::<&std::path::Path>(directory)?;
-    // Portal can disappear without completing its already accepted request.
+    let token = format!("krot{}", uuid::Uuid::new_v4().simple());
+    let sender = connection
+        .unique_name()
+        .context("Нет имени на шине D-Bus.")?
+        .trim_start_matches(':')
+        .replace('.', "_");
+    let mut handle = OwnedObjectPath::try_from(format!(
+        "/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    ))?;
+    // Subscribe before the call so a fast response is not missed.
+    let mut responses = portal_responses(&connection, &handle).await?;
+    let mut options = std::collections::HashMap::from([
+        ("handle_token", Value::from(token.as_str())),
+        ("multiple", Value::from(false)),
+    ]);
+    if let Some(directory) = directory {
+        let mut bytes = directory.as_os_str().as_encoded_bytes().to_vec();
+        bytes.push(0);
+        options.insert("current_folder", Value::from(bytes));
+    }
+    let parent = parent.map(|parent| parent.to_string()).unwrap_or_default();
+    let reply = connection
+        .call_method(
+            Some(PORTAL),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.FileChooser"),
+            "OpenFile",
+            &(parent, "Выберите приватный ключ", options),
+        )
+        .await?;
+    let returned: OwnedObjectPath = reply.body().deserialize()?;
+    // Older portals choose the handle themselves.
+    if returned != handle {
+        handle = returned;
+        responses = portal_responses(&connection, &handle).await?;
+    }
+    // The portal can disappear without answering an accepted request.
     let disappeared = async {
         while let Some(change) = owners.next().await {
             if change.args()?.old_owner().is_some() {
@@ -605,20 +636,53 @@ async fn portal_key_file(
         anyhow::bail!("Служба выбора файлов завершилась.")
     };
     tokio::select! {
-      result = request.send() => match result?.response() {
-        Ok(response) => response
-            .uris()
-            .first()
-            .map(|uri| {
-                uri.to_file_path()
-                    .map_err(|_| anyhow::anyhow!("Диалог вернул недопустимый путь."))
-            })
-            .transpose(),
-        Err(ashpd::Error::Response(ResponseError::Cancelled)) => Ok(None),
-        Err(error) => Err(error.into()),
-      },
-      result = disappeared => result,
+        response = responses.next() => {
+            let message = response.context("Служба выбора файлов не ответила.")?;
+            let (code, results): (u32, std::collections::HashMap<String, OwnedValue>) =
+                message.body().deserialize()?;
+            match code {
+                0 => {
+                    let uris: Vec<String> = results
+                        .get("uris")
+                        .map(|uris| uris.try_clone()?.try_into())
+                        .transpose()?
+                        .unwrap_or_default();
+                    uris.first()
+                        .map(|uri| {
+                            reqwest::Url::parse(uri)
+                                .ok()
+                                .and_then(|uri| uri.to_file_path().ok())
+                                .context("Диалог вернул недопустимый путь.")
+                        })
+                        .transpose()
+                }
+                1 => Ok(None),
+                _ => anyhow::bail!("Диалог выбора файла завершился с ошибкой."),
+            }
+        },
+        result = disappeared => result,
+        _ = cancel.cancelled() => {
+            let _ = connection
+                .call_method(Some(PORTAL), &handle, Some("org.freedesktop.portal.Request"), "Close", &())
+                .await;
+            Ok(None)
+        },
     }
+}
+#[cfg(target_os = "linux")]
+async fn portal_responses(
+    connection: &zbus::Connection,
+    handle: &zbus::zvariant::OwnedObjectPath,
+) -> zbus::Result<zbus::proxy::SignalStream<'static>> {
+    zbus::Proxy::new(
+        connection,
+        PORTAL,
+        handle.clone(),
+        "org.freedesktop.portal.Request",
+    )
+    .await?
+    .receive_signal("Response")
+    .await
 }
 #[cfg(not(target_os = "linux"))]
 fn pick_key_file(
@@ -2181,8 +2245,10 @@ impl eframe::App for Desktop {
                 let parent = window_identifier(frame, &backend.runtime);
                 self.key_picks += 1;
                 let (id, tx, ctx) = (self.key_picks, self.tx.clone(), ctx.clone());
-                let task = backend.runtime.spawn(async move {
-                    let result = portal_key_file(parent, directory.as_deref())
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let closed = cancel.clone();
+                backend.runtime.spawn(async move {
+                    let result = portal_key_file(parent, directory.as_deref(), closed)
                         .await
                         .map_err(|_| ());
                     let _ = tx.send(Event::KeyPicked { id, result });
@@ -2191,7 +2257,7 @@ impl eframe::App for Desktop {
                 form.picking = Some(KeyPick {
                     id,
                     target,
-                    task: task.abort_handle(),
+                    _cancel: cancel.drop_guard(),
                 });
             }
             // The native dialog runs its own modal loop.
@@ -2618,11 +2684,17 @@ mod tests {
         assert_eq!(key_directory(""), None);
         assert_eq!(key_directory("keys\0/invalid"), None);
     }
+    /// Portal tests share one well-known bus name, so they run one at a time.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[ignore = "dbus-run-session -- cargo test --lib key_portal -- --ignored"]
-    async fn key_portal_disappearance_returns_error_instead_of_blocking_the_form() {
-        struct Portal(tokio::sync::mpsc::UnboundedSender<()>);
+    static PORTAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// A fake desktop portal that reports `OpenFile` and `Request.Close` calls.
+    #[cfg(target_os = "linux")]
+    async fn fake_portal() -> (
+        zbus::Connection,
+        tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    ) {
+        const HANDLE: &str = "/org/freedesktop/portal/desktop/request/pending";
+        struct Portal(tokio::sync::mpsc::UnboundedSender<&'static str>);
         #[zbus::interface(name = "org.freedesktop.portal.FileChooser")]
         impl Portal {
             fn open_file(
@@ -2631,52 +2703,118 @@ mod tests {
                 _title: &str,
                 _options: HashMap<String, zbus::zvariant::OwnedValue>,
             ) -> zbus::zvariant::OwnedObjectPath {
-                self.0.send(()).unwrap();
-                "/org/freedesktop/portal/desktop/request/pending"
-                    .try_into()
-                    .unwrap()
+                self.0.send("open").unwrap();
+                HANDLE.try_into().unwrap()
             }
             #[zbus(property)]
             fn version(&self) -> u32 {
                 4
             }
         }
-        let (tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        struct Request(tokio::sync::mpsc::UnboundedSender<&'static str>);
+        #[zbus::interface(name = "org.freedesktop.portal.Request")]
+        impl Request {
+            fn close(&self) {
+                self.0.send("close").unwrap();
+            }
+        }
+        let (tx, calls) = tokio::sync::mpsc::unbounded_channel();
         let service = zbus::connection::Builder::session()
             .unwrap()
-            .name("org.freedesktop.portal.Desktop")
+            .name(PORTAL)
             .unwrap()
-            .serve_at("/org/freedesktop/portal/desktop", Portal(tx))
+            .serve_at("/org/freedesktop/portal/desktop", Portal(tx.clone()))
+            .unwrap()
+            .serve_at(HANDLE, Request(tx))
             .unwrap()
             .build()
             .await
             .unwrap();
-        let selection = portal_key_file(None, None);
-        tokio::pin!(selection);
+        (service, calls)
+    }
+    #[cfg(target_os = "linux")]
+    async fn portal_opened(
+        selection: &mut std::pin::Pin<
+            &mut impl std::future::Future<Output = anyhow::Result<Option<PathBuf>>>,
+        >,
+        calls: &mut tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    ) {
         tokio::select! {
-            result = &mut selection => panic!("Request ended before portal accepted it: {result:?}"),
-            _ = accepted.recv() => {},
+            result = selection => panic!("Request ended before portal accepted it: {result:?}"),
+            call = calls.recv() => assert_eq!(call, Some("open")),
             _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("Portal did not receive OpenFile"),
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "dbus-run-session -- cargo test --lib key_portal -- --ignored"]
+    async fn key_portal_disappearance_returns_error_instead_of_blocking_the_form() {
+        let _serial = PORTAL_TESTS.lock().await;
+        let (service, mut calls) = fake_portal().await;
+        let selection = portal_key_file(None, None, tokio_util::sync::CancellationToken::new());
+        tokio::pin!(selection);
+        portal_opened(&mut selection, &mut calls).await;
         tokio::select! {
             result = &mut selection => panic!("Request ended without Response: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(100)) => {},
         }
-        service
-            .release_name("org.freedesktop.portal.Desktop")
-            .await
-            .unwrap();
+        service.release_name(PORTAL).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), selection)
             .await
             .expect("Portal disappearance must return control to the form");
         assert!(result.is_err());
     }
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "dbus-run-session -- cargo test --lib key_portal -- --ignored"]
+    async fn key_portal_cancel_closes_the_dialog_and_response_returns_the_file() {
+        let _serial = PORTAL_TESTS.lock().await;
+        let (service, mut calls) = fake_portal().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let selection = portal_key_file(None, None, cancel.clone());
+        tokio::pin!(selection);
+        portal_opened(&mut selection, &mut calls).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), selection)
+            .await
+            .expect("Cancelling must return control to the form");
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            calls.recv().await,
+            Some("close"),
+            "the portal dialog is closed"
+        );
+
+        let selection = portal_key_file(None, None, tokio_util::sync::CancellationToken::new());
+        tokio::pin!(selection);
+        portal_opened(&mut selection, &mut calls).await;
+        // Let the client subscribe to the handle the portal returned.
+        tokio::select! {
+            result = &mut selection => panic!("Request ended without Response: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+        }
+        let results = HashMap::from([(
+            "uris",
+            zbus::zvariant::Value::from(vec!["file:///keys/%D0%BA%D0%BB%D1%8E%D1%87"]),
+        )]);
+        service
+            .emit_signal(
+                None::<()>,
+                "/org/freedesktop/portal/desktop/request/pending",
+                "org.freedesktop.portal.Request",
+                "Response",
+                &(0u32, results),
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), selection)
+            .await
+            .expect("The response must reach the form");
+        assert_eq!(result.unwrap(), Some(PathBuf::from("/keys/ключ")));
+    }
+    #[cfg(target_os = "linux")]
     #[test]
     fn key_dialog_result_arrives_as_an_event_and_stale_or_cancelled_picks_are_ignored() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
         let ctx = egui::Context::default();
         configure(&ctx, "dark");
         let mut app = Desktop::new(None, true);
@@ -2684,7 +2822,7 @@ mod tests {
         let pick = |id| KeyPick {
             id,
             target: KeyTarget::Server,
-            task: runtime.spawn(std::future::pending::<()>()).abort_handle(),
+            _cancel: tokio_util::sync::CancellationToken::new().drop_guard(),
         };
         let mut form = TunnelForm::new(Some(tunnel()));
         form.draft.server.auth = "key".into();
@@ -2727,16 +2865,16 @@ mod tests {
         let Some(Dialog::Form(form)) = &mut app.dialog else {
             unreachable!()
         };
-        let abandoned = runtime.spawn(std::future::pending::<()>());
+        let cancel = tokio_util::sync::CancellationToken::new();
         form.picking = Some(KeyPick {
             id: 4,
             target: KeyTarget::Server,
-            task: abandoned.abort_handle(),
+            _cancel: cancel.clone().drop_guard(),
         });
         form.picking = None;
         assert!(
-            runtime.block_on(abandoned).unwrap_err().is_cancelled(),
-            "cancelling the choice abandons the portal request"
+            cancel.is_cancelled(),
+            "cancelling the choice closes the dialog"
         );
     }
     #[test]

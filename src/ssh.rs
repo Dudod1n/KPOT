@@ -24,7 +24,40 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use zeroize::Zeroizing;
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
-pub(crate) const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// About five seconds of consecutive accept errors.
+const ACCEPT_ATTEMPTS: u32 = 50;
+const ACCEPT_FAILED: Problem = Problem {
+    message: "Локальный порт перестал принимать соединения.",
+    retryable: true,
+};
+
+/// Paces retries after accept errors without blocking the surrounding `select!`.
+#[derive(Default)]
+pub(crate) struct AcceptBackoff {
+    failures: u32,
+    resume: Option<tokio::time::Instant>,
+}
+impl AcceptBackoff {
+    pub(crate) fn ready(&self) -> bool {
+        self.resume.is_none()
+    }
+    pub(crate) fn resume_at(&self) -> tokio::time::Instant {
+        self.resume.unwrap_or_else(tokio::time::Instant::now)
+    }
+    pub(crate) fn resume(&mut self) {
+        self.resume = None;
+    }
+    pub(crate) fn succeeded(&mut self) {
+        self.failures = 0;
+    }
+    /// Pauses accepting and returns the number of consecutive failures.
+    pub(crate) fn failed(&mut self) -> u32 {
+        self.failures = self.failures.saturating_add(1);
+        self.resume = Some(tokio::time::Instant::now() + ACCEPT_RETRY);
+        self.failures
+    }
+}
 const CANCELLED: Problem = Problem {
     message: "Подключение отменено.",
     retryable: false,
@@ -339,6 +372,10 @@ impl Manager {
             return Ok(());
         }
     }
+    async fn log(&self, id: &str, message: &str) {
+        let mut state = self.0.state.lock().await;
+        push_log(state.runtimes.entry(id.into()).or_default(), message);
+    }
     async fn state(&self, id: &str, status: &str, message: &str, hop: Option<&str>) {
         let mut state = self.0.state.lock().await;
         let runtime = state.runtimes.entry(id.into()).or_default();
@@ -523,17 +560,24 @@ impl Manager {
             .await;
         attempt.started = true;
         let mut check = tokio::time::interval(Duration::from_millis(100));
+        let mut backoff = AcceptBackoff::default();
         loop {
             tokio::select! {
                 _ = attempt.cancel.cancelled() => return Err(CANCELLED),
                 _ = check.tick() => if attempt.sessions.iter().any(|session| session.is_closed()) { return Err(attempt.failure.lock().unwrap().take().unwrap_or(NETWORK)); },
                 Some(_) = attempt.copies.join_next(), if !attempt.copies.is_empty() => {},
-                accepted = accept_optional(attempt.listener.as_ref()), if attempt.listener.is_some() => {
-                    // A transient accept error must not tear down the tunnel.
+                _ = tokio::time::sleep_until(backoff.resume_at()), if !backoff.ready() => backoff.resume(),
+                accepted = accept_optional(attempt.listener.as_ref()), if attempt.listener.is_some() && backoff.ready() => {
                     let Ok((socket, origin)) = accepted else {
-                        tokio::time::sleep(ACCEPT_RETRY).await;
+                        // Retry a transient error; reconnect with a new listener if it persists.
+                        match backoff.failed() {
+                            1 => self.log(&tunnel.id, "Ошибка приёма соединения на локальном порту; повторяем.").await,
+                            ACCEPT_ATTEMPTS.. => return Err(ACCEPT_FAILED),
+                            _ => {}
+                        }
                         continue;
                     };
+                    backoff.succeeded();
                     let connection = connection.clone();
                     let target = tunnel.target.clone();
                     let port = tunnel.target_port;
@@ -658,6 +702,9 @@ fn now() -> f64 {
 fn update(runtime: &mut Runtime, state: &str, message: &str) {
     runtime.state = state.into();
     runtime.message = message.into();
+    push_log(runtime, message);
+}
+fn push_log(runtime: &mut Runtime, message: &str) {
     runtime
         .logs
         .push_back(log_line(&chrono::Local::now(), message));
@@ -1533,6 +1580,33 @@ mod tests {
             .expect("stop must not wait for the network timeout")
             .unwrap();
         assert_eq!(manager.states().await.0[&tunnel.id], "stopped");
+    }
+    #[tokio::test]
+    async fn accept_backoff_pauses_counts_and_resets() {
+        let mut backoff = AcceptBackoff::default();
+        assert!(backoff.ready());
+        assert_eq!(backoff.failed(), 1);
+        assert!(!backoff.ready());
+        let start = tokio::time::Instant::now();
+        tokio::time::sleep_until(backoff.resume_at()).await;
+        assert!(start.elapsed() >= ACCEPT_RETRY);
+        backoff.resume();
+        assert!(backoff.ready());
+        assert_eq!(backoff.failed(), 2);
+        backoff.resume();
+        backoff.succeeded();
+        assert_eq!(backoff.failed(), 1, "a success starts a new series");
+    }
+    #[test]
+    fn log_entries_keep_the_tunnel_state() {
+        let mut runtime = Runtime::default();
+        update(&mut runtime, "running", "Туннель работает");
+        push_log(&mut runtime, "Ошибка приёма соединения");
+        assert_eq!(
+            (runtime.state.as_str(), runtime.message.as_str()),
+            ("running", "Туннель работает")
+        );
+        assert_eq!(runtime.logs.len(), 2);
     }
     #[test]
     fn runtime_log_is_bounded() {
