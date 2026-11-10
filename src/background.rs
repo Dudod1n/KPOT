@@ -76,7 +76,8 @@ struct Metadata {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Owner(Metadata);
 
-pub(crate) fn observe_owner(store: &Store) -> Result<Option<Owner>> {
+/// Shared by the client and the owner check, so both read the address the same way.
+fn read_metadata(store: &Store) -> Result<Option<Metadata>> {
     let stream = match std::fs::File::open(store.sidecar(".background.json")) {
         Ok(stream) => stream,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -85,9 +86,14 @@ pub(crate) fn observe_owner(store: &Store) -> Result<Option<Owner>> {
     let mut raw = Vec::new();
     std::io::Read::read_to_end(&mut std::io::Read::take(stream, 4097), &mut raw)?;
     ensure!(raw.len() <= 4096, "Некорректный адрес фонового процесса.");
-    let metadata: Metadata = serde_json::from_slice(&raw)?;
+    let metadata: Metadata =
+        serde_json::from_slice(&raw).context("Некорректный адрес фонового процесса.")?;
     metadata.validate()?;
-    Ok(Some(Owner(metadata)))
+    Ok(Some(metadata))
+}
+
+pub(crate) fn observe_owner(store: &Store) -> Result<Option<Owner>> {
+    Ok(read_metadata(store)?.map(Owner))
 }
 
 impl Metadata {
@@ -164,6 +170,18 @@ pub struct Client {
     pub path: PathBuf,
 }
 
+/// Test helper: waits up to 3 s until the daemon answers.
+#[cfg(test)]
+pub(crate) async fn wait_until_serving(client: &Client) {
+    timeout(Duration::from_secs(3), async {
+        while client.snapshot().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the daemon did not start");
+}
+
 impl Client {
     pub fn new(store: &Store) -> Self {
         Self {
@@ -188,17 +206,8 @@ impl Client {
         mut payload: Value,
         owner: Option<&Owner>,
     ) -> Result<Value> {
-        let store = Store::new(&self.path)?;
-        let mut raw = Vec::new();
-        tokio::fs::File::open(store.sidecar(".background.json"))
-            .await?
-            .take(4097)
-            .read_to_end(&mut raw)
-            .await?;
-        ensure!(raw.len() <= 4096, "Некорректный адрес фонового процесса.");
-        let metadata: Metadata =
-            serde_json::from_slice(&raw).context("Некорректный адрес фонового процесса.")?;
-        metadata.validate()?;
+        let metadata =
+            read_metadata(&Store::new(&self.path)?)?.context("Фоновый КРОТ не запущен.")?;
         ensure!(
             owner.is_none_or(|owner| owner.0 == metadata),
             "Предыдущий КРОТ уже сменился. Проверьте новый процесс и повторите выбор."
@@ -551,6 +560,9 @@ pub async fn serve(store: Store) -> Result<()> {
         closed: CancellationToken::new(),
         activation: AtomicU64::new(0),
     });
+    // SIGTERM closes tunnels like Ctrl+C; registered before the address is published.
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let metadata = Metadata {
         port: listener.local_addr()?.port(),
@@ -569,9 +581,16 @@ pub async fn serve(store: Store) -> Result<()> {
     let (tray, mut tray_actions) = crate::tray::Tray::start(service.shutdown.child_token());
     let mut tray_poll = tokio::time::interval(Duration::from_secs(1));
     loop {
+        let terminated = async {
+            #[cfg(unix)]
+            terminate.recv().await;
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        };
         tokio::select! {
             _ = service.shutdown.cancelled() => break,
             _ = tokio::signal::ctrl_c() => { service.shutdown.cancel(); break; },
+            _ = terminated => { service.shutdown.cancel(); break; },
             Some(_) = handlers.join_next(), if !handlers.is_empty() => {},
             Some(action) = tray_actions.recv() => match action {
                 crate::tray::Action::Open => {
@@ -582,20 +601,21 @@ pub async fn serve(store: Store) -> Result<()> {
                 crate::tray::Action::Stop => { service.shutdown.cancel(); break; }
             },
             _ = tray_poll.tick() => {
-                let owned = service.owned.lock().await;
-                let (runtimes, prompts) = owned.manager.snapshot().await;
-                tray.update(crate::tray::Status::from_snapshot(&Snapshot {
-                    version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                    config:owned.config.clone(),runtimes,prompts,
-                    activation:service.activation.load(Ordering::Relaxed),
-                }));
-            },
-            accepted = listener.accept() => {
-                let (stream,_) = accepted?;
-                if let Ok(permit) = permits.clone().try_acquire_owned() {
-                    let service = service.clone();
-                    handlers.spawn(async move { let _permit = permit; let _ = service.handle(stream).await; });
+                // Keep the previous icon while a command holds the state.
+                if let Ok(owned) = service.owned.try_lock() {
+                    let (states, waiting) = owned.manager.states().await;
+                    tray.update(crate::tray::Status::count(&owned.config.tunnels, &states, &waiting));
                 }
+            },
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    if let Ok(permit) = permits.clone().try_acquire_owned() {
+                        let service = service.clone();
+                        handlers.spawn(async move { let _permit = permit; let _ = service.handle(stream).await; });
+                    }
+                }
+                // A transient accept error must not stop the daemon.
+                Err(_) => tokio::time::sleep(crate::ssh::ACCEPT_RETRY).await,
             }
         }
     }
@@ -726,13 +746,7 @@ mod startup_tests {
         let store = Store::new(temp.path().join("config.json")).unwrap();
         let daemon = tokio::spawn(serve(store.clone()));
         let client = Client::new(&store);
-        timeout(Duration::from_secs(3), async {
-            while client.snapshot().await.is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until_serving(&client).await;
         stop_and_wait(&store).await.unwrap();
         assert!(store.lock().is_ok());
         daemon.await.unwrap().unwrap();
@@ -744,24 +758,12 @@ mod startup_tests {
         let store = Store::new(temp.path().join("config.json")).unwrap();
         let client = Client::new(&store);
         let first = tokio::spawn(serve(store.clone()));
-        timeout(Duration::from_secs(3), async {
-            while client.snapshot().await.is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until_serving(&client).await;
         let previous = observe_owner(&store).unwrap();
         stop_and_wait(&store).await.unwrap();
         first.await.unwrap().unwrap();
         let second = tokio::spawn(serve(store.clone()));
-        timeout(Duration::from_secs(3), async {
-            while client.snapshot().await.is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until_serving(&client).await;
         assert!(
             stop_selected_and_wait(&store, previous.as_ref())
                 .await

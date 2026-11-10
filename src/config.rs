@@ -164,7 +164,7 @@ impl Config {
     }
 }
 
-fn unbracket(host: &str) -> &str {
+pub(crate) fn unbracket(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
         .unwrap_or(host)

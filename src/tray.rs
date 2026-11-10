@@ -1,7 +1,8 @@
 //! The background owner keeps the tray alive independently of desktop windows.
-use crate::{background::Snapshot, icons};
+use crate::{config::Tunnel, icons};
 use anyhow::Result;
 use std::{
+    collections::{HashMap, HashSet},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -28,16 +29,21 @@ pub struct Status {
 }
 
 impl Status {
-    pub fn from_snapshot(snapshot: &Snapshot) -> Self {
+    /// Counts configured tunnels by state; `waiting` holds tunnels with a pending prompt.
+    pub fn count(
+        tunnels: &[Tunnel],
+        states: &HashMap<String, String>,
+        waiting: &HashSet<String>,
+    ) -> Self {
         let mut status = Self {
-            total: snapshot.config.tunnels.len(),
+            total: tunnels.len(),
             ..Self::default()
         };
-        for tunnel in &snapshot.config.tunnels {
-            if snapshot.prompts.contains_key(&tunnel.id) {
+        for tunnel in tunnels {
+            if waiting.contains(&tunnel.id) {
                 status.waiting += 1;
-            } else if let Some(runtime) = snapshot.runtimes.get(&tunnel.id) {
-                match runtime.state.as_str() {
+            } else if let Some(state) = states.get(&tunnel.id) {
+                match state.as_str() {
                     "running" => status.running += 1,
                     "error" => status.errors += 1,
                     "connecting" | "reconnecting" => status.connecting += 1,
@@ -261,9 +267,22 @@ fn pump_messages() {}
 mod tests {
     use super::*;
     use crate::{
-        config::Tunnel,
+        background::Snapshot,
         ssh::{PendingPrompt, Prompt, Runtime},
     };
+    impl Status {
+        fn from_snapshot(snapshot: &Snapshot) -> Self {
+            Self::count(
+                &snapshot.config.tunnels,
+                &snapshot
+                    .runtimes
+                    .iter()
+                    .map(|(id, runtime)| (id.clone(), runtime.state.clone()))
+                    .collect(),
+                &snapshot.prompts.keys().cloned().collect(),
+            )
+        }
+    }
     #[test]
     fn summary_counts_configured_tunnels_and_prioritizes_attention() {
         let mut snapshot = Snapshot::default();

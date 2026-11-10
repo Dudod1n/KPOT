@@ -40,7 +40,12 @@ async fn prepare(store: &Store, reuse_running: bool) -> Result<Startup> {
         return Ok(conflict(store).await);
     };
     if !reuse_running && background::try_lease(store)?.is_none() {
-        return Ok(conflict(store).await);
+        // Reopen a running daemon of this version; ask only otherwise.
+        let state = conflict(store).await;
+        if !matches!(&state, Startup::Conflict { version: Some(version), .. } if version == env!("CARGO_PKG_VERSION"))
+        {
+            return Ok(state);
+        }
     }
     drop(guard);
     let client = background::ensure_running(store).await?;
@@ -317,13 +322,7 @@ mod tests {
         let store = Store::new(temp.path().join("config.json")).unwrap();
         let daemon = tokio::spawn(background::serve(store.clone()));
         let client = Client::new(&store);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while client.snapshot().await.is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        background::wait_until_serving(&client).await;
         let window = Store::new(store.sidecar(".ui")).unwrap().lock().unwrap();
         assert!(matches!(
             prepare(&store, false).await.unwrap(),
@@ -338,6 +337,32 @@ mod tests {
         assert_eq!(client.snapshot().await.unwrap().activation, 1);
         client.request("shutdown", Value::Null).await.unwrap();
         drop(window);
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_start_reopens_a_windowless_daemon_of_the_same_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().join("config.json")).unwrap();
+        let daemon = tokio::spawn(background::serve(store.clone()));
+        let client = Client::new(&store);
+        background::wait_until_serving(&client).await;
+        assert!(background::observe_owner(&store).unwrap().is_some());
+        let Startup::Ready { lease, client } = prepare(&store, false).await.unwrap() else {
+            panic!("the running daemon of this version must be reused without a choice");
+        };
+        assert_eq!(client.snapshot().await.unwrap().activation, 0);
+        assert!(
+            store.lock().is_err(),
+            "reopening must keep the daemon and its tunnels"
+        );
+        // The reopened window holds the UI lease, so the next start asks.
+        assert!(matches!(
+            prepare(&store, false).await.unwrap(),
+            Startup::Conflict { .. }
+        ));
+        drop(lease);
+        client.request("shutdown", Value::Null).await.unwrap();
         daemon.await.unwrap().unwrap();
     }
 
