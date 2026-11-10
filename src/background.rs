@@ -580,6 +580,7 @@ pub async fn serve(store: Store) -> Result<()> {
     let mut handlers = JoinSet::new();
     let (tray, mut tray_actions) = crate::tray::Tray::start(service.shutdown.child_token());
     let mut tray_poll = tokio::time::interval(Duration::from_secs(1));
+    let mut backoff = crate::ssh::AcceptBackoff::default();
     loop {
         let terminated = async {
             #[cfg(unix)]
@@ -607,15 +608,17 @@ pub async fn serve(store: Store) -> Result<()> {
                     tray.update(crate::tray::Status::count(&owned.config.tunnels, &states, &waiting));
                 }
             },
-            accepted = listener.accept() => match accepted {
+            _ = tokio::time::sleep_until(backoff.resume_at()), if !backoff.ready() => backoff.resume(),
+            accepted = listener.accept(), if backoff.ready() => match accepted {
                 Ok((stream, _)) => {
+                    backoff.succeeded();
                     if let Ok(permit) = permits.clone().try_acquire_owned() {
                         let service = service.clone();
                         handlers.spawn(async move { let _permit = permit; let _ = service.handle(stream).await; });
                     }
                 }
                 // A transient accept error must not stop the daemon.
-                Err(_) => tokio::time::sleep(crate::ssh::ACCEPT_RETRY).await,
+                Err(_) => { backoff.failed(); }
             }
         }
     }
