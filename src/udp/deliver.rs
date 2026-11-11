@@ -65,6 +65,15 @@ const RUN_TAIL: &str = r#"[ -f "$f" ] && [ "$(h "$f")" = "$2" ] || exit 90
 exec "$f"
 "#;
 
+/// Removes every version of the relay and the cache directory if it is then empty.
+pub const REMOVE: &str = r#"[ -n "$HOME" ] || exit 94
+d="$HOME/.cache/krot"
+[ -L "$d" ] && exit 95
+rm -f "$d"/krot-relay-* "$d"/.upload.*
+rmdir "$d" 2>/dev/null
+exit 0
+"#;
+
 pub fn ensure_script() -> String {
     format!("{PREPARE}{ENSURE_TAIL}")
 }
@@ -264,6 +273,14 @@ async fn exec<H: russh::client::Handler>(
     tokio::time::timeout(EXEC_TIMEOUT, run)
         .await
         .map_err(|_| Problem::Failed)?
+}
+
+/// Removes the relay from the server, when UDP is switched off or the tunnel is deleted.
+pub async fn remove<H: russh::client::Handler>(handle: &russh::client::Handle<H>) -> bool {
+    matches!(
+        exec(handle, &command(REMOVE, &[]), b"").await,
+        Ok((Some(0), _))
+    )
 }
 
 /// Makes sure the server holds the relay, starts it and greets it.

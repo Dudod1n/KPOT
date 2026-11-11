@@ -177,6 +177,23 @@ fn a_new_version_replaces_the_old_ones() {
 }
 
 #[test]
+fn removal_takes_every_version_and_the_empty_directory() {
+    let home = tempfile::tempdir().unwrap();
+    for text in ["ONE", "TWO"] {
+        let bytes = relay(text);
+        assert_eq!(ensure(home.path(), &bytes, &bytes).code, 0);
+    }
+    assert_eq!(run(home.path(), None, REMOVE, &[], b"").code, 0);
+    assert!(!home.path().join(".cache/krot").exists());
+    assert!(
+        home.path().join(".cache").exists(),
+        "only our own directory goes"
+    );
+    // Nothing to remove is fine too.
+    assert_eq!(run(home.path(), None, REMOVE, &[], b"").code, 0);
+}
+
+#[test]
 fn unsafe_or_unusable_servers_are_named() {
     let bytes = relay("X");
 

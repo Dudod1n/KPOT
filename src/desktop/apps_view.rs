@@ -274,7 +274,7 @@ impl Desktop {
         ui.add_space(16.0);
         if has_socks {
             ui.label("Добавьте приложение, чтобы направить его трафик через туннель.");
-            ui.weak("Через туннель идёт только TCP. Пока туннель работает, UDP и QUIC приложения блокируются.");
+            ui.weak("Через туннель идёт TCP. UDP идёт через туннель, если для него включён «UDP через сервер»; иначе блокируется.");
         } else {
             ui.label("Приложения ходят через туннели типа D (SOCKS5). Таких туннелей пока нет.");
             if ui.button("Создать туннель D").clicked() {
@@ -367,7 +367,7 @@ impl Desktop {
         } else {
             "Дочерние процессы: не включены"
         });
-        ui.weak("Трафик: только TCP, имена разрешает этот компьютер; при работающем туннеле UDP и QUIC блокируются");
+        self.rule_udp(ui, ctx, rule, tunnel.as_ref());
         ui.label(format!(
             "Соединений {} · всего {} · ↑ {} · ↓ {}",
             runtime.connections,
@@ -411,6 +411,82 @@ impl Desktop {
         }
         for line in &runtime.logs {
             ui.label(line);
+        }
+    }
+}
+
+impl Desktop {
+    /// What happens to the rule's UDP right now, its numbers and the QUIC switch.
+    fn rule_udp(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rule: &AppRule,
+        tunnel: Option<&crate::config::Tunnel>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let quic = snapshot.udp.quic(&rule.id);
+        let running = tunnel.is_some_and(|tunnel| {
+            snapshot
+                .udp_runtimes
+                .get(&tunnel.id)
+                .is_some_and(|runtime| runtime.state == "running")
+        });
+        let consent = tunnel.is_some_and(|tunnel| snapshot.udp.tunnel_enabled(&tunnel.id));
+        let text = match (running, consent) {
+            (true, _) if quic => "Трафик: TCP и UDP через туннель, включая QUIC",
+            (true, _) => {
+                "Трафик: TCP и UDP через туннель; QUIC (UDP 443) блокируется, браузер переходит на TCP"
+            }
+            (false, true) => {
+                "Трафик: только TCP; UDP через сервер ещё не работает, поэтому UDP блокируется"
+            }
+            (false, false) => {
+                "Трафик: только TCP; UDP блокируется — включите «UDP через сервер» в туннеле"
+            }
+        };
+        ui.weak(text);
+        ui.weak("Имена для приложения разрешает система Windows (служба DNS-клиент) напрямую; через туннель идут только DNS-запросы, которые приложение отправляет само.");
+        let helper = snapshot.udp_helper.get(&rule.id);
+        let routed = snapshot.udp_rules.get(&rule.id);
+        if helper.is_some() || routed.is_some() {
+            let captured = helper.map_or(0, |stats| stats.captured.datagrams);
+            let injected = helper.map_or(0, |stats| stats.injected.datagrams);
+            let drops = |map: Option<&std::collections::BTreeMap<String, u64>>, reason: &str| {
+                map.and_then(|map| map.get(reason)).copied().unwrap_or(0)
+            };
+            let helper_drops = helper.map(|stats| &stats.drops);
+            let routed_drops = routed.map(|stats| &stats.drops);
+            let lost = |reason: &str| drops(helper_drops, reason) + drops(routed_drops, reason);
+            ui.weak(format!(
+                "UDP: ↑ {captured} · ↓ {injected} датаграмм · потоков {}",
+                routed.map_or(0, |stats| stats.flows_active)
+            ));
+            ui.weak(format!(
+                "Потери: срок годности {} · переполнение {} · размер {} · канал {} · QUIC заблокирован {}",
+                lost("expired"),
+                lost("overflow"),
+                lost("size"),
+                lost("channel"),
+                lost("quic")
+            ));
+        }
+        let mut wanted = quic;
+        if ui
+            .add_enabled(
+                self.pending_operations == 0 && snapshot.udp_error.is_empty(),
+                egui::Checkbox::new(&mut wanted, "Туннелировать QUIC (UDP 443)"),
+            )
+            .changed()
+        {
+            self.request(
+                ctx,
+                Operation::Udp,
+                "udp_rule",
+                json!({"id": rule.id, "quic": wanted}),
+            );
         }
     }
 }
@@ -544,7 +620,7 @@ pub(super) fn app_form_view(
                     );
                 });
                 ui.checkbox(&mut form.draft.children, "Включая дочерние процессы");
-                ui.weak("Через туннель идёт только TCP. Пока туннель работает, UDP и QUIC приложения блокируются, имена разрешает этот компьютер. «Пускать напрямую» без туннеля пропускает и TCP, и UDP.");
+                ui.weak("Через туннель идёт TCP, а UDP — если для туннеля включён «UDP через сервер»; иначе UDP блокируется. QUIC (UDP 443) блокируется, пока в карточке правила не включено его туннелирование. «Пускать напрямую» без туннеля пропускает и TCP, и UDP.");
             });
         ui.separator();
         ui.horizontal_wrapped(|ui| {

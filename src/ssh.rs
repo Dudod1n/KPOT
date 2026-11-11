@@ -200,6 +200,28 @@ impl Manager {
                 .send_modify(|generation| *generation += 1);
         }
     }
+    /// Switches the tunnel's UDP off and waits a little for its relay to leave the server.
+    pub async fn remove_udp(&self, id: &str) {
+        let mut enabled = self.0.state.lock().await.udp_enabled.clone();
+        if !enabled.remove(id) {
+            return;
+        }
+        self.set_udp(enabled).await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    let state = self.0.state.lock().await;
+                    if state.udp.get(id).is_none_or(|runtime| {
+                        runtime.state == "off" || runtime.state == "unavailable"
+                    }) {
+                        return;
+                    }
+                    drop(state);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+    }
     /// UDP state of every tunnel that has one, with the metrics of running transports.
     pub async fn udp_snapshot(
         &self,
@@ -674,6 +696,20 @@ impl Manager {
                 },
                 _ = changes.changed() => {
                     if !self.0.state.lock().await.udp_enabled.contains(&tunnel.id) {
+                        // Switched off: the relay leaves the server too, while it is reachable.
+                        self.udp_down(&tunnel.id).await;
+                        let removed = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            crate::udp::deliver::remove(&connection),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        self.log(&tunnel.id, if removed {
+                            "UDP: помощник удалён с сервера."
+                        } else {
+                            "UDP: не удалось удалить помощник с сервера."
+                        })
+                        .await;
                         return Ok(());
                     }
                 },

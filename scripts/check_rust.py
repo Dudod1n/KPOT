@@ -169,12 +169,14 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             while not (await self.request('snapshot'))['udp_metrics'].get(tunnel.id, {}).get('rtt', {}).get('count'):
                 await asyncio.sleep(.2)
 
-        # Off stops the relay; on again starts it without a second upload.
+        # Off stops the relay and takes it off the server; on again uploads it again.
         await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': False})
-        await self.udp_state(tunnel, ('off',))
+        snapshot, _ = await self.udp_state(tunnel, ('off',))
+        self.assertFalse((home / '.cache' / 'krot').exists())
+        self.assertIn('помощник удалён с сервера', '\n'.join(snapshot['runtimes'][tunnel.id]['logs']))
         await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
         _, runtime = await self.udp_state(tunnel, ('running',))
-        self.assertEqual((runtime['uploads'], runtime['starts']), (1, 2))
+        self.assertEqual((runtime['uploads'], runtime['starts']), (2, 2))
 
         # A relay that dies is started again; the tunnel itself keeps working.
         running = [process for command, process in self.commands
@@ -188,9 +190,17 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
                 if runtime['state'] == 'running' and runtime['starts'] == 3:
                     break
                 await asyncio.sleep(.05)
-        self.assertEqual(runtime['uploads'], 1)
+        self.assertEqual(runtime['uploads'], 2, 'a restart reuses the uploaded relay')
         await self.exchange(tunnel.port, socks=True)
         self.assertEqual((await self.request('snapshot'))['runtimes'][tunnel.id]['state'], 'running')
+
+        # Deleting the tunnel takes its relay and its consent away.
+        snapshot = await self.request('snapshot')
+        await self.request('save_checked', {'before': snapshot['config'],
+                                            'config': {**snapshot['config'], 'tunnels': []}})
+        self.assertFalse((home / '.cache' / 'krot').exists())
+        settings = json.loads(self.store.path.with_name('config.json.udp.json').read_text('utf-8'))
+        self.assertEqual(settings['tunnels'], {})
 
     async def test_helper_datagram_travels_through_ssh_and_the_relay_and_back(self):
         home = self.path / 'server-home'
@@ -245,6 +255,14 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             metrics = snapshot['udp_metrics'][tunnel.id]
             self.assertGreaterEqual(metrics['sent']['datagrams'], 1)
             self.assertEqual(set(metrics['drops']), {'expired', 'overflow', 'size', 'channel', 'quic'})
+            code, out, err = await self.cli('metrics', '--tunnel', tunnel.id)
+            self.assertEqual(code, 0, err)
+            report = json.loads(out)
+            self.assertEqual(report['schema'], 1)
+            self.assertEqual(report['tunnels'][tunnel.id]['state']['state'], 'running')
+            self.assertEqual(report['rules']['rule1']['tunnel']['sent']['datagrams'], 1)
+            code, out, _ = await self.cli('status')
+            self.assertIn('UDP: работает, уровень 1', out)
         finally:
             echo.close()
         await self.exchange(tunnel.port, socks=True)

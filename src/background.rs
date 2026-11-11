@@ -619,6 +619,10 @@ impl Service {
                     .map(|t| t.id.clone())
                     .collect();
                 for id in &changed {
+                    // A deleted tunnel takes its relay off the server first.
+                    if !next.tunnels.iter().any(|tunnel| tunnel.id == *id) {
+                        owned.manager.remove_udp(id).await;
+                    }
                     owned.manager.stop(id).await?;
                 }
                 for t in &next.tunnels {
@@ -627,6 +631,16 @@ impl Service {
                     }
                 }
                 owned.config = next;
+                if owned.udp_error.is_empty() {
+                    let mut udp = owned.udp.clone();
+                    udp.retain_known(
+                        owned.config.tunnels.iter().map(|tunnel| tunnel.id.as_str()),
+                        owned.apps.rules.iter().map(|rule| rule.id.as_str()),
+                    );
+                    if udp != owned.udp && crate::udp::consent::save(&self.store, &udp).is_ok() {
+                        owned.udp = udp;
+                    }
+                }
                 let udp = owned.udp_tunnels();
                 owned.manager.set_udp(udp).await;
                 Ok(Value::Null)
