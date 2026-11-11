@@ -25,6 +25,7 @@ BINARY = Path(os.environ.get('KROT_RUST_BIN', ROOT / 'target' / 'debug' / ('krot
 
 class RustIntegration(unittest.IsolatedAsyncioTestCase):
     server = SSHFixtures.server
+    run_command = SSHFixtures.run_command
     tunnel = SSHFixtures.tunnel
     echo_bytes = SSHFixtures.echo_bytes
     exchange = SSHFixtures.exchange
@@ -106,7 +107,7 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
                     if answer is not None:
                         self.prompts.append(prompt)
                         await self.request('answer', {'id': pending['id'], 'value': answer})
-                status = last['runtimes'].get(tunnel.id, {})
+                status = last["runtimes"].get(tunnel.id, {})
                 if status.get('state') in expected:
                     return status
                 if status.get('state') == 'error' and 'error' not in expected:
@@ -126,6 +127,81 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
                 elif snapshot['runtimes'].get(tunnel.id, {}).get('state') == 'error':
                     self.fail(snapshot['runtimes'][tunnel.id]['message'])
                 await asyncio.sleep(.025)
+
+    async def udp_state(self, tunnel, expected, timeout=30):
+        async with asyncio.timeout(timeout):
+            while True:
+                snapshot = await self.request('snapshot')
+                runtime = snapshot.get('udp_runtimes', {}).get(tunnel.id, {})
+                if runtime.get('state') == 'unavailable' and 'не содержит' in runtime.get('message', ''):
+                    self.skipTest('this build embeds no UDP relay (KROT_RELAY_DIR was not set)')
+                if runtime.get('state') in expected:
+                    return snapshot, runtime
+                await asyncio.sleep(.05)
+
+    async def test_udp_relay_is_uploaded_started_and_restarted_without_touching_tcp(self):
+        home = self.path / 'server-home'
+        home.mkdir()
+        server = await self.server(shell_home=home)
+        tunnel = self.tunnel(server, kind='D')
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        snapshot = await self.request('snapshot')
+        self.assertEqual(snapshot['udp_runtimes'].get(tunnel.id, {}).get('state', 'off'), 'off')
+        self.assertFalse((home / '.cache').exists(), 'nothing is uploaded without consent')
+
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
+        settings = json.loads(self.store.path.with_name('config.json.udp.json').read_text('utf-8'))
+        self.assertEqual(settings['tunnels'], {tunnel.id: {'enabled': True}})
+        snapshot, runtime = await self.udp_state(tunnel, ('running', 'unavailable'))
+        self.assertEqual(runtime['state'], 'running', runtime.get('message'))
+        self.assertEqual((runtime['level'], runtime['uploads']), (1, 1))
+        relays = list((home / '.cache' / 'krot').iterdir())
+        self.assertEqual(len(relays), 1)
+        self.assertTrue(relays[0].name.startswith('krot-relay-'))
+        self.assertEqual(relays[0].stat().st_mode & 0o777, 0o700)
+        logs = '\n'.join(snapshot['runtimes'][tunnel.id]['logs'])
+        self.assertIn('помощник загружен', logs)
+        await self.exchange(tunnel.port, socks=True)
+
+        async with asyncio.timeout(10):
+            while not (await self.request('snapshot'))['udp_metrics'].get(tunnel.id, {}).get('rtt', {}).get('count'):
+                await asyncio.sleep(.2)
+
+        # Off stops the relay; on again starts it without a second upload.
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': False})
+        await self.udp_state(tunnel, ('off',))
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
+        _, runtime = await self.udp_state(tunnel, ('running',))
+        self.assertEqual((runtime['uploads'], runtime['starts']), (1, 2))
+
+        # A relay that dies is started again; the tunnel itself keeps working.
+        running = [process for command, process in self.commands
+                   if 'exec "$f"' in command and process.returncode is None]
+        self.assertEqual(len(running), 1)
+        running[0].kill()
+        # The restart can be faster than polling, so the start counter tells it happened.
+        async with asyncio.timeout(30):
+            while True:
+                _, runtime = await self.udp_state(tunnel, ('running', 'unavailable', 'starting', 'waiting'))
+                if runtime['state'] == 'running' and runtime['starts'] == 3:
+                    break
+                await asyncio.sleep(.05)
+        self.assertEqual(runtime['uploads'], 1)
+        await self.exchange(tunnel.port, socks=True)
+        self.assertEqual((await self.request('snapshot'))['runtimes'][tunnel.id]['state'], 'running')
+
+    async def test_udp_relay_reports_a_server_without_commands(self):
+        server = await self.server()
+        tunnel = self.tunnel(server, kind='D')
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
+        _, runtime = await self.udp_state(tunnel, ('unavailable',))
+        self.assertIn('не разрешает выполнять команды', runtime['message'])
+        await self.exchange(tunnel.port, socks=True)
 
     async def test_cli_checks_without_display_or_writing_configuration(self):
         code, out, err = await self.cli('check')

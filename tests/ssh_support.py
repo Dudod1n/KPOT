@@ -7,6 +7,7 @@ import contextlib
 from dataclasses import asdict, dataclass, field
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -219,11 +220,34 @@ class SSHFixtures:
             writer.close()
             await writer.wait_closed()
 
-    async def server(self, *, port=0, key=None, password=None, client_key=None):
+    async def run_command(self, process, home):
+        """Run an exec request with the local /bin/sh, as a server account with `home`."""
+        env = {'HOME': str(home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        local = await asyncio.create_subprocess_shell(
+            process.command, env=env, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        self.commands.append((process.command, local))
+        try:
+            await process.redirect(stdin=local.stdin, stdout=local.stdout, stderr=local.stderr)
+            process.exit(await local.wait())
+        finally:
+            if local.returncode is None:
+                local.kill()
+                await local.wait()
+
+    async def server(self, *, port=0, key=None, password=None, client_key=None, shell_home=None):
+        """`shell_home` lets the server run commands; otherwise sessions are refused."""
+        extra = {}
+        if shell_home is not None:
+            if not hasattr(self, 'commands'):
+                self.commands = []
+            extra = {'encoding': None,
+                     'process_factory': lambda process: self.run_command(process, shell_home)}
         server = await asyncssh.listen(
             '127.0.0.1', port, config=None,
             server_factory=lambda: Server(self, password, client_key),
             server_host_keys=[key or asyncssh.generate_private_key('ssh-ed25519')],
+            **extra,
         )
         self.servers.append(server)
         return server

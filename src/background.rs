@@ -1,6 +1,6 @@
 //! One owner per configuration; the desktop talks to it over authenticated loopback JSON.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     path::PathBuf,
     process::Stdio,
@@ -78,6 +78,16 @@ pub struct Snapshot {
     /// Why the helper last failed to start.
     #[serde(default)]
     pub divert_error: String,
+    /// The user's UDP choices: relay consent per tunnel, QUIC per rule.
+    #[serde(default)]
+    pub udp: crate::udp::consent::UdpSettings,
+    /// Why the UDP settings file could not be read; UDP stays off meanwhile.
+    #[serde(default)]
+    pub udp_error: String,
+    #[serde(default)]
+    pub udp_runtimes: HashMap<String, crate::ssh::UdpRuntime>,
+    #[serde(default)]
+    pub udp_metrics: HashMap<String, crate::udp::transport::TransportMetrics>,
 }
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -424,6 +434,36 @@ struct Owned {
     apps: Apps,
     divert: Divert,
     manager: Manager,
+    udp: crate::udp::consent::UdpSettings,
+    udp_error: String,
+}
+
+const UDP_BROKEN: &str = "Файл настроек UDP повреждён. Исправьте или удалите его, затем повторите.";
+
+impl Owned {
+    /// SOCKS tunnels whose user agreed to the relay.
+    fn udp_tunnels(&self) -> HashSet<String> {
+        self.config
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.kind == "D" && self.udp.tunnel_enabled(&tunnel.id))
+            .map(|tunnel| tunnel.id.clone())
+            .collect()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UdpTunnelChoice {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UdpRuleChoice {
+    id: String,
+    quic: bool,
 }
 
 struct Service {
@@ -485,7 +525,19 @@ impl Service {
                         )
                     })
                     .collect();
+                let mut udp_runtimes = HashMap::new();
+                let mut udp_metrics = HashMap::new();
+                for (id, (runtime, metrics)) in owned.manager.udp_snapshot().await {
+                    if let Some(metrics) = metrics {
+                        udp_metrics.insert(id.clone(), metrics);
+                    }
+                    udp_runtimes.insert(id, runtime);
+                }
                 Ok(serde_json::to_value(Snapshot {
+                    udp: owned.udp.clone(),
+                    udp_error: owned.udp_error.clone(),
+                    udp_runtimes,
+                    udp_metrics,
                     apps: owned.apps.rules.clone(),
                     app_runtimes,
                     apps_unavailable: unavailable.into(),
@@ -533,6 +585,58 @@ impl Service {
                     }
                 }
                 owned.config = next;
+                let udp = owned.udp_tunnels();
+                owned.manager.set_udp(udp).await;
+                Ok(Value::Null)
+            }
+            "udp_tunnel" => {
+                let choice: UdpTunnelChoice =
+                    serde_json::from_value(payload).context("Некорректный выбор UDP.")?;
+                ensure!(owned.udp_error.is_empty(), UDP_BROKEN);
+                ensure!(
+                    owned
+                        .config
+                        .tunnels
+                        .iter()
+                        .any(|tunnel| tunnel.id == choice.id && tunnel.kind == "D"),
+                    "UDP через сервер доступен только для сохранённого туннеля типа D."
+                );
+                let mut next = owned.udp.clone();
+                next.tunnels.insert(
+                    choice.id,
+                    crate::udp::consent::TunnelUdp {
+                        enabled: choice.enabled,
+                    },
+                );
+                next.retain_known(
+                    owned.config.tunnels.iter().map(|tunnel| tunnel.id.as_str()),
+                    owned.apps.rules.iter().map(|rule| rule.id.as_str()),
+                );
+                crate::udp::consent::save(&self.store, &next)?;
+                owned.udp = next;
+                let udp = owned.udp_tunnels();
+                owned.manager.set_udp(udp).await;
+                Ok(Value::Null)
+            }
+            "udp_rule" => {
+                let choice: UdpRuleChoice =
+                    serde_json::from_value(payload).context("Некорректный выбор UDP.")?;
+                ensure!(owned.udp_error.is_empty(), UDP_BROKEN);
+                ensure!(
+                    owned.apps.rules.iter().any(|rule| rule.id == choice.id),
+                    "Сохранённое правило не найдено."
+                );
+                let mut next = owned.udp.clone();
+                next.rules.insert(
+                    choice.id,
+                    crate::udp::consent::RuleUdp { quic: choice.quic },
+                );
+                next.retain_known(
+                    owned.config.tunnels.iter().map(|tunnel| tunnel.id.as_str()),
+                    owned.apps.rules.iter().map(|rule| rule.id.as_str()),
+                );
+                crate::udp::consent::save(&self.store, &next)?;
+                owned.udp = next;
                 Ok(Value::Null)
             }
             "start" | "stop" => {
@@ -708,6 +812,11 @@ pub async fn serve(store: Store) -> Result<()> {
     let config = store.load()?;
     // Broken application rules must not keep the tunnels from starting.
     let apps = crate::apps::load(&store).unwrap_or_default();
+    // Broken UDP settings keep UDP off and the file untouched; tunnels still start.
+    let (udp, udp_error) = match crate::udp::consent::load(&store) {
+        Ok(udp) => (udp, String::new()),
+        Err(error) => (Default::default(), format!("{error:#}")),
+    };
     let manager = Manager::new(store.known_hosts_path());
     let service = Arc::new(Service {
         store: store.clone(),
@@ -717,6 +826,8 @@ pub async fn serve(store: Store) -> Result<()> {
             apps,
             divert: Divert::default(),
             manager: manager.clone(),
+            udp,
+            udp_error,
         }),
         shutdown: CancellationToken::new(),
         closed: CancellationToken::new(),
@@ -733,6 +844,10 @@ pub async fn serve(store: Store) -> Result<()> {
     let endpoint = store.sidecar(".background.json");
     atomic_json(&endpoint, &metadata, Some(4096))?;
     drop(guard);
+    {
+        let owned = service.owned.lock().await;
+        manager.set_udp(owned.udp_tunnels()).await;
+    }
     for tunnel in config.tunnels {
         if tunnel.enabled {
             manager.start(tunnel).await?;
@@ -978,6 +1093,8 @@ mod startup_tests {
                 apps: Apps::default(),
                 divert: Divert::default(),
                 manager: Manager::new(store.known_hosts_path()),
+                udp: Default::default(),
+                udp_error: String::new(),
             }),
             shutdown: CancellationToken::new(),
             closed: CancellationToken::new(),
@@ -1078,6 +1195,8 @@ mod startup_tests {
                 },
                 divert: Divert::default(),
                 manager: Manager::new(store.known_hosts_path()),
+                udp: Default::default(),
+                udp_error: String::new(),
             }),
             shutdown: CancellationToken::new(),
             closed: CancellationToken::new(),
