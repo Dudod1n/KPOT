@@ -34,11 +34,14 @@ class PackageTests(unittest.TestCase):
                 for name in ['krot', 'krot-cli']:
                     (source / (name + suffix)).write_bytes((runner + name).encode())
                 (source / 'THIRD_PARTY_NOTICES.txt').write_text(runner + ' licenses')
+            for name in ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt']:
+                (builds / 'krot-rust-Windows-X64' / name).write_bytes(name.encode())
             # Windows chmod does not set Unix executable permission bits.
             with patch.object(packager, 'ROOT', root), patch.object(Path, 'chmod'):
                 packager.package('v1.2.3', builds, output, notes)
             self.assertEqual(notes.read_text(), '### Fixed\n- Port cleanup.\n')
-            self.assertEqual(len(list(output.iterdir())), 10)
+            self.assertEqual(len(list(output.iterdir())), 13)
+            self.assertEqual((output / 'WinDivert64.sys').read_bytes(), b'WinDivert64.sys')
             for line in (output / 'SHA256SUMS').read_text().splitlines():
                 digest, name = line.split('  ', 1)
                 self.assertEqual(digest, hashlib.sha256((output / name).read_bytes()).hexdigest())
@@ -47,11 +50,31 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(archive.read('LICENSE'), b'GPL test notice')
                 self.assertEqual(archive.read('THIRD_PARTY_NOTICES.txt'), b'Windows licenses')
                 self.assertIn(b'/tree/v1.2.3', archive.read('README.txt'))
+                for name in ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt']:
+                    self.assertEqual(archive.read(name), name.encode())
             with tarfile.open(output / 'krot-1.2.3-linux-x64.tar.gz') as archive:
                 self.assertEqual(archive.extractfile('krot-1.2.3/krot-cli').read(), b'Linuxkrot-cli')
                 self.assertEqual(archive.getmember('krot-1.2.3/krot-cli').mode & 0o777, 0o755)
                 self.assertEqual(archive.extractfile('krot-1.2.3/THIRD_PARTY_NOTICES.txt').read(), b'Linux licenses')
                 self.assertEqual(archive.extractfile('krot-1.2.3/LICENSE').read(), b'GPL test notice')
+                self.assertNotIn('krot-1.2.3/WinDivert.dll', archive.getnames())
+
+    def test_windows_archive_is_not_built_without_the_driver_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'assets').mkdir()
+            (root / 'Cargo.toml').write_text('[package]\nversion = "1.2.3"\n')
+            (root / 'CHANGELOG.md').write_text('## 1.2.3\nNotes\n')
+            for name in ['LICENSE', 'assets/krot.png', 'assets/krot.ico']:
+                (root / name).write_bytes(b'x')
+            for runner, suffix in [('Linux', ''), ('Windows', '.exe')]:
+                source = root / 'builds' / f'krot-rust-{runner}-X64'
+                source.mkdir(parents=True)
+                for name in ['krot' + suffix, 'krot-cli' + suffix, 'THIRD_PARTY_NOTICES.txt']:
+                    (source / name).write_bytes(b'x')
+            with patch.object(packager, 'ROOT', root), self.assertRaises(ValueError):
+                packager.package('v1.2.3', root / 'builds', root / 'output', root / 'notes')
+            self.assertFalse((root / 'output').exists())
 
     def test_invalid_tag_and_missing_notes_fail_before_creating_output(self):
         with tempfile.TemporaryDirectory() as directory:

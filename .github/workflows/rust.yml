@@ -44,6 +44,9 @@ jobs:
         run: python scripts/check_rust.py -v
         env:
           KROT_RUST_BIN: target/release/krot-cli.exe
+      - if: runner.os == 'Windows'
+        name: Fetch the pinned WinDivert files
+        run: python scripts/fetch_windivert.py --output target/release
       - uses: actions/upload-artifact@v7
         with:
           name: krot-rust-${{ runner.os }}-${{ runner.arch }}
@@ -53,3 +56,6 @@ jobs:
             target/release/krot-cli
             target/release/krot-cli.exe
             target/release/THIRD_PARTY_NOTICES.txt
+            target/release/WinDivert.dll
+            target/release/WinDivert64.sys
+            target/release/WinDivert-LICENSE.txt
