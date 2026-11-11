@@ -1,7 +1,7 @@
 //! WinDivert glue: loads the official driver library, runs the packet loop and the relay.
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::c_void,
     net::SocketAddr,
     os::windows::{ffi::OsStrExt, process::CommandExt},
@@ -309,6 +309,8 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
         parents: RefCell::new(None),
     };
     let mut generation = u64::MAX;
+    // Rules whose application goes around its tunnel right now, because the tunnel is down.
+    let mut bypassing: HashSet<String> = HashSet::new();
     let mut udp_ports: HashMap<(u16, bool), (Option<String>, Instant)> = HashMap::new();
     let mut buffer = vec![0u8; 40 + 0xffff];
     let mut purged = Instant::now();
@@ -340,7 +342,14 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
         let current = shared.generation.load(Ordering::Acquire);
         if current != generation {
             generation = current;
-            matcher.set_rules(&shared.rules.lock().unwrap());
+            let rules = shared.rules.lock().unwrap();
+            matcher.set_rules(&rules);
+            bypassing = rules
+                .iter()
+                .filter(|rule| rule.direct && rule.proxy.is_none())
+                .map(|rule| rule.id.clone())
+                .collect();
+            drop(rules);
             udp_ports.clear();
         }
         let data = &mut buffer[..length as usize];
@@ -351,22 +360,29 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
                 nat.purge(now);
                 udp_ports.retain(|_, (_, at)| now.duration_since(*at) < PORT_TTL);
             }
-            handle(data, relay_port, &mut nat, now, &mut |protocol, origin| {
-                if protocol == TCP {
-                    return matcher.decide(port_owner(true, origin)?, now, &system);
-                }
-                // Datagrams arrive in bursts: one lookup per local port every few seconds.
-                let key = (origin.local_port, origin.v6);
-                if let Some((rule, at)) = udp_ports.get(&key)
-                    && now.duration_since(*at) < PORT_TTL
-                {
-                    return rule.clone();
-                }
-                let rule =
-                    port_owner(false, origin).and_then(|pid| matcher.decide(pid, now, &system));
-                udp_ports.insert(key, (rule.clone(), now));
-                rule
-            })
+            handle(
+                data,
+                relay_port,
+                &mut nat,
+                now,
+                &mut |protocol, origin| {
+                    if protocol == TCP {
+                        return matcher.decide(port_owner(true, origin)?, now, &system);
+                    }
+                    // Datagrams arrive in bursts: one lookup per local port every few seconds.
+                    let key = (origin.local_port, origin.v6);
+                    if let Some((rule, at)) = udp_ports.get(&key)
+                        && now.duration_since(*at) < PORT_TTL
+                    {
+                        return rule.clone();
+                    }
+                    let rule =
+                        port_owner(false, origin).and_then(|pid| matcher.decide(pid, now, &system));
+                    udp_ports.insert(key, (rule.clone(), now));
+                    rule
+                },
+                &|rule| bypassing.contains(rule),
+            )
         };
         if verdict == Verdict::Drop {
             continue;

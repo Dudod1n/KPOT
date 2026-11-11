@@ -197,13 +197,15 @@ impl Nat {
 }
 
 /// Decides what happens to one outbound packet. `owner` names the rule of the process that
-/// owns a local port, or `None` when the process is not covered by any rule.
+/// owns a local port, or `None` when the process is not covered by any rule. `direct` tells
+/// whether a rule lets its application bypass a tunnel that is not running.
 pub fn handle(
     data: &mut [u8],
     relay_port: u16,
     nat: &mut Nat,
     now: Instant,
     owner: &mut dyn FnMut(u8, &Origin) -> Option<String>,
+    direct: &dyn Fn(&str) -> bool,
 ) -> Verdict {
     let Some(packet) = parse(data) else {
         return Verdict::Pass;
@@ -215,11 +217,14 @@ pub fn handle(
         remote_port: packet.destination_port,
     };
     if packet.protocol == UDP {
-        // Names are resolved by this computer; everything else would bypass the tunnel.
-        return if packet.destination_port != DNS_PORT && owner(UDP, &view).is_some() {
-            Verdict::Drop
-        } else {
-            Verdict::Pass
+        // Names are resolved by this computer; everything else would bypass the tunnel,
+        // unless the rule sends the application around a tunnel that is down anyway.
+        if packet.destination_port == DNS_PORT {
+            return Verdict::Pass;
+        }
+        return match owner(UDP, &view) {
+            Some(rule) if !direct(&rule) => Verdict::Drop,
+            _ => Verdict::Pass,
         };
     }
     if packet.source_port == relay_port {
@@ -470,6 +475,12 @@ mod tests {
     fn foreign(_: u8, _: &Origin) -> Option<String> {
         None
     }
+    fn tunneled(_: &str) -> bool {
+        false
+    }
+    fn bypassing(_: &str) -> bool {
+        true
+    }
 
     #[test]
     fn covered_connection_is_reflected_into_the_relay_and_back_for_both_families() {
@@ -486,7 +497,7 @@ mod tests {
             let (mut nat, now) = (Nat::default(), Instant::now());
             let mut syn = tcp(app, remote, 0x02);
             assert_eq!(
-                handle(&mut syn, RELAY, &mut nat, now, &mut covered),
+                handle(&mut syn, RELAY, &mut nat, now, &mut covered, &tunneled),
                 Verdict::Reflect
             );
             // The relay accepts a connection that seems to come from the remote address.
@@ -496,7 +507,7 @@ mod tests {
 
             let mut answer = tcp(relay, &as_peer, 0x12);
             assert_eq!(
-                handle(&mut answer, RELAY, &mut nat, now, &mut foreign),
+                handle(&mut answer, RELAY, &mut nat, now, &mut foreign, &tunneled),
                 Verdict::Reflect
             );
             // The application sees the answer as coming from the real destination.
@@ -505,7 +516,7 @@ mod tests {
             // Later packets follow the table, not the process lookup.
             let mut data = tcp(app, remote, 0x18);
             assert_eq!(
-                handle(&mut data, RELAY, &mut nat, now, &mut foreign),
+                handle(&mut data, RELAY, &mut nat, now, &mut foreign, &tunneled),
                 Verdict::Reflect
             );
             assert_eq!(endpoints(&data).1, relay);
@@ -519,7 +530,7 @@ mod tests {
             let original = tcp("192.168.1.5:50001", "10.0.0.1:22", flags);
             let mut packet = original.clone();
             assert_eq!(
-                handle(&mut packet, RELAY, &mut nat, now, &mut foreign),
+                handle(&mut packet, RELAY, &mut nat, now, &mut foreign, &tunneled),
                 Verdict::Pass
             );
             assert_eq!(packet, original);
@@ -527,31 +538,38 @@ mod tests {
         assert!(nat.is_empty());
         let mut stray = tcp("192.168.1.5:40000", "10.0.0.1:50001", 0x12);
         assert_eq!(
-            handle(&mut stray, RELAY, &mut nat, now, &mut covered),
+            handle(&mut stray, RELAY, &mut nat, now, &mut covered, &tunneled),
             Verdict::Drop
         );
         // A reused local port that now belongs to a foreign process leaves the table.
         let mut syn = tcp("192.168.1.5:50002", "10.0.0.1:80", 0x02);
-        handle(&mut syn, RELAY, &mut nat, now, &mut covered);
+        handle(&mut syn, RELAY, &mut nat, now, &mut covered, &tunneled);
         let mut reused = tcp("192.168.1.5:50002", "10.0.0.1:80", 0x02);
         assert_eq!(
-            handle(&mut reused, RELAY, &mut nat, now, &mut foreign),
+            handle(&mut reused, RELAY, &mut nat, now, &mut foreign, &tunneled),
             Verdict::Pass
         );
         assert!(nat.is_empty());
         // Same port and address, other destination port: not this flow.
-        handle(&mut syn.clone(), RELAY, &mut nat, now, &mut covered);
+        handle(
+            &mut syn.clone(),
+            RELAY,
+            &mut nat,
+            now,
+            &mut covered,
+            &tunneled,
+        );
         let mut syn = tcp("192.168.1.5:50002", "10.0.0.1:80", 0x02);
-        handle(&mut syn, RELAY, &mut nat, now, &mut covered);
+        handle(&mut syn, RELAY, &mut nat, now, &mut covered, &tunneled);
         let mut other = tcp("192.168.1.5:50002", "10.0.0.1:8080", 0x10);
         assert_eq!(
-            handle(&mut other, RELAY, &mut nat, now, &mut foreign),
+            handle(&mut other, RELAY, &mut nat, now, &mut foreign, &tunneled),
             Verdict::Pass
         );
         for garbage in [&[][..], &[0x45, 0, 0], &[0x10; 40]] {
             let mut packet = garbage.to_vec();
             assert_eq!(
-                handle(&mut packet, RELAY, &mut nat, now, &mut covered),
+                handle(&mut packet, RELAY, &mut nat, now, &mut covered, &tunneled),
                 Verdict::Pass
             );
         }
@@ -566,17 +584,40 @@ mod tests {
             packet
         };
         assert_eq!(
-            handle(&mut udp(443), RELAY, &mut nat, now, &mut covered),
+            handle(&mut udp(443), RELAY, &mut nat, now, &mut covered, &tunneled),
             Verdict::Drop
         );
         assert_eq!(
-            handle(&mut udp(53), RELAY, &mut nat, now, &mut covered),
+            handle(&mut udp(53), RELAY, &mut nat, now, &mut covered, &tunneled),
             Verdict::Pass
         );
         assert_eq!(
-            handle(&mut udp(443), RELAY, &mut nat, now, &mut foreign),
+            handle(&mut udp(443), RELAY, &mut nat, now, &mut foreign, &tunneled),
             Verdict::Pass
         );
+    }
+
+    #[test]
+    fn covered_udp_goes_direct_while_the_rule_bypasses_a_stopped_tunnel() {
+        let (mut nat, now) = (Nat::default(), Instant::now());
+        for (source, destination) in [
+            ("192.168.1.5:50003", "8.8.8.8:443"),
+            ("[fd00::5]:50003", "[2001:db8::8]:3478"),
+        ] {
+            let mut packet = tcp(source, destination, 0);
+            packet[if source.starts_with('[') { 6 } else { 9 }] = UDP;
+            let original = packet.clone();
+            assert_eq!(
+                handle(&mut packet, RELAY, &mut nat, now, &mut covered, &bypassing),
+                Verdict::Pass
+            );
+            assert_eq!(packet, original);
+            assert_eq!(
+                handle(&mut packet, RELAY, &mut nat, now, &mut covered, &tunneled),
+                Verdict::Drop
+            );
+        }
+        assert!(nat.is_empty());
     }
 
     #[test]
@@ -584,20 +625,20 @@ mod tests {
         let (mut nat, start) = (Nat::default(), Instant::now());
         let open = |nat: &mut Nat, port: u16| {
             let mut syn = tcp(&format!("192.168.1.5:{port}"), "10.0.0.1:443", 0x02);
-            handle(&mut syn, RELAY, nat, start, &mut covered);
+            handle(&mut syn, RELAY, nat, start, &mut covered, &tunneled);
         };
         open(&mut nat, 1);
         open(&mut nat, 2);
         open(&mut nat, 3);
         // 1: both sides finish. 2: reset. 3: stays idle.
         let mut fin = tcp("192.168.1.5:1", "10.0.0.1:443", 0x11);
-        handle(&mut fin, RELAY, &mut nat, start, &mut foreign);
+        handle(&mut fin, RELAY, &mut nat, start, &mut foreign, &tunneled);
         nat.purge(start + CLOSED_FLOW * 2);
         assert_eq!(nat.len(), 3, "a half-closed connection is still alive");
         let mut fin = tcp("192.168.1.5:40000", "10.0.0.1:1", 0x11);
-        handle(&mut fin, RELAY, &mut nat, start, &mut foreign);
+        handle(&mut fin, RELAY, &mut nat, start, &mut foreign, &tunneled);
         let mut reset = tcp("192.168.1.5:2", "10.0.0.1:443", 0x04);
-        handle(&mut reset, RELAY, &mut nat, start, &mut foreign);
+        handle(&mut reset, RELAY, &mut nat, start, &mut foreign, &tunneled);
         nat.purge(start + CLOSED_FLOW / 2);
         assert_eq!(nat.len(), 3);
         nat.purge(start + CLOSED_FLOW * 2);
