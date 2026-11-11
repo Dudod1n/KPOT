@@ -174,6 +174,53 @@ async fn fetch_release(
 pub async fn check(store: &Store, manual: bool) -> Result<Option<Release>> {
     fetch_release(&client()?, LATEST, env!("CARGO_PKG_VERSION"), store, manual).await
 }
+/// Downloads driver files that the installed copy lacks from this version's release.
+/// An update installed by an older КРОТ replaces only the two executables.
+pub async fn fetch_components(
+    directory: &Path,
+    components: &[&crate::divert::Component],
+) -> Result<()> {
+    let base = concat!(
+        "https://github.com/Dudod1n/KPOT/releases/download/v",
+        env!("CARGO_PKG_VERSION"),
+        "/"
+    );
+    fetch_components_from(&client()?, base, directory, components).await
+}
+async fn fetch_components_from(
+    client: &reqwest::Client,
+    base: &str,
+    directory: &Path,
+    components: &[&crate::divert::Component],
+) -> Result<()> {
+    // Everything is verified before the first file appears next to the executable.
+    let mut verified = Vec::new();
+    for component in components {
+        let response = client
+            .get(format!("{base}{}", component.name))
+            .send()
+            .await?
+            .error_for_status()?;
+        let data = bounded_body(response, component.size as usize).await?;
+        ensure!(
+            data.len() as u64 == component.size
+                && hex::encode(Sha256::digest(&data)) == component.sha256,
+            "Скачанный {} не совпадает с официальной сборкой WinDivert.",
+            component.name
+        );
+        verified.push((component.name, data));
+    }
+    for (name, data) in verified {
+        // The driver is loaded by the system, so the file keeps the directory's access rights.
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        temporary.write_all(&data)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(directory.join(name))
+            .map_err(|error| error.error)?;
+    }
+    Ok(())
+}
 fn asset_digest(asset: &Asset) -> Result<String> {
     ensure!(
         asset.size > 0 && asset.size <= MAX_ASSET,
@@ -1035,6 +1082,84 @@ mod network_tests {
 mod download_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn driver_files_are_written_only_when_every_download_matches_its_pin() {
+        use crate::divert::Component;
+        async fn serve(
+            bodies: Vec<&'static [u8]>,
+        ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/v1/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut paths = Vec::new();
+                for body in bodies {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let read = stream.read(&mut request).await.unwrap();
+                    let line = String::from_utf8_lossy(&request[..read]);
+                    paths.push(line.split(' ').nth(1).unwrap_or_default().to_owned());
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                }
+                paths
+            });
+            (base, server)
+        }
+        let sha = |data: &[u8]| -> &'static str { hex::encode(Sha256::digest(data)).leak() };
+        let library = Component {
+            name: "WinDivert.dll",
+            sha256: sha(b"library"),
+            size: 7,
+        };
+        let driver = Component {
+            name: "WinDivert64.sys",
+            sha256: sha(b"driver"),
+            size: 6,
+        };
+        let client = client().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+
+        // The second file is wrong: the first must not be left behind either.
+        let (base, server) = serve(vec![b"library", b"forged"]).await;
+        let result =
+            fetch_components_from(&client, &base, directory.path(), &[&library, &driver]).await;
+        assert!(result.unwrap_err().to_string().contains("WinDivert64.sys"));
+        server.await.unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        // A longer body is refused by size before it is hashed.
+        let (base, server) = serve(vec![b"library and more"]).await;
+        assert!(
+            fetch_components_from(&client, &base, directory.path(), &[&library])
+                .await
+                .is_err()
+        );
+        server.abort();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        fs::write(directory.path().join("WinDivert.dll"), b"stale").unwrap();
+        let (base, server) = serve(vec![b"library", b"driver"]).await;
+        fetch_components_from(&client, &base, directory.path(), &[&library, &driver])
+            .await
+            .unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            ["/v1/WinDivert.dll", "/v1/WinDivert64.sys"]
+        );
+        assert_eq!(
+            fs::read(directory.path().join("WinDivert.dll")).unwrap(),
+            b"library"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("WinDivert64.sys")).unwrap(),
+            b"driver"
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
     #[tokio::test]
     async fn real_download_rejects_bad_digest_and_size_and_writes_verified_file() {
         let dir = tempfile::tempdir().unwrap();

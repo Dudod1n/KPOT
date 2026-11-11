@@ -26,10 +26,17 @@ def archive(files):
 
 class WinDivertTests(unittest.TestCase):
     def test_helper_and_fetcher_pin_the_same_files(self):
-        source = (ROOT / 'src/divert/windows.rs').read_text(encoding='utf-8')
-        pinned = dict(re.findall(r'const (DLL|SYS)_SHA256: &str = "([0-9a-f]{64})";', source))
+        source = (ROOT / 'src/divert.rs').read_text(encoding='utf-8')
+        pinned = dict(re.findall(r'pub const (DLL|SYS)_SHA256: &str = "([0-9a-f]{64})";', source))
         self.assertEqual(pinned['DLL'], fetcher.FILES['x64/WinDivert.dll'][1])
         self.assertEqual(pinned['SYS'], fetcher.FILES['x64/WinDivert64.sys'][1])
+
+    def test_published_names_match_what_the_application_downloads(self):
+        source = (ROOT / 'src/divert.rs').read_text(encoding='utf-8')
+        packager = (ROOT / 'scripts/package_release.py').read_text(encoding='utf-8')
+        for name in re.findall(r'name: "(WinDivert[^"]+)"', source):
+            self.assertIn(name, [shipped for shipped, _ in fetcher.FILES.values()])
+            self.assertIn(f"'{name}'", packager)
 
     def test_only_the_pinned_archive_and_files_are_extracted(self):
         files = {'x64/WinDivert.dll': b'dll', 'x64/WinDivert64.sys': b'sys', 'LICENSE': b'LGPL'}

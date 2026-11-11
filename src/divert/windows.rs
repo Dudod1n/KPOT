@@ -38,7 +38,9 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{Matcher, Nat, Origin, Processes, TCP, Verdict, handle, table_owner};
+use super::{
+    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle, table_owner,
+};
 use crate::{
     apps::{DivertReport, DivertRule, DivertStats},
     background::Client,
@@ -46,9 +48,6 @@ use crate::{
     proxy::{Counters, Destination},
 };
 
-/// Official WinDivert 2.2.2-A x64 files; anything else is refused before it is loaded.
-const DLL_SHA256: &str = "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2";
-const SYS_SHA256: &str = "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2";
 const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp)\0";
 const FIREWALL_RULE: &str = "KROT-app-relay";
 const OUTBOUND: u32 = 1 << 17;

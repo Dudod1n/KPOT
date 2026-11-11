@@ -148,6 +148,39 @@ impl Desktop {
             json!(rule.id),
         );
     }
+    /// Starts the elevated helper, first fetching its driver files if this copy lacks them.
+    pub(super) fn grant_divert(&mut self, ctx: &egui::Context) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        let directory = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+        let missing = match &directory {
+            Some(directory) if cfg!(windows) => crate::divert::missing_components(directory),
+            _ => Vec::new(),
+        };
+        let (Some(directory), false) = (directory, missing.is_empty()) else {
+            self.launch_divert();
+            return;
+        };
+        self.fetching_components = true;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        backend.runtime.spawn(async move {
+            let result = crate::update::fetch_components(&directory, &missing)
+                .await
+                .map_err(|_| COMPONENTS_ERROR.to_owned());
+            let _ = tx.send(Event::ComponentsFetched(result));
+            ctx.request_repaint();
+        });
+    }
+    pub(super) fn launch_divert(&mut self) {
+        if let Some(backend) = &self.backend
+            && let Err(error) = crate::divert::launch(&backend.store.path)
+        {
+            self.error = error.to_string();
+        }
+    }
     pub(super) fn new_socks_tunnel(&mut self) {
         let mut form = TunnelForm::new(None);
         form.draft.kind = "D".into();
@@ -220,12 +253,15 @@ impl Desktop {
             if !failure.is_empty() {
                 ui.colored_label(tone(ui, RED), &failure);
             }
-            if ui.button("Предоставить права…").clicked()
-                && let Some(backend) = &self.backend
-                && let Err(error) = crate::divert::launch(&backend.store.path)
-            {
-                self.error = error.to_string();
+            if self.fetching_components {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
+                    ui.label("Скачиваем файлы WinDivert…");
+                });
+            } else if ui.button("Предоставить права…").clicked() {
+                self.grant_divert(ctx);
             }
+            ui.weak("Если файлов WinDivert нет рядом с КРОТом, они будут скачаны из его релиза на GitHub.");
             ui.add_space(8.0);
         }
         if let Some(rule) = self.selected_app() {

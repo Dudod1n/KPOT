@@ -66,7 +66,10 @@ def package(tag, builds, output, notes_path):
         files = [*binaries, (notices, 'THIRD_PARTY_NOTICES.txt'),
                  *((path, path.name) for path in common)]
         if platform == 'windows':
-            files += [(source / name, name) for name in windivert]
+            # Also published on their own: a copy updated from an older version downloads them.
+            for name in windivert:
+                shutil.copy2(source / name, output / name)
+            files += [(output / name, name) for name in windivert]
             with zipfile.ZipFile(output / f'krot-{version}-windows-x64.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
                 for path, name in files:
                     archive.write(path, name)

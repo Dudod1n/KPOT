@@ -40,7 +40,8 @@ class PackageTests(unittest.TestCase):
             with patch.object(packager, 'ROOT', root), patch.object(Path, 'chmod'):
                 packager.package('v1.2.3', builds, output, notes)
             self.assertEqual(notes.read_text(), '### Fixed\n- Port cleanup.\n')
-            self.assertEqual(len(list(output.iterdir())), 10)
+            self.assertEqual(len(list(output.iterdir())), 13)
+            self.assertEqual((output / 'WinDivert64.sys').read_bytes(), b'WinDivert64.sys')
             for line in (output / 'SHA256SUMS').read_text().splitlines():
                 digest, name = line.split('  ', 1)
                 self.assertEqual(digest, hashlib.sha256((output / name).read_bytes()).hexdigest())

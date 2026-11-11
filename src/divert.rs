@@ -12,6 +12,44 @@ use crate::apps::{DivertRule, path_key};
 #[cfg(windows)]
 mod windows;
 
+/// Official WinDivert 2.2.2-A x64 files; anything else is refused before it is loaded.
+pub const DLL_SHA256: &str = "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2";
+pub const SYS_SHA256: &str = "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2";
+
+/// A driver file that must sit next to the executable.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Component {
+    pub name: &'static str,
+    pub sha256: &'static str,
+    pub size: u64,
+}
+
+pub const COMPONENTS: [Component; 2] = [
+    Component {
+        name: "WinDivert.dll",
+        sha256: DLL_SHA256,
+        size: 47_616,
+    },
+    Component {
+        name: "WinDivert64.sys",
+        sha256: SYS_SHA256,
+        size: 94_144,
+    },
+];
+
+/// Components that are absent from `directory` or are not the pinned build.
+pub fn missing_components(directory: &std::path::Path) -> Vec<&'static Component> {
+    use sha2::Digest;
+    COMPONENTS
+        .iter()
+        .filter(|component| {
+            std::fs::read(directory.join(component.name))
+                .map(|bytes| hex::encode(sha2::Sha256::digest(&bytes)) != component.sha256)
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
 const TCP: u8 = 6;
 const UDP: u8 = 17;
 const DNS_PORT: u16 = 53;
@@ -631,6 +669,21 @@ mod tests {
         assert_eq!(matcher.decide(11, now, &empty).as_deref(), Some("browser"));
         matcher.set_rules(&[rule("solo", r"C:\Apps\solo.exe", false)]);
         assert_eq!(matcher.decide(11, now, &tree), None);
+    }
+
+    #[test]
+    fn only_the_pinned_driver_files_count_as_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = |missing: Vec<&Component>| -> Vec<_> {
+            missing.iter().map(|component| component.name).collect()
+        };
+        assert_eq!(
+            names(missing_components(directory.path())),
+            ["WinDivert.dll", "WinDivert64.sys"]
+        );
+        // A file with the right name and other content is still missing.
+        std::fs::write(directory.path().join("WinDivert.dll"), b"other build").unwrap();
+        assert_eq!(missing_components(directory.path()).len(), 2);
     }
 
     #[test]

@@ -26,6 +26,7 @@ const CLOSE_PREFERENCE_ERROR: &str =
     "Не удалось запомнить выбор. Повторите попытку или нажмите «Назад».";
 const KEY_DIALOG_ERROR: &str =
     "Не удалось открыть диалог выбора файла. Введите путь к ключу вручную.";
+const COMPONENTS_ERROR: &str = "Не удалось скачать файлы WinDivert. Проверьте подключение к сети или скопируйте WinDivert.dll и WinDivert64.sys из архива релиза в каталог КРОТа.";
 const SKIP_UPDATE_ERROR: &str =
     "Не удалось запомнить пропущенную версию. Повторите попытку или нажмите «Позже».";
 const INK: Color32 = Color32::from_rgb(225, 232, 232);
@@ -266,6 +267,7 @@ enum Event {
     Snapshot(Result<Box<Snapshot>, String>),
     Complete(Operation, Result<(), String>),
     AutostartLoaded(Result<bool, String>),
+    ComponentsFetched(Result<(), String>),
     AutostartChanged(Result<bool, String>),
     ClosePreferenceSaved(Result<(), String>),
     UpdateChecked {
@@ -321,6 +323,7 @@ pub(crate) struct Desktop {
     view: View,
     selected_app: Option<String>,
     busy_apps: HashSet<String>,
+    fetching_components: bool,
     #[cfg(not(target_os = "linux"))]
     browse_app: bool,
     dialog: Option<Dialog>,
@@ -768,6 +771,7 @@ impl Desktop {
             view: View::Tunnels,
             selected_app: None,
             busy_apps: HashSet::new(),
+            fetching_components: false,
             #[cfg(not(target_os = "linux"))]
             browse_app: false,
             dialog: None,
@@ -1054,6 +1058,13 @@ impl Desktop {
                         }
                     }
                     self.next_poll = Instant::now();
+                }
+                Event::ComponentsFetched(result) => {
+                    self.fetching_components = false;
+                    match result {
+                        Ok(()) => self.launch_divert(),
+                        Err(error) => self.error = error,
+                    }
                 }
                 Event::AutostartLoaded(result) => {
                     if let Some(Dialog::Settings(settings)) = &mut self.dialog {
