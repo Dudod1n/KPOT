@@ -29,6 +29,25 @@ class LicenseTests(unittest.TestCase):
         self.assertEqual([p['name'] for p in collector.runtime_packages(metadata)],
                          ['runtime', 'shared'])
 
+    def test_relay_graph_starts_at_its_package_and_skips_workspace_members(self):
+        def edge(package):
+            return {'pkg': package, 'dep_kinds': [{'kind': None}]}
+        metadata = {
+            'packages': [{'id': name, 'name': name, 'version': '1'}
+                         for name in ['app', 'relay', 'proto', 'libc', 'gui']],
+            'workspace_members': ['app', 'relay', 'proto'],
+            'resolve': {'root': 'app', 'nodes': [
+                {'id': 'app', 'deps': [edge('gui')]},
+                {'id': 'relay', 'deps': [edge('proto'), edge('libc')]},
+                {'id': 'proto', 'deps': []},
+                {'id': 'libc', 'deps': []},
+                {'id': 'gui', 'deps': []},
+            ]},
+        }
+        self.assertEqual([p['name'] for p in collector.runtime_packages(metadata)], ['gui'])
+        self.assertEqual([p['name'] for p in collector.runtime_packages(metadata, 'relay')],
+                         ['libc'])
+
     def test_missing_license_text_fails_even_when_notice_exists(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)

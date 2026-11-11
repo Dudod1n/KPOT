@@ -25,9 +25,16 @@ FALLBACKS = {
 }
 
 
-def runtime_packages(metadata):
+# The server relay is embedded into the client for these targets and statically links musl.
+RELAY_PACKAGE = 'krot-relay'
+RELAY_TARGETS = ('x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl')
+
+
+def runtime_packages(metadata, root=None):
+    """Runtime dependencies of `root` (the workspace root by default), without workspace members."""
     nodes = {node['id']: node for node in metadata['resolve']['nodes']}
-    root = metadata['resolve']['root']
+    root = root or metadata['resolve']['root']
+    members = set(metadata.get('workspace_members', [])) | {root}
     pending, selected = [root], set()
     while pending:
         package = pending.pop()
@@ -36,7 +43,7 @@ def runtime_packages(metadata):
         selected.add(package)
         pending.extend(dep['pkg'] for dep in nodes[package]['deps']
                        if any(kind['kind'] is None for kind in dep['dep_kinds']))
-    return sorted((p for p in metadata['packages'] if p['id'] in selected and p['id'] != root),
+    return sorted((p for p in metadata['packages'] if p['id'] in selected and p['id'] not in members),
                   key=lambda p: (p['name'], p['version']))
 
 
@@ -77,30 +84,63 @@ def cargo(*arguments):
     return subprocess.check_output(['cargo', *arguments], cwd=ROOT, text=True, encoding='utf-8')
 
 
+def active_packages(target, package=None):
+    """Runtime packages Cargo actually resolves for `target`, for `package` or the root."""
+    metadata = json.loads(cargo('metadata', '--locked', '--format-version=1',
+                                '--filter-platform', target))
+    root = None
+    selection = []
+    if package:
+        root = next(p['id'] for p in metadata['packages']
+                    if p['name'] == package and p['id'] in metadata['workspace_members'])
+        selection = ['--package', package]
+    # Metadata also lists inactive optional edges; cargo tree resolves active features.
+    tree = cargo('tree', '--locked', '--offline', '--target', target, '--edges', 'normal',
+                 '--prefix', 'none', '--format', '{p}', *selection)
+    active = set(re.findall(r'^(\S+) v(\S+)', tree, re.M))
+    return [p for p in runtime_packages(metadata, root) if (p['name'], p['version']) in active]
+
+
+def section(package):
+    parts = [f"\n{'=' * 72}\n{package['name']} {package['version']}\n"
+             f"Declared license: {package['license']}\n"
+             f"Source: {package.get('repository') or 'https://crates.io/crates/' + package['name']}\n"]
+    for name, contents in package_notices(package):
+        parts.append(f'\n--- {name} ---\n{contents.rstrip()}\n')
+    return ''.join(parts)
+
+
+def relay_sections():
+    """Notices of the embedded server relay: its crates and the musl C library it links."""
+    packages = {}
+    for target in RELAY_TARGETS:
+        for package in active_packages(target, RELAY_PACKAGE):
+            packages[(package['name'], package['version'])] = package
+    musl = (ROOT / 'licenses' / 'musl' / 'COPYRIGHT.txt').read_text(encoding='utf-8')
+    parts = [f"\n{'#' * 72}\nEmbedded server relay ({RELAY_PACKAGE}) for "
+             f"{', '.join(RELAY_TARGETS)}\n"
+             'КРОТ uploads this program to an SSH server only with the user\'s consent.\n',
+             f"\n{'=' * 72}\nmusl libc (statically linked by the Rust *-linux-musl targets)\n"
+             'Declared license: MIT\nSource: https://musl.libc.org/\n'
+             f'\n--- COPYRIGHT ---\n{musl.rstrip()}\n']
+    parts.extend(section(package) for _, package in sorted(packages.items()))
+    return parts
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', required=True)
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
-    metadata = json.loads(cargo('metadata', '--locked', '--format-version=1',
-                                '--filter-platform', args.target))
-    # Metadata also lists inactive optional edges; cargo tree resolves active features.
-    tree = cargo('tree', '--locked', '--offline', '--target', args.target, '--edges', 'normal',
-                 '--prefix', 'none', '--format', '{p}')
-    active = set(re.findall(r'^(\S+) v(\S+)', tree, re.M))
-    packages = [p for p in runtime_packages(metadata) if (p['name'], p['version']) in active]
+    packages = active_packages(args.target)
     if not packages:
         raise ValueError('Cargo returned no active runtime dependencies')
     sections = [f'KROT third-party notices — {args.target}\n\n'
                 'KROT application code is GPL-3.0-only. Dependencies and embedded fonts\n'
                 'retain their original licenses. This file preserves upstream license\n'
                 'and attribution texts for the locked runtime dependency graph.\n']
-    for package in packages:
-        sections.append(f"\n{'=' * 72}\n{package['name']} {package['version']}\n"
-                        f"Declared license: {package['license']}\n"
-                        f"Source: {package.get('repository') or 'https://crates.io/crates/' + package['name']}\n")
-        for name, contents in package_notices(package):
-            sections.append(f'\n--- {name} ---\n{contents.rstrip()}\n')
+    sections.extend(section(package) for package in packages)
+    sections.extend(relay_sections())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(''.join(sections), encoding='utf-8')
     print(f'Collected notices for {len(packages)} runtime packages: {args.output}')

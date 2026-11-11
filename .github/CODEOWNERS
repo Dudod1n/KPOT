@@ -10,6 +10,10 @@
 /Cargo.toml @Dudod1n
 /Cargo.lock @Dudod1n
 /build.rs @Dudod1n
+/src/relay.rs @Dudod1n
+/proto/ @Dudod1n
+/relay/ @Dudod1n
+/licenses/musl/ @Dudod1n
 /scripts/package_release.py @Dudod1n
 /scripts/collect_licenses.py @Dudod1n
 /scripts/fetch_windivert.py @Dudod1n
