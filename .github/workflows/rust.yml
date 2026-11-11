@@ -17,7 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
-      - run: sudo apt-get update && sudo apt-get install -y qemu-user
+      # Retries: a mirror that briefly fails to resolve must not fail the build.
+      - run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends qemu-user
       - run: cargo +stable test --locked -p krot-udp-proto -p krot-relay --target x86_64-unknown-linux-musl
       - run: cargo +stable test --locked -p krot-udp-proto -p krot-relay --target aarch64-unknown-linux-musl
         env:
