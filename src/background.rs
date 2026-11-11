@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    apps::{AppRule, AppRuntime, Apps, DivertReport, DivertStats, Interceptor},
     config::{Config, Store, atomic_json},
     ssh::{Manager, PendingPrompt, Runtime},
 };
@@ -64,6 +65,45 @@ pub struct Snapshot {
     pub prompts: HashMap<String, PendingPrompt>,
     #[serde(default)]
     pub activation: u64,
+    #[serde(default)]
+    pub apps: Vec<AppRule>,
+    #[serde(default)]
+    pub app_runtimes: HashMap<String, AppRuntime>,
+    /// Why application traffic cannot be intercepted; empty when it can.
+    #[serde(default)]
+    pub apps_unavailable: String,
+    /// The elevated helper is running and intercepts traffic.
+    #[serde(default)]
+    pub divert_attached: bool,
+    /// Why the helper last failed to start.
+    #[serde(default)]
+    pub divert_error: String,
+}
+
+const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_APP_LOGS: usize = 200;
+
+/// The last word from the elevated helper and what it has reported so far.
+#[derive(Default)]
+struct Divert {
+    seen: Option<Instant>,
+    stats: HashMap<String, DivertStats>,
+    logs: HashMap<String, Vec<String>>,
+    error: String,
+}
+
+impl Divert {
+    fn attached(&self) -> bool {
+        self.seen
+            .is_some_and(|seen| seen.elapsed() < DIVERT_TIMEOUT)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckedApps {
+    before: Vec<AppRule>,
+    rules: Vec<AppRule>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,10 +350,13 @@ pub(crate) async fn stop_selected_and_wait(store: &Store, owner: Option<&Owner>)
         )?;
     }
     let ui = Store::new(store.sidecar(".ui"))?;
+    // The elevated helper runs the old executable until it notices the daemon is gone.
+    let divert = Store::new(store.sidecar(".divert"))?;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(_daemon) = try_lease(store)?
             && let Some(_window) = try_lease(&ui)?
+            && let Some(_helper) = try_lease(&divert)?
         {
             return Ok(());
         }
@@ -378,6 +421,8 @@ pub async fn ensure_running(store: &Store) -> Result<Client> {
 
 struct Owned {
     config: Config,
+    apps: Apps,
+    divert: Divert,
     manager: Manager,
 }
 
@@ -400,7 +445,52 @@ impl Service {
         match command {
             "snapshot" if payload.is_null() => {
                 let (runtimes, prompts) = owned.manager.snapshot().await;
+                let states = runtimes
+                    .iter()
+                    .map(|(id, runtime)| (id.clone(), runtime.state.clone()))
+                    .collect();
+                let unavailable = crate::apps::unavailable();
+                let attached = owned.divert.attached();
+                let interceptor = if attached {
+                    Interceptor::Attached
+                } else if unavailable.is_empty() {
+                    Interceptor::Detached
+                } else {
+                    Interceptor::Unavailable
+                };
+                let app_runtimes = owned
+                    .apps
+                    .rules
+                    .iter()
+                    .map(|rule| {
+                        let state =
+                            crate::apps::state(rule, &owned.config.tunnels, &states, interceptor);
+                        let stats = owned
+                            .divert
+                            .stats
+                            .get(&rule.id)
+                            .filter(|_| attached)
+                            .cloned()
+                            .unwrap_or_default();
+                        (
+                            rule.id.clone(),
+                            AppRuntime {
+                                state: state.into(),
+                                connections: stats.connections,
+                                total: stats.total,
+                                sent: stats.sent,
+                                received: stats.received,
+                                logs: owned.divert.logs.get(&rule.id).cloned().unwrap_or_default(),
+                            },
+                        )
+                    })
+                    .collect();
                 Ok(serde_json::to_value(Snapshot {
+                    apps: owned.apps.rules.clone(),
+                    app_runtimes,
+                    apps_unavailable: unavailable.into(),
+                    divert_attached: attached,
+                    divert_error: owned.divert.error.clone(),
                     version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     config: owned.config.clone(),
                     runtimes,
@@ -467,6 +557,74 @@ impl Service {
                 } else {
                     owned.manager.stop(id).await?;
                 }
+                Ok(Value::Null)
+            }
+            "apps_save" => {
+                let update: CheckedApps =
+                    serde_json::from_value(payload).context("Некорректные правила приложений.")?;
+                if update.before != owned.apps.rules {
+                    return Err(StaleConfig.into());
+                }
+                for rule in &update.rules {
+                    // Untouched rules may wait for a deleted tunnel; new and edited ones may not.
+                    if !owned.apps.rules.contains(rule) {
+                        crate::apps::validate_rule(rule, &update.rules, &owned.config.tunnels)?;
+                    }
+                }
+                let next = Apps {
+                    version: 1,
+                    rules: update.rules,
+                };
+                crate::apps::save(&self.store, &next)?;
+                owned.apps = crate::apps::load(&self.store)?;
+                Ok(Value::Null)
+            }
+            "divert_sync" => {
+                let report: DivertReport =
+                    serde_json::from_value(payload).context("Некорректный отчёт перехвата.")?;
+                ensure!(
+                    report.error.chars().count() <= 400 && report.logs.len() <= 1000,
+                    "Отчёт перехвата превышает допустимый размер."
+                );
+                if report.version != env!("CARGO_PKG_VERSION") {
+                    return Ok(json!({"rules": [], "stop": true}));
+                }
+                let divert = &mut owned.divert;
+                if !report.error.is_empty() {
+                    divert.error = report.error;
+                    divert.seen = None;
+                    return Ok(json!({"rules": []}));
+                }
+                divert.error.clear();
+                divert.seen = Some(Instant::now());
+                divert.stats = report.stats;
+                for (rule, line) in report.logs {
+                    if owned.apps.rules.iter().any(|saved| saved.id == rule) {
+                        let lines = owned.divert.logs.entry(rule).or_default();
+                        lines.push(line.chars().take(200).collect());
+                        if lines.len() > MAX_APP_LOGS {
+                            lines.drain(..lines.len() - MAX_APP_LOGS);
+                        }
+                    }
+                }
+                let (states, _) = owned.manager.states().await;
+                let rules =
+                    crate::apps::divert_rules(&owned.apps.rules, &owned.config.tunnels, &states);
+                Ok(json!({"rules": rules}))
+            }
+            "app_start" | "app_stop" => {
+                let id = payload
+                    .as_str()
+                    .context("Укажите ID сохранённого правила.")?;
+                let mut next = owned.apps.clone();
+                let rule = next
+                    .rules
+                    .iter_mut()
+                    .find(|rule| rule.id == id)
+                    .context("Сохранённое правило не найдено.")?;
+                rule.enabled = command == "app_start";
+                crate::apps::save(&self.store, &next)?;
+                owned.apps = next;
                 Ok(Value::Null)
             }
             "answer" => {
@@ -548,12 +706,16 @@ pub async fn serve(store: Store) -> Result<()> {
     let guard = crate::update::startup_guard().await?;
     let _lease: File = store.lock()?;
     let config = store.load()?;
+    // Broken application rules must not keep the tunnels from starting.
+    let apps = crate::apps::load(&store).unwrap_or_default();
     let manager = Manager::new(store.known_hosts_path());
     let service = Arc::new(Service {
         store: store.clone(),
         token: hex::encode(rand::random::<[u8; 32]>()),
         owned: Mutex::new(Owned {
             config: config.clone(),
+            apps,
+            divert: Divert::default(),
             manager: manager.clone(),
         }),
         shutdown: CancellationToken::new(),
@@ -718,6 +880,20 @@ mod startup_tests {
         );
         drop(ui);
         waiting.await.unwrap().unwrap();
+
+        // The helper is waited for in the same way: an update must not start beside it.
+        let helper = Store::new(store.sidecar(".divert"))
+            .unwrap()
+            .lock()
+            .unwrap();
+        let waiting = tokio::spawn({
+            let store = store.clone();
+            async move { stop_and_wait(&store).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the helper still owns its lease");
+        drop(helper);
+        waiting.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -778,5 +954,178 @@ mod startup_tests {
         );
         stop_and_wait(&store).await.unwrap();
         second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_rules_are_saved_beside_the_config_and_survive_their_tunnel() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("tunnels.json")).unwrap();
+        let socks = crate::config::Tunnel {
+            id: "socks".into(),
+            name: "socks".into(),
+            kind: "D".into(),
+            ..Default::default()
+        };
+        let config = Config {
+            tunnels: vec![socks],
+            ..Default::default()
+        };
+        let service = Service {
+            store: store.clone(),
+            token: String::new(),
+            owned: Mutex::new(Owned {
+                config: config.clone(),
+                apps: Apps::default(),
+                divert: Divert::default(),
+                manager: Manager::new(store.known_hosts_path()),
+            }),
+            shutdown: CancellationToken::new(),
+            closed: CancellationToken::new(),
+            activation: AtomicU64::new(0),
+        };
+        let rule = AppRule {
+            id: "rule".into(),
+            name: "curl".into(),
+            path: "/usr/bin/curl".into(),
+            tunnel_id: "socks".into(),
+            ..Default::default()
+        };
+        let stray = AppRule {
+            id: "stray".into(),
+            path: "/usr/bin/wget".into(),
+            tunnel_id: "missing".into(),
+            ..rule.clone()
+        };
+        assert!(
+            service
+                .execute("apps_save", json!({"before": [], "rules": [stray]}))
+                .await
+                .is_err(),
+            "a new rule needs an existing SOCKS5 tunnel"
+        );
+        service
+            .execute("apps_save", json!({"before": [], "rules": [rule]}))
+            .await
+            .unwrap();
+        let stale = service
+            .execute("apps_save", json!({"before": [], "rules": []}))
+            .await
+            .unwrap_err();
+        assert!(stale.is::<StaleConfig>());
+        service.execute("app_start", json!("rule")).await.unwrap();
+        assert!(service.execute("app_start", json!("gone")).await.is_err());
+        let saved = crate::apps::load(&store).unwrap();
+        assert!(saved.rules[0].enabled);
+        assert!(
+            !store.path.exists(),
+            "the main configuration is not rewritten"
+        );
+
+        // Deleting the tunnel keeps the rule and reports why it does nothing.
+        service
+            .execute(
+                "save_checked",
+                json!({"before": config, "config": Config::default()}),
+            )
+            .await
+            .unwrap();
+        let snapshot: Snapshot =
+            serde_json::from_value(service.execute("snapshot", Value::Null).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot.apps, saved.rules);
+        assert_eq!(snapshot.apps_unavailable, crate::apps::unavailable());
+        assert!(!snapshot.divert_attached);
+        assert_ne!(snapshot.app_runtimes["rule"].state, "running");
+        // An untouched orphan does not block saving the rest.
+        service
+            .execute(
+                "apps_save",
+                json!({"before": saved.rules, "rules": saved.rules}),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn helper_reports_attach_it_and_carry_counters_journal_and_start_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("tunnels.json")).unwrap();
+        let socks = crate::config::Tunnel {
+            id: "socks".into(),
+            name: "socks".into(),
+            kind: "D".into(),
+            ..Default::default()
+        };
+        let rule = AppRule {
+            id: "rule".into(),
+            name: "curl".into(),
+            path: "/usr/bin/curl".into(),
+            tunnel_id: "socks".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let service = Service {
+            store: store.clone(),
+            token: String::new(),
+            owned: Mutex::new(Owned {
+                config: Config {
+                    tunnels: vec![socks],
+                    ..Default::default()
+                },
+                apps: Apps {
+                    version: 1,
+                    rules: vec![rule],
+                },
+                divert: Divert::default(),
+                manager: Manager::new(store.known_hosts_path()),
+            }),
+            shutdown: CancellationToken::new(),
+            closed: CancellationToken::new(),
+            activation: AtomicU64::new(0),
+        };
+        async fn snapshot(service: &Service) -> Snapshot {
+            serde_json::from_value(service.execute("snapshot", Value::Null).await.unwrap()).unwrap()
+        }
+        let version = env!("CARGO_PKG_VERSION");
+        // A helper left over from another version is told to stop and never attaches.
+        let stale = json!({"version": "0.0.1", "stats": {}});
+        let reply = service.execute("divert_sync", stale).await.unwrap();
+        assert_eq!(reply, json!({"rules": [], "stop": true}));
+        assert!(!snapshot(&service).await.divert_attached);
+        let failed = json!({"version": version, "error": "Драйвер не загрузился."});
+        service.execute("divert_sync", failed).await.unwrap();
+        let state = snapshot(&service).await;
+        assert!(!state.divert_attached);
+        assert_eq!(state.divert_error, "Драйвер не загрузился.");
+
+        let report = json!({
+            "version": version,
+            "stats": {"rule": {"connections": 2, "total": 9, "sent": 10, "received": 20}},
+            "logs": [["rule", "10:00:00 10.0.0.1:443 через туннель"], ["gone", "x"]],
+        });
+        let reply = service.execute("divert_sync", report).await.unwrap();
+        // The tunnel is not running, so the application is cut off rather than proxied.
+        assert_eq!(
+            reply["rules"],
+            json!([{"id": "rule", "path": "/usr/bin/curl", "children": true, "direct": false, "proxy": null}])
+        );
+        let state = snapshot(&service).await;
+        assert!(state.divert_attached && state.divert_error.is_empty());
+        let runtime = &state.app_runtimes["rule"];
+        assert_eq!(runtime.state, "blocked");
+        assert_eq!((runtime.connections, runtime.total), (2, 9));
+        assert_eq!(runtime.logs, ["10:00:00 10.0.0.1:443 через туннель"]);
+
+        // A helper that stopped reporting no longer counts as intercepting.
+        service.owned.lock().await.divert.seen = Instant::now().checked_sub(DIVERT_TIMEOUT * 2);
+        let state = snapshot(&service).await;
+        assert!(!state.divert_attached);
+        assert_eq!(state.app_runtimes["rule"].connections, 0);
+        assert!(
+            service
+                .execute("divert_sync", json!({"unknown": 1}))
+                .await
+                .is_err()
+        );
     }
 }
