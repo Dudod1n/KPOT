@@ -2305,6 +2305,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "krot-relay"
+version = "0.0.0"
+dependencies = [
+ "krot-udp-proto",
+ "libc",
+]
+
+[[package]]
 name = "krot-udp-proto"
 version = "0.0.0"
 

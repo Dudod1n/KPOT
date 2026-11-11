@@ -10,7 +10,7 @@ repository = "https://github.com/Dudod1n/KPOT"
 readme = "README.md"
 
 [workspace]
-members = ["proto"]
+members = ["proto", "relay"]
 
 [dependencies]
 anyhow = "1"
@@ -55,3 +55,11 @@ winresource = "=0.1.34"
 [profile.release]
 lto = "thin"
 strip = true
+
+# The server relay is embedded into the client: size matters more than speed.
+[profile.relay]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
