@@ -11,4 +11,5 @@ pub mod proxy;
 pub mod relay;
 pub mod ssh;
 pub mod tray;
+pub mod udp;
 pub mod update;

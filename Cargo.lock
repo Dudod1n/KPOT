@@ -2281,6 +2281,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "krot-udp-proto",
  "rand 0.9.5",
  "raw-window-handle",
  "reqwest",
