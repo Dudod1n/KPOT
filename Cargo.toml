@@ -9,6 +9,9 @@ license = "GPL-3.0-only"
 repository = "https://github.com/Dudod1n/KPOT"
 readme = "README.md"
 
+[workspace]
+members = ["proto"]
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

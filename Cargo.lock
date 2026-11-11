@@ -2305,6 +2305,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "krot-udp-proto"
+version = "0.0.0"
+
+[[package]]
 name = "ksni"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
