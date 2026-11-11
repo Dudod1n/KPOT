@@ -110,6 +110,8 @@ pub struct DivertStats {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DivertReport {
+    /// The helper's own version: after an update the old helper must not stay attached.
+    pub version: String,
     pub stats: HashMap<String, DivertStats>,
     /// New journal lines as (rule, text).
     pub logs: Vec<(String, String)>,

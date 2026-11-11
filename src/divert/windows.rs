@@ -515,6 +515,7 @@ async fn serve(store: Store) -> Result<()> {
     };
     if let Err(error) = start() {
         let report = DivertReport {
+            version: env!("CARGO_PKG_VERSION").into(),
             error: error.to_string(),
             ..Default::default()
         };
@@ -523,7 +524,8 @@ async fn serve(store: Store) -> Result<()> {
     }
     let mut failures = 0;
     let mut pending: Vec<(String, String)> = Vec::new();
-    while failures < 5 {
+    // A stopped КРОТ is noticed within seconds, so an update never waits long for the helper.
+    while failures < 3 {
         pending.append(&mut shared.logs.lock().unwrap());
         let stats = shared
             .counters
@@ -543,14 +545,20 @@ async fn serve(store: Store) -> Result<()> {
             })
             .collect();
         let report = DivertReport {
+            version: env!("CARGO_PKG_VERSION").into(),
             stats,
             logs: pending.clone(),
             error: String::new(),
         };
-        let rules = client
-            .request("divert_sync", json!(report))
-            .await
-            .ok()
+        let reply = client.request("divert_sync", json!(report)).await.ok();
+        // Another version of КРОТ took over: its own helper has to be started instead.
+        if reply
+            .as_ref()
+            .is_some_and(|reply| reply.get("stop").and_then(|stop| stop.as_bool()) == Some(true))
+        {
+            break;
+        }
+        let rules = reply
             .and_then(|reply| reply.get("rules").cloned())
             .and_then(|rules| serde_json::from_value::<Vec<DivertRule>>(rules).ok());
         match rules {

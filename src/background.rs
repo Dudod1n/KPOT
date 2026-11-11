@@ -350,10 +350,13 @@ pub(crate) async fn stop_selected_and_wait(store: &Store, owner: Option<&Owner>)
         )?;
     }
     let ui = Store::new(store.sidecar(".ui"))?;
+    // The elevated helper runs the old executable until it notices the daemon is gone.
+    let divert = Store::new(store.sidecar(".divert"))?;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(_daemon) = try_lease(store)?
             && let Some(_window) = try_lease(&ui)?
+            && let Some(_helper) = try_lease(&divert)?
         {
             return Ok(());
         }
@@ -583,6 +586,9 @@ impl Service {
                     report.error.chars().count() <= 400 && report.logs.len() <= 1000,
                     "Отчёт перехвата превышает допустимый размер."
                 );
+                if report.version != env!("CARGO_PKG_VERSION") {
+                    return Ok(json!({"rules": [], "stop": true}));
+                }
                 let divert = &mut owned.divert;
                 if !report.error.is_empty() {
                     divert.error = report.error;
@@ -874,6 +880,20 @@ mod startup_tests {
         );
         drop(ui);
         waiting.await.unwrap().unwrap();
+
+        // The helper is waited for in the same way: an update must not start beside it.
+        let helper = Store::new(store.sidecar(".divert"))
+            .unwrap()
+            .lock()
+            .unwrap();
+        let waiting = tokio::spawn({
+            let store = store.clone();
+            async move { stop_and_wait(&store).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the helper still owns its lease");
+        drop(helper);
+        waiting.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1066,13 +1086,20 @@ mod startup_tests {
         async fn snapshot(service: &Service) -> Snapshot {
             serde_json::from_value(service.execute("snapshot", Value::Null).await.unwrap()).unwrap()
         }
-        let failed = json!({"error": "Драйвер не загрузился."});
+        let version = env!("CARGO_PKG_VERSION");
+        // A helper left over from another version is told to stop and never attaches.
+        let stale = json!({"version": "0.0.1", "stats": {}});
+        let reply = service.execute("divert_sync", stale).await.unwrap();
+        assert_eq!(reply, json!({"rules": [], "stop": true}));
+        assert!(!snapshot(&service).await.divert_attached);
+        let failed = json!({"version": version, "error": "Драйвер не загрузился."});
         service.execute("divert_sync", failed).await.unwrap();
         let state = snapshot(&service).await;
         assert!(!state.divert_attached);
         assert_eq!(state.divert_error, "Драйвер не загрузился.");
 
         let report = json!({
+            "version": version,
             "stats": {"rule": {"connections": 2, "total": 9, "sent": 10, "received": 20}},
             "logs": [["rule", "10:00:00 10.0.0.1:443 через туннель"], ["gone", "x"]],
         });
