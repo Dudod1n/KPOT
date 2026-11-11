@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tests'))
 
 import asyncssh
-from ssh_support import Client, Config, Endpoint, SSHFixtures, Store
+from ssh_support import Client, Config, Endpoint, Frames, SSHFixtures, Store, attach_udp
 
 BINARY = Path(os.environ.get('KROT_RUST_BIN', ROOT / 'target' / 'debug' / ('krot-cli.exe' if os.name == 'nt' else 'krot-cli'))).resolve()
 
@@ -191,6 +191,63 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime['uploads'], 1)
         await self.exchange(tunnel.port, socks=True)
         self.assertEqual((await self.request('snapshot'))['runtimes'][tunnel.id]['state'], 'running')
+
+    async def test_helper_datagram_travels_through_ssh_and_the_relay_and_back(self):
+        home = self.path / 'server-home'
+        home.mkdir()
+        server = await self.server(shell_home=home)
+        tunnel = self.tunnel(server, kind='D')
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        rule = {'id': 'rule1', 'name': 'app', 'path': '/usr/bin/krot-test-app', 'tunnel_id': tunnel.id,
+                'enabled': True, 'on_tunnel_down': 'block', 'children': True}
+        await self.request('apps_save', {'before': [], 'rules': [rule]})
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
+        await self.udp_state(tunnel, ('running',))
+
+        # The UDP echo server stands "behind" the SSH server.
+        loop = asyncio.get_running_loop()
+        seen = []
+
+        class Echo(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def datagram_received(self, data, address):
+                seen.append(address)
+                self.transport.sendto(b'echo:' + data, address)
+
+        echo, _ = await loop.create_datagram_endpoint(Echo, local_addr=('127.0.0.1', 0))
+        echo_port = echo.get_extra_info('sockname')[1]
+        try:
+            version = (await self.request('snapshot'))['version']
+            # As the helper does once a second: the reply says the rule's UDP is up.
+            reply = await self.request('divert_sync', {'version': version})
+            self.assertEqual([(r['id'], r['udp']) for r in reply['rules']], [('rule1', True)])
+
+            def exchange():
+                with attach_udp(self.store.path) as channel:
+                    channel.sendall(Frames.open(7, 'rule1') + Frames.send(7, '127.0.0.1', echo_port, b'ping'))
+                    kind, body = Frames.read(channel)
+                    return kind, body
+            kind, body = await asyncio.to_thread(exchange)
+            self.assertEqual(kind, Frames.RECV)
+            self.assertEqual(int.from_bytes(body[:4], 'big'), 7)
+            self.assertEqual(body[4:5], b'\x04')
+            self.assertEqual(int.from_bytes(body[9:11], 'big'), echo_port)
+            self.assertEqual(body[11:], b'echo:ping')
+            self.assertEqual(len(seen), 1)
+            snapshot = await self.request('snapshot')
+            counters = snapshot['udp_rules']['rule1']
+            self.assertEqual((counters['flows_total'], counters['sent']['datagrams'],
+                              counters['received']['datagrams']), (1, 1, 1))
+            metrics = snapshot['udp_metrics'][tunnel.id]
+            self.assertGreaterEqual(metrics['sent']['datagrams'], 1)
+            self.assertEqual(set(metrics['drops']), {'expired', 'overflow', 'size', 'channel', 'quic'})
+        finally:
+            echo.close()
+        await self.exchange(tunnel.port, socks=True)
 
     async def test_udp_relay_reports_a_server_without_commands(self):
         server = await self.server()

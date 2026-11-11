@@ -2,4 +2,7 @@
 pub mod consent;
 pub mod deliver;
 pub mod metrics;
+pub mod router;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod transport;

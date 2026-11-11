@@ -168,6 +168,63 @@ class Client:
         raise ValueError('Некорректный ответ фонового процесса.')
 
 
+def attach_udp(path: Path, version: int = 1) -> socket.socket:
+    """Open the helper's binary UDP channel like the elevated helper does."""
+    metadata = _metadata(endpoint_path(Path(path).expanduser().resolve()))
+    deadline = time.monotonic() + REQUEST_TIMEOUT
+    connection = socket.create_connection(('127.0.0.1', metadata['port']), timeout=AUTH_TIMEOUT)
+    try:
+        nonce = secrets.token_hex(32)
+        connection.sendall(json.dumps({'nonce': nonce}).encode('ascii') + b'\n')
+        proof = _json(_receive_line(connection, deadline, 4096))
+        expected = hmac.digest(metadata['token'].encode('ascii'), nonce.encode('ascii'), 'sha256').hex()
+        if not hmac.compare_digest(proof.get('proof', ''), expected):
+            raise ValueError('Не удалось подтвердить фоновый процесс КРОТ.')
+        connection.sendall(json.dumps({'token': metadata['token'], 'command': 'udp_attach',
+                                       'payload': {'version': version}}).encode('utf-8') + b'\n')
+        response = _json(_receive_line(connection, deadline, MAX_MESSAGE_BYTES))
+        if response != {'ok': True, 'value': {'version': version}}:
+            raise ValueError(f'UDP-канал не открыт: {response}')
+        connection.settimeout(5)
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+class Frames:
+    """The UDP channel's frames, as the elevated helper writes and reads them."""
+    OPEN, SEND, RECV, CLOSE = 0x40, 0x10, 0x11, 0x12
+
+    @staticmethod
+    def frame(kind: int, body: bytes) -> bytes:
+        return (len(body) + 1).to_bytes(4, 'big') + bytes([kind]) + body
+
+    @classmethod
+    def open(cls, flow: int, rule: str) -> bytes:
+        name = rule.encode('utf-8')
+        return cls.frame(cls.OPEN, flow.to_bytes(4, 'big') + bytes([len(name)]) + name)
+
+    @classmethod
+    def send(cls, flow: int, host: str, port: int, data: bytes) -> bytes:
+        address = bytes([4]) + socket.inet_aton(host) + port.to_bytes(2, 'big')
+        return cls.frame(cls.SEND, flow.to_bytes(4, 'big') + address + data)
+
+    @staticmethod
+    def read(connection: socket.socket) -> tuple[int, bytes]:
+        def exactly(count):
+            data = b''
+            while len(data) < count:
+                chunk = connection.recv(count - len(data))
+                if not chunk:
+                    raise ConnectionError('channel closed')
+                data += chunk
+            return data
+        length = int.from_bytes(exactly(4), 'big')
+        body = exactly(length)
+        return body[0], body[1:]
+
+
 def unused_port():
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
