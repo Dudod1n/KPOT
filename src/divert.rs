@@ -307,7 +307,7 @@ impl Matcher {
             decisions: HashMap::new(),
         }
     }
-    pub fn set_rules(&mut self, rules: &[DivertRule]) {
+    pub fn set_rules(&mut self, rules: &[DivertRule]) -> bool {
         let next: Vec<_> = rules
             .iter()
             .map(|rule| (rule.id.clone(), path_key(&rule.path), rule.children))
@@ -317,7 +317,9 @@ impl Matcher {
         if next != self.rules {
             self.rules = next;
             self.decisions.clear();
+            return true;
         }
+        false
     }
     pub fn decide(&mut self, pid: u32, now: Instant, processes: &dyn Processes) -> Option<String> {
         if self.rules.is_empty() {
@@ -408,42 +410,256 @@ fn tcp_table_owner(table: &[u8], v6: bool, local_port: u16, remote_port: u16) ->
 
 /// Windows reports the bound UDP address, which can be unspecified for a wildcard socket.
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct UdpSocket {
+    pid: u32,
+    created_at: u64,
+    address: IpAddr,
+    scope: [u8; 4],
+}
+
+#[cfg(any(windows, test))]
+impl UdpSocket {
+    fn matches(self, local: SocketAddr, allow_ipv6_wildcard: bool) -> bool {
+        let source = local.ip().to_canonical();
+        match self.address {
+            IpAddr::V4(ip) => source.is_ipv4() && (ip.is_unspecified() || self.address == source),
+            IpAddr::V6(ip) if ip.is_unspecified() => source.is_ipv6() || allow_ipv6_wildcard,
+            IpAddr::V6(ip) => {
+                self.address == source
+                    && (!ip.is_unicast_link_local()
+                        || matches!(local, SocketAddr::V6(addr) if udp_scope_matches(self.scope, addr.scope_id())))
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+const UDP_TABLE_HEADER: usize = 8;
+#[cfg(any(windows, test))]
+const UDP4_ROW_SIZE: usize = 160;
+#[cfg(any(windows, test))]
+const UDP6_ROW_SIZE: usize = 176;
+
+#[cfg(any(windows, test))]
 fn udp_table_owners(
     table: &[u8],
     local: SocketAddr,
     allow_ipv6_wildcard: bool,
-) -> impl Iterator<Item = u32> + '_ {
-    let (size, offset) = if local.is_ipv6() { (28, 20) } else { (12, 4) };
-    owner_rows(table, size)
-        .filter(move |row| {
-            table_port(row, offset) == local.port()
-                && match local {
-                    SocketAddr::V4(addr) => row[..4] == addr.ip().octets() || row[..4] == [0; 4],
-                    SocketAddr::V6(addr) => {
-                        let ip = addr.ip();
-                        (row[..16] == ip.octets()
-                            && (!ip.is_unicast_link_local()
-                                || udp_scope_matches(row, addr.scope_id())))
-                            || (allow_ipv6_wildcard && row[..16] == [0; 16])
-                            || (ip.to_ipv4_mapped().is_some()
-                                && row[..16] == Ipv4Addr::UNSPECIFIED.to_ipv6_mapped().octets())
-                    }
-                }
-        })
-        .map(table_pid)
-        .filter(|pid| *pid != 0)
+) -> impl Iterator<Item = UdpSocket> + '_ {
+    udp_sockets(table, local.is_ipv6()).filter_map(move |(port, socket)| {
+        (port == local.port() && socket.matches(local, allow_ipv6_wildcard)).then_some(socket)
+    })
 }
 
 #[cfg(any(windows, test))]
-fn udp_scope_matches(row: &[u8], interface: u32) -> bool {
-    let bytes: [u8; 4] = row[16..20].try_into().unwrap();
-    // The zone occupies the low 28 bits of SCOPE_ID. Accept both the documented network
-    // byte order and the native order used by IP Helper implementations such as Wine.
+fn udp_sockets(table: &[u8], v6: bool) -> impl Iterator<Item = (u16, UdpSocket)> + '_ {
+    let (size, port_offset, time_offset) = if v6 {
+        (UDP6_ROW_SIZE, 20, 32)
+    } else {
+        (UDP4_ROW_SIZE, 4, 16)
+    };
+    let count = table
+        .first_chunk::<4>()
+        .copied()
+        .map_or(0, u32::from_le_bytes);
+    table
+        .get(UDP_TABLE_HEADER..)
+        .unwrap_or_default()
+        .chunks_exact(size)
+        .take(count as usize)
+        .filter_map(move |row| {
+            let pid = u32::from_le_bytes(*row[port_offset + 4..].first_chunk::<4>().unwrap());
+            let created_at = u64::from_le_bytes(*row[time_offset..].first_chunk::<8>().unwrap());
+            let (address, scope) = if v6 {
+                let ip = Ipv6Addr::from(*row.first_chunk::<16>().unwrap());
+                (
+                    IpAddr::V6(ip).to_canonical(),
+                    row[16..20].try_into().unwrap(),
+                )
+            } else {
+                (
+                    Ipv4Addr::from(*row.first_chunk::<4>().unwrap()).into(),
+                    [0; 4],
+                )
+            };
+            let socket = UdpSocket {
+                pid,
+                created_at,
+                address,
+                scope,
+            };
+            (pid != 0).then(|| (table_port(row, port_offset), socket))
+        })
+}
+
+#[cfg(any(windows, test))]
+fn udp_scope_matches(bytes: [u8; 4], interface: u32) -> bool {
+    // Accept both network and native byte order for the low 28 bits of SCOPE_ID.
     const ZONE_MASK: u32 = 0x0fff_ffff;
     interface == 0
         || bytes == [0; 4]
         || u32::from_be_bytes(bytes) & ZONE_MASK == interface
         || u32::from_ne_bytes(bytes) & ZONE_MASK == interface
+}
+
+/// FILETIME interval bracketing the capture, accounting for scheduling between clock reads.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+struct CaptureTime {
+    earliest: u64,
+    latest: u64,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct UdpDecision {
+    owners: Vec<(UdpSocket, Option<String>)>,
+    complete: bool,
+}
+
+#[cfg(any(windows, test))]
+impl UdpDecision {
+    fn add(
+        &mut self,
+        owners: impl Iterator<Item = UdpSocket>,
+        captured: CaptureTime,
+        blocking_rule: &mut impl FnMut(u32) -> Option<String>,
+    ) {
+        self.owners.extend(owners.map(|owner| {
+            let rule = if owner.created_at <= captured.latest {
+                blocking_rule(owner.pid)
+            } else {
+                None
+            };
+            (owner, rule)
+        }));
+    }
+}
+
+/// Retain individually observed blocked bindings for datagrams already in the driver queue.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct UdpHistory {
+    ports: HashMap<u16, Vec<UdpBinding>>,
+}
+
+#[cfg(any(windows, test))]
+struct UdpBinding {
+    socket: UdpSocket,
+    observed_at: u64,
+    ended_by: Option<u64>,
+    rule: String,
+    seen_on_ipv4: bool,
+}
+
+#[cfg(any(windows, test))]
+impl UdpHistory {
+    // FILETIME counts 100-nanosecond intervals. WinDivert's default queue time is 2 seconds.
+    const QUEUE_AGE: u64 = 20_000_000;
+
+    #[cfg(windows)]
+    fn allow_bypassing(&mut self, bypassing: &std::collections::HashSet<String>) {
+        self.ports.retain(|_, bindings| {
+            bindings.retain(|binding| !bypassing.contains(&binding.rule));
+            !bindings.is_empty()
+        });
+    }
+    fn prune(
+        &mut self,
+        now: u64,
+        observed: u64,
+        live: &std::collections::HashSet<(u16, UdpSocket)>,
+    ) {
+        self.ports.retain(|port, bindings| {
+            for binding in bindings.iter_mut() {
+                if !live.contains(&(*port, binding.socket)) {
+                    binding.ended_by.get_or_insert(observed);
+                }
+            }
+            bindings.retain(|binding| {
+                binding
+                    .ended_by
+                    .is_none_or(|end| now.saturating_sub(end) <= Self::QUEUE_AGE)
+            });
+            !bindings.is_empty()
+        });
+    }
+
+    fn decide(
+        &mut self,
+        local: SocketAddr,
+        captured: CaptureTime,
+        observed: u64,
+        current: UdpDecision,
+    ) -> Option<String> {
+        let mut rule = current.owners.iter().find_map(|(_, rule)| rule.clone());
+        if let Some(bindings) = self.ports.get_mut(&local.port()) {
+            for binding in bindings
+                .iter_mut()
+                .filter(|binding| binding.socket.matches(local, binding.seen_on_ipv4))
+            {
+                if current
+                    .owners
+                    .iter()
+                    .any(|(socket, _)| *socket == binding.socket)
+                {
+                    binding.observed_at = observed;
+                    continue;
+                }
+                if current.complete {
+                    // A newer observed bind can delimit reuse. A socket already present in the
+                    // previous snapshot can overlap this binding, for example via a wildcard.
+                    let end = current
+                        .owners
+                        .iter()
+                        .filter(|(socket, _)| {
+                            socket.address == binding.socket.address
+                                && socket.scope == binding.socket.scope
+                        })
+                        .map(|(socket, _)| socket.created_at)
+                        .filter(|time| *time > binding.observed_at)
+                        .min()
+                        .map_or(observed, |time| time.saturating_sub(1));
+                    binding.ended_by = Some(binding.ended_by.map_or(end, |old| old.min(end)));
+                }
+                if rule.is_none()
+                    && binding.socket.created_at <= captured.latest
+                    && binding.ended_by.is_none_or(|end| captured.earliest <= end)
+                {
+                    rule = Some(binding.rule.clone());
+                }
+            }
+        }
+        for (socket, blocked_by) in current.owners {
+            if let Some(blocked_by) = blocked_by {
+                self.remember(local, socket, blocked_by, observed);
+            }
+        }
+        rule
+    }
+
+    fn remember(&mut self, local: SocketAddr, socket: UdpSocket, rule: String, observed_at: u64) {
+        let port = local.port();
+        if let Some(binding) = self
+            .ports
+            .get_mut(&port)
+            .and_then(|bindings| bindings.iter_mut().find(|binding| binding.socket == socket))
+        {
+            binding.observed_at = observed_at;
+            binding.ended_by = None;
+            binding.rule = rule;
+            binding.seen_on_ipv4 |= local.is_ipv4();
+            return;
+        }
+        self.ports.entry(port).or_default().push(UdpBinding {
+            socket,
+            observed_at,
+            ended_by: None,
+            rule,
+            seen_on_ipv4: local.is_ipv4(),
+        });
+    }
 }
 
 /// Starts the helper with administrator rights; the system asks the user for consent.
@@ -697,7 +913,7 @@ mod tests {
                 "[fe80::8]:3478",
             ),
         ] {
-            let row = |endpoint: &str, pid| udp_row(endpoint.parse().unwrap(), pid);
+            let row = |endpoint: &str, pid| udp_row(endpoint.parse().unwrap(), pid, 1);
             let bypass = |rule: &str| rule == "direct";
             let mut check = |source: &str, table: &[u8], pids: &[u32], expected| {
                 let mut packet = tcp(source, destination, 0);
@@ -716,7 +932,9 @@ mod tests {
                             {
                                 addr.set_scope_id(bound.scope_id());
                             }
-                            let owners: Vec<_> = udp_table_owners(table, local, true).collect();
+                            let owners: Vec<_> = udp_table_owners(table, local, true)
+                                .map(|owner| owner.pid)
+                                .collect();
                             assert_eq!(owners, pids, "{source}");
                             owners.into_iter().find_map(|pid| {
                                 matcher.decide(pid, now, &tree).filter(|rule| !bypass(rule))
@@ -728,17 +946,17 @@ mod tests {
                     "{source}",
                 );
             };
-            let separate = owner_table(&[row(direct, 10), row(blocked, 20)]);
+            let separate = udp_table(&[row(direct, 10), row(blocked, 20)]);
             check(direct, &separate, &[10], Verdict::Pass);
             check(blocked, &separate, &[20], Verdict::Drop);
             check(other, &separate, &[], Verdict::Pass);
 
             // The same endpoint changes PID within the lifetime of the process cache.
-            let reused = owner_table(&[row(direct, 20)]);
+            let reused = udp_table(&[row(direct, 20)]);
             check(direct, &reused, &[20], Verdict::Drop);
 
             // Both the exact and wildcard sockets could send from this address.
-            let overlapping = owner_table(&[row(direct, 10), row(wildcard, 20)]);
+            let overlapping = udp_table(&[row(direct, 10), row(wildcard, 20)]);
             check(direct, &overlapping, &[10, 20], Verdict::Drop);
             check(other, &overlapping, &[20], Verdict::Drop);
         }
@@ -857,7 +1075,14 @@ mod tests {
         table
     }
 
-    fn udp_row(endpoint: SocketAddr, pid: u32) -> Vec<u8> {
+    fn udp_table(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut table = (rows.len() as u32).to_le_bytes().to_vec();
+        table.resize(UDP_TABLE_HEADER, 0);
+        table.extend(rows.iter().flatten());
+        table
+    }
+
+    fn udp_row(endpoint: SocketAddr, pid: u32, created_at: u64) -> Vec<u8> {
         let mut row = match endpoint {
             SocketAddr::V4(addr) => addr.ip().octets().to_vec(),
             SocketAddr::V6(addr) => {
@@ -869,6 +1094,14 @@ mod tests {
         row.extend(endpoint.port().to_be_bytes());
         row.extend([0; 2]);
         row.extend(pid.to_le_bytes());
+        let (size, time_offset) = if endpoint.is_ipv6() {
+            (UDP6_ROW_SIZE, 32)
+        } else {
+            (UDP4_ROW_SIZE, 16)
+        };
+        row.resize(time_offset, 0);
+        row.extend(created_at.to_le_bytes());
+        row.resize(size, 0);
         row
     }
 
@@ -904,37 +1137,187 @@ mod tests {
 
     #[test]
     fn ipv4_mapped_udp_lookup_matches_compatible_bindings() {
-        let row = |addr: &str, pid| udp_row(addr.parse().unwrap(), pid);
+        let row = |addr: &str, pid| udp_row(addr.parse().unwrap(), pid, 1);
         let mapped = "[::ffff:192.0.2.1]:50000".parse().unwrap();
-        let table = owner_table(&[
+        let table = udp_table(&[
             row("[::]:50000", 10),
             row("[fd00::1]:50000", 20),
             row("[::ffff:192.0.2.2]:50000", 30),
             row("[::ffff:192.0.2.1]:50001", 40),
-            udp_row(mapped, 0),
-            udp_row(mapped, 50),
+            udp_row(mapped, 0, 1),
+            udp_row(mapped, 50, 1),
             row("[::ffff:0.0.0.0]:50000", 60),
         ]);
         assert_eq!(
-            udp_table_owners(&table, mapped, false).collect::<Vec<_>>(),
+            udp_table_owners(&table, mapped, false)
+                .map(|owner| owner.pid)
+                .collect::<Vec<_>>(),
             [50, 60],
         );
-        let fallback = owner_table(&[row("[::]:50000", 10)]);
+        let fallback = udp_table(&[row("[::]:50000", 10)]);
         assert_eq!(
-            udp_table_owners(&fallback, mapped, true).collect::<Vec<_>>(),
+            udp_table_owners(&fallback, mapped, true)
+                .map(|owner| owner.pid)
+                .collect::<Vec<_>>(),
             [10],
         );
         assert!(udp_table_owners(&fallback, mapped, false).next().is_none());
     }
 
     #[test]
+    fn queued_udp_keeps_the_old_rule_across_close_and_rebind() {
+        for (source, remote, protocol_offset) in [
+            ("192.168.1.5:50003", "8.8.8.8:443", 9),
+            ("[fd00::5]:50003", "[2001:db8::8]:443", 6),
+        ] {
+            let local = source.parse().unwrap();
+            let mut history = UdpHistory::default();
+            let (mut nat, now) = (Nat::default(), Instant::now());
+            let blocked = udp_table(&[udp_row(local, 10, 1)]);
+            let replacement = udp_table(&[udp_row(local, 20, 30)]);
+            let empty = udp_table(&[]);
+            let mut check = |table: &[u8], captured, observed| {
+                let captured = at(captured);
+                let mut packet = tcp(source, remote, 0);
+                packet[protocol_offset] = UDP;
+                handle(
+                    &mut packet,
+                    RELAY,
+                    &mut nat,
+                    now,
+                    &mut |_, origin| {
+                        let mut decision = UdpDecision {
+                            complete: true,
+                            ..UdpDecision::default()
+                        };
+                        decision.add(
+                            udp_table_owners(table, origin.local, true),
+                            captured,
+                            &mut |pid| (pid == 10).then(|| "blocked".to_owned()),
+                        );
+                        history.decide(origin.local, captured, observed, decision)
+                    },
+                    &tunneled,
+                )
+            };
+            assert_eq!(check(&blocked, 10, 11), Verdict::Drop);
+            assert_eq!(check(&empty, 20, 25), Verdict::Drop);
+            assert_eq!(check(&replacement, 22, 32), Verdict::Drop);
+            assert_eq!(check(&replacement, 31, 33), Verdict::Pass);
+            // The queue can deliver older packets after seeing the replacement.
+            assert_eq!(check(&replacement, 23, 34), Verdict::Drop);
+            assert_eq!(check(&empty, 35, 36), Verdict::Pass);
+            assert_eq!(check(&empty, 39, 40), Verdict::Pass);
+            history.prune(40 + UdpHistory::QUEUE_AGE + 1, 41, &Default::default());
+            assert!(history.ports.is_empty());
+        }
+    }
+
+    fn at(time: u64) -> CaptureTime {
+        CaptureTime {
+            earliest: time,
+            latest: time,
+        }
+    }
+
+    #[test]
+    fn known_udp_wildcard_keeps_its_block_across_sources_and_overlapping_binds() {
+        let first: SocketAddr = "192.0.2.1:50003".parse().unwrap();
+        let second: SocketAddr = "192.0.2.2:50003".parse().unwrap();
+        let wildcard = udp_row("0.0.0.0:50003".parse().unwrap(), 10, 1);
+        let direct = udp_row(second, 20, 12);
+        let both = udp_table(&[wildcard, direct.clone()]);
+        let after_close = udp_table(&[direct]);
+        let mut history = UdpHistory::default();
+        let mut decide = |local, table, captured, observed| {
+            let mut decision = UdpDecision {
+                complete: true,
+                ..UdpDecision::default()
+            };
+            decision.add(
+                udp_table_owners(table, local, true),
+                at(captured),
+                &mut |pid| (pid == 10).then(|| "blocked".into()),
+            );
+            history.decide(local, at(captured), observed, decision)
+        };
+        assert!(decide(first, &both, 10, 11).is_some());
+        assert!(decide(second, &after_close, 13, 14).is_some());
+        assert!(decide(second, &after_close, 15, 16).is_none());
+    }
+
+    #[test]
+    fn bind_in_capture_clock_interval_can_still_block() {
+        let local: SocketAddr = "192.0.2.1:50003".parse().unwrap();
+        let table = udp_table(&[udp_row(local, 10, 50)]);
+        let captured = CaptureTime {
+            earliest: 40,
+            latest: 60,
+        };
+        let mut decision = UdpDecision::default();
+        decision.add(udp_table_owners(&table, local, true), captured, &mut |_| {
+            Some("blocked".into())
+        });
+        assert!(
+            UdpHistory::default()
+                .decide(local, captured, 70, decision)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_udp_snapshot_does_not_expire_a_known_block() {
+        let local = "192.0.2.1:50003".parse().unwrap();
+        let mut history = UdpHistory::default();
+        let blocked = UdpDecision {
+            owners: vec![(
+                UdpSocket {
+                    pid: 10,
+                    created_at: 1,
+                    address: "192.0.2.1".parse().unwrap(),
+                    scope: [0; 4],
+                },
+                Some("blocked".into()),
+            )],
+            complete: true,
+        };
+        assert!(history.decide(local, at(10), 11, blocked).is_some());
+        assert!(
+            history
+                .decide(local, at(20), 21, UdpDecision::default())
+                .is_some()
+        );
+        assert!(
+            history
+                .decide(local, at(30), 31, UdpDecision::default())
+                .is_some()
+        );
+        assert!(
+            history
+                .decide(
+                    local,
+                    at(32),
+                    33,
+                    UdpDecision {
+                        complete: true,
+                        ..UdpDecision::default()
+                    }
+                )
+                .is_some()
+        );
+        assert!(
+            history
+                .decide(local, at(34), 35, UdpDecision::default())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn udp_scope_matches_the_zone_in_both_byte_orders() {
-        let mut row = [0; 28];
         let link_scope = 0x2000_0008u32;
         for bytes in [link_scope.to_be_bytes(), link_scope.to_ne_bytes()] {
-            row[16..20].copy_from_slice(&bytes);
-            assert!(udp_scope_matches(&row, 8));
-            assert!(!udp_scope_matches(&row, 3));
+            assert!(udp_scope_matches(bytes, 8));
+            assert!(!udp_scope_matches(bytes, 3));
         }
     }
 }
