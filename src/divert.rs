@@ -3,7 +3,7 @@
 //! everywhere; capturing and injecting packets is Windows-only (WinDivert).
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -211,8 +211,7 @@ pub fn handle(
         return Verdict::Pass;
     };
     let view = Origin {
-        v6: packet.source.is_ipv6(),
-        local_port: packet.source_port,
+        local: SocketAddr::new(packet.source, packet.source_port),
         remote: packet.destination,
         remote_port: packet.destination_port,
     };
@@ -283,8 +282,7 @@ pub fn handle(
 /// What the owner lookup needs to know about a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Origin {
-    pub v6: bool,
-    pub local_port: u16,
+    pub local: SocketAddr,
     pub remote: IpAddr,
     pub remote_port: u16,
 }
@@ -371,38 +369,81 @@ impl Matcher {
     }
 }
 
-/// Finds the owner of a local port in a Windows `GetExtended*Table` buffer of the
-/// `OWNER_PID` classes: a `u32` row count followed by fixed-size rows.
+// Windows OWNER_PID tables contain a row count followed by fixed-size rows.
+#[cfg(any(windows, test))]
+fn owner_rows(table: &[u8], row_size: usize) -> impl Iterator<Item = &[u8]> {
+    let (count, rows) = table.split_first_chunk::<4>().unwrap_or((&[0; 4], &[]));
+    rows.chunks_exact(row_size)
+        .take(u32::from_le_bytes(*count) as usize)
+}
+
+#[cfg(any(windows, test))]
+fn table_port(row: &[u8], offset: usize) -> u16 {
+    // The network-order port occupies the first two bytes of the 32-bit field.
+    u16::from_be_bytes([row[offset], row[offset + 1]])
+}
+
+#[cfg(any(windows, test))]
+fn table_pid(row: &[u8]) -> u32 {
+    u32::from_le_bytes(*row.last_chunk::<4>().unwrap())
+}
+
 /// A TCP row that also matches the remote port wins over one that shares only the local port.
-pub fn table_owner(
-    table: &[u8],
-    tcp: bool,
-    v6: bool,
-    local_port: u16,
-    remote_port: u16,
-) -> Option<u32> {
-    // (row size, local port, remote port, pid) offsets as laid out by iphlpapi.
-    let (row, local, remote, pid) = match (tcp, v6) {
-        (true, false) => (24, 8, 16, 20),
-        (true, true) => (56, 20, 44, 52),
-        (false, false) => (12, 4, 0, 8),
-        (false, true) => (28, 20, 0, 24),
-    };
-    let count = u32::from_le_bytes(table.get(..4)?.try_into().ok()?) as usize;
-    // Ports are stored in network byte order in the low half of a 32-bit field.
-    let port = |row: &[u8], at: usize| u16::from_be_bytes([row[at], row[at + 1]]);
+#[cfg(any(windows, test))]
+fn tcp_table_owner(table: &[u8], v6: bool, local_port: u16, remote_port: u16) -> Option<u32> {
+    let (size, local, remote) = if v6 { (56, 20, 44) } else { (24, 8, 16) };
     let mut fallback = None;
-    for row in table[4..].chunks_exact(row).take(count) {
-        if port(row, local) != local_port {
+    for row in owner_rows(table, size) {
+        if table_port(row, local) != local_port {
             continue;
         }
-        let owner = u32::from_le_bytes([row[pid], row[pid + 1], row[pid + 2], row[pid + 3]]);
-        if !tcp || port(row, remote) == remote_port {
+        let owner = table_pid(row);
+        if table_port(row, remote) == remote_port {
             return Some(owner);
         }
         fallback.get_or_insert(owner);
     }
     fallback
+}
+
+/// Windows reports the bound UDP address, which can be unspecified for a wildcard socket.
+#[cfg(any(windows, test))]
+fn udp_table_owners(
+    table: &[u8],
+    local: SocketAddr,
+    allow_ipv6_wildcard: bool,
+) -> impl Iterator<Item = u32> + '_ {
+    let (size, offset) = if local.is_ipv6() { (28, 20) } else { (12, 4) };
+    owner_rows(table, size)
+        .filter(move |row| {
+            table_port(row, offset) == local.port()
+                && match local {
+                    SocketAddr::V4(addr) => row[..4] == addr.ip().octets() || row[..4] == [0; 4],
+                    SocketAddr::V6(addr) => {
+                        let ip = addr.ip();
+                        (row[..16] == ip.octets()
+                            && (!ip.is_unicast_link_local()
+                                || udp_scope_matches(row, addr.scope_id())))
+                            || (allow_ipv6_wildcard && row[..16] == [0; 16])
+                            || (ip.to_ipv4_mapped().is_some()
+                                && row[..16] == Ipv4Addr::UNSPECIFIED.to_ipv6_mapped().octets())
+                    }
+                }
+        })
+        .map(table_pid)
+        .filter(|pid| *pid != 0)
+}
+
+#[cfg(any(windows, test))]
+fn udp_scope_matches(row: &[u8], interface: u32) -> bool {
+    let bytes: [u8; 4] = row[16..20].try_into().unwrap();
+    // The zone occupies the low 28 bits of SCOPE_ID. Accept both the documented network
+    // byte order and the native order used by IP Helper implementations such as Wine.
+    const ZONE_MASK: u32 = 0x0fff_ffff;
+    interface == 0
+        || bytes == [0; 4]
+        || u32::from_be_bytes(bytes) & ZONE_MASK == interface
+        || u32::from_ne_bytes(bytes) & ZONE_MASK == interface
 }
 
 /// Starts the helper with administrator rights; the system asks the user for consent.
@@ -621,6 +662,89 @@ mod tests {
     }
 
     #[test]
+    fn udp_rules_follow_local_bindings_and_port_reuse() {
+        let tree = Tree(HashMap::from([
+            (10, (r"C:\Apps\direct.exe", 1)),
+            (20, (r"C:\Apps\blocked.exe", 1)),
+        ]));
+        let mut matcher = Matcher::new(r"C:\KROT\krot.exe");
+        matcher.set_rules(&[
+            rule("direct", r"C:\Apps\direct.exe", false),
+            rule("blocked", r"C:\Apps\blocked.exe", false),
+        ]);
+
+        let (mut nat, now) = (Nat::default(), Instant::now());
+        for (direct, blocked, other, wildcard, destination) in [
+            (
+                "192.168.1.5:50003",
+                "192.168.1.6:50003",
+                "192.168.1.7:50003",
+                "0.0.0.0:50003",
+                "8.8.8.8:443",
+            ),
+            (
+                "[fd00::5]:50003",
+                "[fd00::6]:50003",
+                "[fd00::7]:50003",
+                "[::]:50003",
+                "[2001:db8::8]:3478",
+            ),
+            (
+                "[fe80::5%3]:50003",
+                "[fe80::5%8]:50003",
+                "[fe80::5%4]:50003",
+                "[::]:50003",
+                "[fe80::8]:3478",
+            ),
+        ] {
+            let row = |endpoint: &str, pid| udp_row(endpoint.parse().unwrap(), pid);
+            let bypass = |rule: &str| rule == "direct";
+            let mut check = |source: &str, table: &[u8], pids: &[u32], expected| {
+                let mut packet = tcp(source, destination, 0);
+                packet[if source.starts_with('[') { 6 } else { 9 }] = UDP;
+                assert_eq!(
+                    handle(
+                        &mut packet,
+                        RELAY,
+                        &mut nat,
+                        now,
+                        &mut |protocol, origin| {
+                            assert_eq!(protocol, UDP);
+                            let mut local = origin.local;
+                            if let (SocketAddr::V6(addr), SocketAddr::V6(bound)) =
+                                (&mut local, source.parse::<SocketAddr>().unwrap())
+                            {
+                                addr.set_scope_id(bound.scope_id());
+                            }
+                            let owners: Vec<_> = udp_table_owners(table, local, true).collect();
+                            assert_eq!(owners, pids, "{source}");
+                            owners.into_iter().find_map(|pid| {
+                                matcher.decide(pid, now, &tree).filter(|rule| !bypass(rule))
+                            })
+                        },
+                        &bypass,
+                    ),
+                    expected,
+                    "{source}",
+                );
+            };
+            let separate = owner_table(&[row(direct, 10), row(blocked, 20)]);
+            check(direct, &separate, &[10], Verdict::Pass);
+            check(blocked, &separate, &[20], Verdict::Drop);
+            check(other, &separate, &[], Verdict::Pass);
+
+            // The same endpoint changes PID within the lifetime of the process cache.
+            let reused = owner_table(&[row(direct, 20)]);
+            check(direct, &reused, &[20], Verdict::Drop);
+
+            // Both the exact and wildcard sockets could send from this address.
+            let overlapping = owner_table(&[row(direct, 10), row(wildcard, 20)]);
+            check(direct, &overlapping, &[10, 20], Verdict::Drop);
+            check(other, &overlapping, &[20], Verdict::Drop);
+        }
+    }
+
+    #[test]
     fn finished_and_idle_connections_leave_the_table() {
         let (mut nat, start) = (Nat::default(), Instant::now());
         let open = |nat: &mut Nat, port: u16| {
@@ -727,8 +851,29 @@ mod tests {
         assert_eq!(missing_components(directory.path()).len(), 2);
     }
 
+    fn owner_table(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut table = (rows.len() as u32).to_le_bytes().to_vec();
+        table.extend(rows.iter().flatten());
+        table
+    }
+
+    fn udp_row(endpoint: SocketAddr, pid: u32) -> Vec<u8> {
+        let mut row = match endpoint {
+            SocketAddr::V4(addr) => addr.ip().octets().to_vec(),
+            SocketAddr::V6(addr) => {
+                let mut row = addr.ip().octets().to_vec();
+                row.extend(addr.scope_id().to_be_bytes());
+                row
+            }
+        };
+        row.extend(endpoint.port().to_be_bytes());
+        row.extend([0; 2]);
+        row.extend(pid.to_le_bytes());
+        row
+    }
+
     #[test]
-    fn port_owner_is_read_from_all_four_system_table_layouts() {
+    fn tcp_owner_is_read_from_both_system_table_layouts() {
         fn row(size: usize, fields: &[(usize, u32)], ports: &[(usize, u16)]) -> Vec<u8> {
             let mut row = vec![0u8; size];
             for (at, value) in fields {
@@ -739,30 +884,57 @@ mod tests {
             }
             row
         }
-        fn table(rows: &[Vec<u8>]) -> Vec<u8> {
-            let mut table = (rows.len() as u32).to_le_bytes().to_vec();
-            rows.iter().for_each(|row| table.extend(row));
-            table
-        }
-        let tcp4 = table(&[
+        let tcp4 = owner_table(&[
             row(24, &[(20, 100)], &[(8, 50000), (16, 80)]),
             row(24, &[(20, 200)], &[(8, 50000), (16, 443)]),
             row(24, &[(20, 300)], &[(8, 50001), (16, 443)]),
         ]);
-        assert_eq!(table_owner(&tcp4, true, false, 50000, 443), Some(200));
-        assert_eq!(table_owner(&tcp4, true, false, 50000, 22), Some(100));
-        assert_eq!(table_owner(&tcp4, true, false, 50002, 443), None);
-        let tcp6 = table(&[row(56, &[(52, 400)], &[(20, 50000), (44, 443)])]);
-        assert_eq!(table_owner(&tcp6, true, true, 50000, 443), Some(400));
-        let udp4 = table(&[row(12, &[(8, 500)], &[(4, 50000)])]);
-        assert_eq!(table_owner(&udp4, false, false, 50000, 9), Some(500));
-        let udp6 = table(&[row(28, &[(24, 600)], &[(20, 50000)])]);
-        assert_eq!(table_owner(&udp6, false, true, 50000, 9), Some(600));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50000, 443), Some(200));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50000, 22), Some(100));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50002, 443), None);
+        let tcp6 = owner_table(&[row(56, &[(52, 400)], &[(20, 50000), (44, 443)])]);
+        assert_eq!(tcp_table_owner(&tcp6, true, 50000, 443), Some(400));
         // A count larger than the buffer and a truncated buffer are both harmless.
         let mut short = tcp4.clone();
         short[0] = 200;
         short.truncate(4 + 24 + 10);
-        assert_eq!(table_owner(&short, true, false, 50000, 80), Some(100));
-        assert_eq!(table_owner(&[1, 0], true, false, 1, 1), None);
+        assert_eq!(tcp_table_owner(&short, false, 50000, 80), Some(100));
+        assert_eq!(tcp_table_owner(&[1, 0], false, 1, 1), None);
+    }
+
+    #[test]
+    fn ipv4_mapped_udp_lookup_matches_compatible_bindings() {
+        let row = |addr: &str, pid| udp_row(addr.parse().unwrap(), pid);
+        let mapped = "[::ffff:192.0.2.1]:50000".parse().unwrap();
+        let table = owner_table(&[
+            row("[::]:50000", 10),
+            row("[fd00::1]:50000", 20),
+            row("[::ffff:192.0.2.2]:50000", 30),
+            row("[::ffff:192.0.2.1]:50001", 40),
+            udp_row(mapped, 0),
+            udp_row(mapped, 50),
+            row("[::ffff:0.0.0.0]:50000", 60),
+        ]);
+        assert_eq!(
+            udp_table_owners(&table, mapped, false).collect::<Vec<_>>(),
+            [50, 60],
+        );
+        let fallback = owner_table(&[row("[::]:50000", 10)]);
+        assert_eq!(
+            udp_table_owners(&fallback, mapped, true).collect::<Vec<_>>(),
+            [10],
+        );
+        assert!(udp_table_owners(&fallback, mapped, false).next().is_none());
+    }
+
+    #[test]
+    fn udp_scope_matches_the_zone_in_both_byte_orders() {
+        let mut row = [0; 28];
+        let link_scope = 0x2000_0008u32;
+        for bytes in [link_scope.to_be_bytes(), link_scope.to_ne_bytes()] {
+            row[16..20].copy_from_slice(&bytes);
+            assert!(udp_scope_matches(&row, 8));
+            assert!(!udp_scope_matches(&row, 3));
+        }
     }
 }

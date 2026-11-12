@@ -17,7 +17,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    },
     NetworkManagement::IpHelper::{GetExtendedTcpTable, GetExtendedUdpTable},
     System::{
         Diagnostics::ToolHelp::{
@@ -39,7 +41,8 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle, table_owner,
+    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle, tcp_table_owner,
+    udp_table_owners,
 };
 use crate::{
     apps::{DivertReport, DivertRule, DivertStats},
@@ -56,7 +59,7 @@ const AF_INET6: u32 = 23;
 const TCP_TABLE_OWNER_PID_ALL: i32 = 5;
 const UDP_TABLE_OWNER_PID: i32 = 1;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const PORT_TTL: Duration = Duration::from_secs(2);
+const PARENT_TTL: Duration = Duration::from_secs(2);
 const SYNC_TIME: Duration = Duration::from_secs(1);
 const MAX_PENDING_LOGS: usize = 500;
 
@@ -67,6 +70,13 @@ struct Address {
     flags: u32,
     reserved: u32,
     data: [u8; 64],
+}
+
+impl Address {
+    fn interface_index(&self) -> u32 {
+        // The NETWORK layer starts its address data with WINDIVERT_DATA_NETWORK.IfIdx.
+        u32::from_ne_bytes(*self.data.first_chunk::<4>().unwrap())
+    }
 }
 
 type Symbol = unsafe extern "system" fn() -> isize;
@@ -212,7 +222,7 @@ impl Processes for System {
         let mut cached = self.parents.borrow_mut();
         if cached
             .as_ref()
-            .is_none_or(|(_, at)| at.elapsed() > PORT_TTL)
+            .is_none_or(|(_, at)| at.elapsed() > PARENT_TTL)
         {
             *cached = Some((parents(), Instant::now()));
         }
@@ -220,55 +230,79 @@ impl Processes for System {
     }
 }
 
-fn port_owner(tcp: bool, origin: &Origin) -> Option<u32> {
-    let read = |family: u32| {
-        let mut size = 0u32;
-        let mut table: Vec<u8> = Vec::new();
-        for _ in 0..4 {
-            // SAFETY: the buffer is at least `size` bytes; the call reports the size it needs.
-            let status = unsafe {
-                if tcp {
-                    GetExtendedTcpTable(
-                        table.as_mut_ptr().cast(),
-                        &mut size,
-                        0,
-                        family,
-                        TCP_TABLE_OWNER_PID_ALL,
-                        0,
-                    )
-                } else {
-                    GetExtendedUdpTable(
-                        table.as_mut_ptr().cast(),
-                        &mut size,
-                        0,
-                        family,
-                        UDP_TABLE_OWNER_PID,
-                        0,
-                    )
-                }
-            };
-            if status == 0 {
-                return table;
+fn read_port_table(tcp: bool, v6: bool, table: &mut Vec<u8>) -> Option<&[u8]> {
+    let family = if v6 { AF_INET6 } else { AF_INET };
+    for _ in 0..4 {
+        let mut size = table.len() as u32;
+        // SAFETY: the buffer is at least `size` bytes; the call reports the size it needs.
+        let status = unsafe {
+            if tcp {
+                GetExtendedTcpTable(
+                    table.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    family,
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                )
+            } else {
+                GetExtendedUdpTable(
+                    table.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    family,
+                    UDP_TABLE_OWNER_PID,
+                    0,
+                )
             }
-            table = vec![0u8; size as usize + 4096];
-            size = table.len() as u32;
+        };
+        match status {
+            0 => return table.get(..size as usize),
+            ERROR_INSUFFICIENT_BUFFER => table.resize(size.saturating_add(4096) as usize, 0),
+            _ => return None,
         }
-        Vec::new()
-    };
-    let families = if origin.v6 {
-        [(AF_INET6, true), (AF_INET, false)]
-    } else {
-        [(AF_INET, false), (AF_INET6, true)]
-    };
-    families.into_iter().find_map(|(family, v6)| {
-        table_owner(
-            &read(family),
-            tcp,
-            v6,
-            origin.local_port,
-            origin.remote_port,
-        )
+    }
+    None
+}
+
+fn tcp_port_owner(origin: &Origin, buffer: &mut Vec<u8>) -> Option<u32> {
+    let v6 = origin.local.is_ipv6();
+    [v6, !v6].into_iter().find_map(|v6| {
+        let table = read_port_table(true, v6, buffer)?;
+        tcp_table_owner(table, v6, origin.local.port(), origin.remote_port)
     })
+}
+
+fn udp_port_rule(
+    local: SocketAddr,
+    interface: u32,
+    buffer: &mut Vec<u8>,
+    mut blocking_rule: impl FnMut(u32) -> Option<String>,
+) -> Option<String> {
+    let local_v4 = match local {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(mut addr) => {
+            addr.set_scope_id(interface);
+            let table = read_port_table(false, true, buffer)?;
+            return udp_table_owners(table, addr.into(), true).find_map(blocking_rule);
+        }
+    };
+    let mut has_v4_owner = false;
+    if let Some(table) = read_port_table(false, false, buffer) {
+        let mut owners = udp_table_owners(table, local, true).peekable();
+        has_v4_owner = owners.peek().is_some();
+        if let Some(rule) = owners.find_map(&mut blocking_rule) {
+            return Some(rule);
+        }
+    }
+    let table = read_port_table(false, true, buffer)?;
+    let mapped = SocketAddr::new(local_v4.ip().to_ipv6_mapped().into(), local_v4.port());
+    let mut owners = udp_table_owners(table, mapped, false).peekable();
+    if has_v4_owner || owners.peek().is_some() {
+        return owners.find_map(blocking_rule);
+    }
+    // An IPv6 wildcard can belong to a dual-stack socket. Treat it as a fallback for IPv4.
+    udp_table_owners(table, mapped, true).find_map(blocking_rule)
 }
 
 struct Shared {
@@ -311,7 +345,7 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
     let mut generation = u64::MAX;
     // Rules whose application goes around its tunnel right now, because the tunnel is down.
     let mut bypassing: HashSet<String> = HashSet::new();
-    let mut udp_ports: HashMap<(u16, bool), (Option<String>, Instant)> = HashMap::new();
+    let mut port_table = vec![0u8; 4096];
     let mut buffer = vec![0u8; 40 + 0xffff];
     let mut purged = Instant::now();
     let mut failures = 0u32;
@@ -349,8 +383,6 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
                 .filter(|rule| rule.direct && rule.proxy.is_none())
                 .map(|rule| rule.id.clone())
                 .collect();
-            drop(rules);
-            udp_ports.clear();
         }
         let data = &mut buffer[..length as usize];
         let verdict = {
@@ -358,7 +390,6 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
             if now.duration_since(purged) > Duration::from_secs(10) {
                 purged = now;
                 nat.purge(now);
-                udp_ports.retain(|_, (_, at)| now.duration_since(*at) < PORT_TTL);
             }
             handle(
                 data,
@@ -366,20 +397,24 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
                 &mut nat,
                 now,
                 &mut |protocol, origin| {
+                    if matcher.rules.is_empty() {
+                        return None;
+                    }
                     if protocol == TCP {
-                        return matcher.decide(port_owner(true, origin)?, now, &system);
+                        let pid = tcp_port_owner(origin, &mut port_table)?;
+                        return matcher.decide(pid, now, &system);
                     }
-                    // Datagrams arrive in bursts: one lookup per local port every few seconds.
-                    let key = (origin.local_port, origin.v6);
-                    if let Some((rule, at)) = udp_ports.get(&key)
-                        && now.duration_since(*at) < PORT_TTL
-                    {
-                        return rule.clone();
-                    }
-                    let rule =
-                        port_owner(false, origin).and_then(|pid| matcher.decide(pid, now, &system));
-                    udp_ports.insert(key, (rule.clone(), now));
-                    rule
+                    // A wildcard or shared binding can leave more than one possible sender.
+                    udp_port_rule(
+                        origin.local,
+                        address.interface_index(),
+                        &mut port_table,
+                        |pid| {
+                            matcher
+                                .decide(pid, now, &system)
+                                .filter(|rule| !bypassing.contains(rule))
+                        },
+                    )
                 },
                 &|rule| bypassing.contains(rule),
             )
