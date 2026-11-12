@@ -268,6 +268,43 @@ fn datagrams_reach_the_network_and_answers_come_back_on_both_families() {
 }
 
 #[test]
+fn oversized_ipv6_replies_are_dropped_without_truncation() {
+    let Ok(server) = UdpSocket::bind("[::1]:0") else {
+        return;
+    };
+    server.set_read_timeout(Some(WAIT)).unwrap();
+    let mut relay = Relay::started(settings());
+    let peer = server.local_addr().unwrap();
+    relay.write(&Frame::Send {
+        flow: 1,
+        peer,
+        data: b"x",
+    });
+    let (_, mapped) = server.recv_from(&mut [0; 1]).unwrap();
+
+    let oversized = vec![1; 65_527];
+    assert_eq!(server.send_to(&oversized, mapped).unwrap(), oversized.len());
+    let stats = relay.expect(|frame| {
+        assert!(!is_recv(frame), "the oversized reply produced a RECV frame");
+        matches!(frame, Frame::Stats(stats) if stats.from_network_datagrams == 1)
+    });
+    let Frame::Stats(stats) = proto::parse(&stats).unwrap().unwrap().0 else {
+        unreachable!()
+    };
+    assert_eq!(stats.drops.get(DropReason::Size), 1);
+    assert_eq!(stats.from_network_bytes, oversized.len() as u64);
+
+    let largest = vec![2; proto::MAX_PAYLOAD];
+    assert_eq!(server.send_to(&largest, mapped).unwrap(), largest.len());
+    let (flow, from, data) = received(&relay.expect(is_recv));
+    assert_eq!((flow, from), (1, peer));
+    assert!(
+        data == largest,
+        "the largest valid reply must arrive intact"
+    );
+}
+
+#[test]
 fn answers_from_any_address_reach_the_flow() {
     let mut relay = Relay::started(settings());
     let (server, senders) = echo_server("127.0.0.1:0");
