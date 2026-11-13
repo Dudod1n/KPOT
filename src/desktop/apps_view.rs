@@ -435,17 +435,28 @@ impl Desktop {
                 .is_some_and(|runtime| runtime.state == "running")
         });
         let consent = tunnel.is_some_and(|tunnel| snapshot.udp.consented(tunnel));
-        let text = match (running, consent) {
-            (true, _) if quic => "Трафик: TCP и UDP через туннель, включая QUIC",
-            (true, _) => {
-                "Трафик: TCP и UDP через туннель; QUIC (UDP 443) блокируется, браузер переходит на TCP"
-            }
-            (false, true) => {
-                "Трафик: только TCP; UDP через сервер ещё не работает, поэтому UDP блокируется"
-            }
-            (false, false) => {
-                "Трафик: только TCP; UDP блокируется — включите «UDP через сервер» в туннеле"
-            }
+        // What the rule does right now: a stopped rule or a missing helper moves nothing.
+        let state = snapshot
+            .app_runtimes
+            .get(&rule.id)
+            .map(|runtime| runtime.state.as_str())
+            .unwrap_or("stopped");
+        let text = match (state, running, consent) {
+            ("direct", ..) => "Трафик: туннель не работает, всё идёт напрямую, включая UDP",
+            ("blocked", ..) => "Трафик: туннель не работает, сеть приложения закрыта",
+            ("running", ..) => match (running, consent) {
+                (true, _) if quic => "Трафик: TCP и UDP через туннель, включая QUIC",
+                (true, _) => {
+                    "Трафик: TCP и UDP через туннель; QUIC (UDP 443) блокируется, браузер переходит на TCP"
+                }
+                (false, true) => {
+                    "Трафик: только TCP; UDP через сервер ещё не работает, поэтому UDP блокируется"
+                }
+                (false, false) => {
+                    "Трафик: только TCP; UDP блокируется — включите «UDP через сервер» в туннеле"
+                }
+            },
+            _ => "Трафик: правило сейчас не перехватывает приложение",
         };
         ui.weak(text);
         ui.weak("Имена для приложения разрешает система Windows (служба DNS-клиент) напрямую; через туннель идут только DNS-запросы, которые приложение отправляет само.");

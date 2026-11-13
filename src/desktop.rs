@@ -2241,9 +2241,9 @@ impl Desktop {
                 Confirm::UdpConsent { name, .. } => {
                     ui.heading("Включить UDP через сервер?");
                     ui.label(format!("Для туннеля «{name}» КРОТ загрузит на SSH-сервер свой помощник krot-relay (около 0,4 МиБ) в каталог ~/.cache/krot и будет запускать его, пока туннель работает. UDP приложений из правил этого туннеля пойдёт в сеть с адреса сервера."));
-                    ui.weak("Помощник работает с правами вашей учётной записи на сервере, не открывает портов и ничего не записывает, кроме своего файла. Для UDP открывается отдельное SSH-соединение; снаружи это по-прежнему SSH.");
+                    ui.weak("Помощник работает с правами вашей учётной записи на сервере и ничего не записывает, кроме своего файла. Управление идёт через отдельное SSH-соединение, снаружи это по-прежнему SSH. Для каждого UDP-потока приложения помощник открывает на сервере временный UDP-порт и принимает на него ответы с любого адреса — так работают звонки и WebRTC.");
                     ui.weak("Помощник даёт UDP-выход и там, где администратор сервера запретил переадресацию портов (AllowTcpForwarding no). Убедитесь, что это допустимо на этом сервере.");
-                    ui.weak("Выключение UDP или удаление туннеля удаляет помощник с сервера, если сервер доступен.");
+                    ui.weak("Согласие действует только для этого сервера и учётной записи. Выключение UDP, смена сервера или удаление туннеля удаляют помощник с сервера, если он доступен.");
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Отмена").clicked() { choice = 1; }
                         if ui.button(RichText::new("Загрузить и включить").color(tone(ui, CYAN))).clicked() { choice = 2; }
@@ -4723,6 +4723,28 @@ mod tests {
         );
         // The numbers line follows the helper's report.
         assert!(text_rect(&output, "UDP: ↑ 0 · ↓ 0 датаграмм · потоков 0").is_some());
+        // A stopped rule or a missing helper does not claim tunnelling, relay or not.
+        for state in ["stopped", "elevation"] {
+            let mut stopped = snapshot.clone();
+            stopped.app_runtimes.get_mut("rule").unwrap().state = state.into();
+            app.snapshot = Some(stopped);
+            let output = render(&mut app, &ctx, [1000.0, 1200.0]);
+            assert!(
+                text_rect(
+                    &output,
+                    "Трафик: правило сейчас не перехватывает приложение"
+                )
+                .is_some(),
+                "{state}"
+            );
+            assert!(
+                text_rect(
+                    &output,
+                    "Трафик: TCP и UDP через туннель; QUIC (UDP 443) блокируется, браузер переходит на TCP"
+                )
+                .is_none()
+            );
+        }
         snapshot.udp_runtimes.clear();
         app.snapshot = Some(snapshot);
         let output = render(&mut app, &ctx, [1000.0, 1200.0]);
