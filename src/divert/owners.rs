@@ -4,16 +4,21 @@
 //! process. A datagram is matched by its local address and port, not by the port alone, since
 //! several sockets may share a port on different addresses.
 //!
-//! Reading the tables costs too much to do for every datagram, so decisions are kept for a
-//! short time per local endpoint, measured with the monotonic clock only:
-//! - a datagram that is let through (no rule, or a rule that bypasses its stopped tunnel) is
-//!   decided again after `PASS_HOLD`, so that a blocked application reusing the endpoint is
-//!   noticed quickly;
+//! Reading the tables costs too much to do for every datagram: one snapshot serves every
+//! endpoint for `SNAPSHOT_HOLD`, and decisions are kept per local endpoint, measured with the
+//! monotonic clock only:
+//! - a datagram that is let through (no rule, a rule that bypasses its stopped tunnel, or owners
+//!   that could not be read) is decided again after `PASS_HOLD`, so that a blocked application
+//!   reusing the endpoint is noticed quickly;
 //! - a blocked endpoint stays blocked for `BLOCK_HOLD`, and for another `BLOCK_HOLD` after its
-//!   blocking socket is found gone. WinDivert keeps a captured packet for at most its queue time
-//!   (2 s by default), so a datagram the closed socket sent while it existed can never be
-//!   handled after that and leak. The price is that another application binding the same
-//!   endpoint right away is blocked for up to that time too: the safe side.
+//!   blocking socket is found gone, unless its rule now bypasses its tunnel. WinDivert keeps a
+//!   captured packet for at most its queue time (2 s by default), so datagrams of a blocked
+//!   socket that was seen before it closed cannot leak while they wait in the driver. The price
+//!   is that another application binding the same endpoint right away is blocked for up to that
+//!   time too: the safe side.
+//!
+//! Known limit: a socket that sends and closes before any of its datagrams is looked up is never
+//! seen, so those datagrams find no owner and pass, as before this module.
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -22,6 +27,8 @@ use std::{
 
 /// How long a "let through" decision is reused.
 pub const PASS_HOLD: Duration = Duration::from_millis(100);
+/// How long one reading of the system tables answers for every endpoint.
+pub const SNAPSHOT_HOLD: Duration = Duration::from_millis(50);
 /// How long a "block" decision is reused, and kept after its socket is gone.
 /// Matches WinDivert's default queue time.
 pub const BLOCK_HOLD: Duration = Duration::from_secs(2);
@@ -112,7 +119,8 @@ fn owners_in(
 }
 
 /// Processes whose sockets may have sent a datagram from `local`, from the IPv4 and IPv6 UDP
-/// tables. `None` when a table the answer depends on could not be read.
+/// tables. `None` when the table of the datagram's own family could not be read; without the
+/// IPv6 table an IPv4 datagram is still matched against the IPv4 sockets.
 pub fn endpoint_owners(
     ipv4: Option<&[u8]>,
     ipv6: Option<&[u8]>,
@@ -122,18 +130,47 @@ pub fn endpoint_owners(
         return Some(owners_in(ipv6?, true, local, true).collect());
     };
     let mut owners: Vec<u32> = owners_in(ipv4?, false, local, true).collect();
-    let ipv6 = ipv6?;
-    let mapped = SocketAddr::new(address.ip().to_ipv6_mapped().into(), address.port());
-    owners.extend(owners_in(ipv6, true, mapped, false));
-    // Only when nothing else claims the endpoint can an IPv6 wildcard be a dual-stack socket.
-    if owners.is_empty() {
+    if let Some(ipv6) = ipv6 {
+        // A mapped socket, or an IPv6 wildcard that may be dual-stack, can send it too; an
+        // IPv6-only wildcard is the price of the safe side.
+        let mapped = SocketAddr::new(address.ip().to_ipv6_mapped().into(), address.port());
         owners.extend(owners_in(ipv6, true, mapped, true));
     }
     Some(owners)
 }
 
+/// One reading of both UDP tables, shared by every endpoint for `SNAPSHOT_HOLD`.
+#[derive(Default)]
+pub struct Snapshot {
+    ipv4: Option<Vec<u8>>,
+    ipv6: Option<Vec<u8>>,
+    at: Option<Instant>,
+}
+
+impl Snapshot {
+    /// The owners of `local`, reading the tables with `read(v6)` only when the snapshot is old.
+    pub fn owners(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        mut read: impl FnMut(bool) -> Option<Vec<u8>>,
+    ) -> Option<Vec<u32>> {
+        if self
+            .at
+            .is_none_or(|at| now.saturating_duration_since(at) >= SNAPSHOT_HOLD)
+        {
+            self.ipv4 = read(false);
+            self.ipv6 = read(true);
+            self.at = Some(now);
+        }
+        endpoint_owners(self.ipv4.as_deref(), self.ipv6.as_deref(), local)
+    }
+}
+
 struct Entry {
     rule: Option<String>,
+    /// When the owners were last looked up for this entry.
+    checked: Instant,
     /// Until when the entry answers without a lookup.
     until: Instant,
     /// The entry blocks only because its blocking socket was found gone recently.
@@ -165,14 +202,32 @@ impl UdpOwners {
         }
         let blocks = |rule: &Option<String>| rule.as_deref().is_some_and(|rule| !bypass(rule));
         let previous = self.entries.get(&local);
+        // A block whose rule now bypasses its tunnel is held no longer than a pass: the
+        // endpoint may have a new owner whose rule must decide.
         if let Some(entry) = previous
             && now < entry.until
+            && (blocks(&entry.rule) || now < entry.checked + PASS_HOLD)
         {
             return entry.rule.clone();
         }
         let Some(rules) = lookup() else {
-            // Unknown owners: keep the last answer rather than guess.
-            return previous.and_then(|entry| entry.rule.clone());
+            // Unknown owners: keep the last answer rather than guess, and do not ask again
+            // for every datagram.
+            let rule = previous.and_then(|entry| entry.rule.clone());
+            let until = previous
+                .map_or(now, |entry| entry.until)
+                .max(now + PASS_HOLD);
+            let grace = previous.is_some_and(|entry| entry.grace);
+            self.entries.insert(
+                local,
+                Entry {
+                    rule: rule.clone(),
+                    checked: now,
+                    until,
+                    grace,
+                },
+            );
+            return rule;
         };
         // Of several possible senders, a blocking one decides: the safe side.
         let chosen = rules
@@ -184,6 +239,7 @@ impl UdpOwners {
             // The blocking socket is gone: datagrams it sent may still wait in the driver.
             Some(entry) if blocks(&entry.rule) && !entry.grace && !blocks(&chosen) => Entry {
                 rule: entry.rule.clone(),
+                checked: now,
                 until: now + BLOCK_HOLD,
                 grace: true,
             },
@@ -195,6 +251,7 @@ impl UdpOwners {
                         PASS_HOLD
                     },
                 rule: chosen,
+                checked: now,
                 grace: false,
             },
         };

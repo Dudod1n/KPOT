@@ -45,7 +45,7 @@ use windows_sys::Win32::{
 
 use super::{
     DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
-    owners::{UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners, endpoint_owners},
+    owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
     tcp_table_owner,
 };
 use crate::{
@@ -290,24 +290,6 @@ fn tcp_port_owner(origin: &Origin, buffer: &mut Vec<u8>) -> Option<u32> {
     })
 }
 
-/// The rules of the processes whose sockets may have sent from `local`; `None` when the system
-/// tables could not be read.
-fn udp_owner_rules(
-    local: SocketAddr,
-    ipv4: &mut Vec<u8>,
-    ipv6: &mut Vec<u8>,
-    mut rule: impl FnMut(u32) -> Option<String>,
-) -> Option<Vec<String>> {
-    let ipv4 = if local.is_ipv4() {
-        Some(read_port_table(false, false, ipv4)?)
-    } else {
-        None
-    };
-    let ipv6 = read_port_table(false, true, ipv6);
-    let pids = endpoint_owners(ipv4, ipv6, local)?;
-    Some(pids.into_iter().filter_map(&mut rule).collect())
-}
-
 struct Shared {
     nat: Mutex<Nat>,
     rules: Mutex<Vec<DivertRule>>,
@@ -350,8 +332,8 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
     let mut bypassing: HashSet<String> = HashSet::new();
     let mut udp_owners = UdpOwners::default();
     let mut port_table = vec![0u8; 4096];
-    let mut udp4_table = vec![0u8; 4096];
-    let mut udp6_table = vec![0u8; 4096];
+    let mut udp_table = vec![0u8; 4096];
+    let mut udp_snapshot = Snapshot::default();
     let mut buffer = vec![0u8; 40 + 0xffff];
     let mut purged = Instant::now();
     let mut failures = 0u32;
@@ -425,9 +407,14 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
                     }
                     // The rule as it is; `handle` applies whether it bypasses its tunnel.
                     udp_owners.decide(local, now, &|rule| bypassing.contains(rule), || {
-                        udp_owner_rules(local, &mut udp4_table, &mut udp6_table, |pid| {
-                            matcher.decide(pid, now, &system)
-                        })
+                        let pids = udp_snapshot.owners(now, local, |v6| {
+                            read_port_table(false, v6, &mut udp_table).map(<[u8]>::to_vec)
+                        })?;
+                        Some(
+                            pids.into_iter()
+                                .filter_map(|pid| matcher.decide(pid, now, &system))
+                                .collect(),
+                        )
                     })
                 },
                 &|rule| bypassing.contains(rule),
