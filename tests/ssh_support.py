@@ -297,8 +297,18 @@ class SSHFixtures:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=True)
         self.commands.append((process.command, local))
+
+        async def forward(source, target):
+            while data := await source.read(65536):
+                target.write(data)
+                await target.drain()
+
         try:
-            await process.redirect(stdin=local.stdin, stdout=local.stdout, stderr=local.stderr)
+            await process.redirect(stdin=local.stdin)
+            # All output reaches the client before the exit status, like sshd sends it: with
+            # `redirect` the status could overtake a short output and the client saw none.
+            await asyncio.gather(forward(local.stdout, process.stdout),
+                                 forward(local.stderr, process.stderr))
             process.exit(await local.wait())
         finally:
             if local.returncode is None:

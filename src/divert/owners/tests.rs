@@ -83,14 +83,12 @@ fn ipv4_datagrams_also_match_mapped_and_dual_stack_sockets() {
         row("[fd00::1]:50000", 70),
         row("[::]:50000", 80),
     ];
-    // An exact mapped socket claims the endpoint, so the wildcard is not a candidate.
-    assert_eq!(owners(&[], &ipv6, "192.0.2.1:50000"), Some(vec![50]));
-    // With nothing else, an IPv6 wildcard may be a dual-stack socket.
+    // An IPv6 wildcard may always be a dual-stack sender: it is a candidate next to the rest.
+    assert_eq!(owners(&[], &ipv6, "192.0.2.1:50000"), Some(vec![50, 80]));
     assert_eq!(owners(&[], &ipv6, "192.0.2.3:50000"), Some(vec![80]));
-    // An IPv4 socket takes precedence over the dual-stack guess too.
     assert_eq!(
         owners(&[row("0.0.0.0:50000", 90)], &ipv6, "192.0.2.3:50000"),
-        Some(vec![90])
+        Some(vec![90, 80])
     );
 }
 
@@ -99,7 +97,8 @@ fn a_missing_table_leaves_the_owners_unknown() {
     let ipv4 = table(&[row("192.0.2.1:50000", 1)]);
     let ipv6 = table(&[]);
     let local_v4 = "192.0.2.1:50000".parse().unwrap();
-    assert_eq!(endpoint_owners(Some(&ipv4), None, local_v4), None);
+    // Without the IPv6 table an IPv4 datagram is still matched against IPv4 sockets.
+    assert_eq!(endpoint_owners(Some(&ipv4), None, local_v4), Some(vec![1]));
     assert_eq!(endpoint_owners(None, Some(&ipv6), local_v4), None);
     assert_eq!(
         endpoint_owners(Some(&ipv4), None, "[fd00::1]:5".parse().unwrap()),
@@ -286,4 +285,65 @@ fn nothing_is_looked_up_while_every_rule_bypasses() {
         ),
         Some("blocked".into())
     );
+}
+
+#[test]
+fn one_snapshot_serves_every_endpoint_for_its_hold() {
+    let mut snapshot = Snapshot::default();
+    let reads = Cell::new(0);
+    let ipv4 = table(&[row("192.0.2.1:5", 1), row("192.0.2.2:5", 2)]);
+    let read = |v6: bool| {
+        reads.set(reads.get() + 1);
+        Some(if v6 { table(&[]) } else { ipv4.clone() })
+    };
+    let start = Instant::now();
+    assert_eq!(
+        snapshot.owners(start, "192.0.2.1:5".parse().unwrap(), read),
+        Some(vec![1])
+    );
+    let soon = start + SNAPSHOT_HOLD - Duration::from_millis(1);
+    assert_eq!(
+        snapshot.owners(soon, "192.0.2.2:5".parse().unwrap(), read),
+        Some(vec![2])
+    );
+    assert_eq!(reads.get(), 2, "both tables read once for both endpoints");
+    snapshot.owners(start + SNAPSHOT_HOLD, "192.0.2.1:5".parse().unwrap(), read);
+    assert_eq!(reads.get(), 4);
+}
+
+#[test]
+fn unknown_owners_are_asked_again_only_after_a_short_hold() {
+    let (mut owners, start, lookups) = (UdpOwners::default(), Instant::now(), Cell::new(0));
+    for offset in [0, 50, 99] {
+        let at = start + Duration::from_millis(offset);
+        assert_eq!(decide(&mut owners, "192.0.2.1:5", at, None, &lookups), None);
+    }
+    assert_eq!(lookups.get(), 1);
+    decide(
+        &mut owners,
+        "192.0.2.1:5",
+        start + PASS_HOLD,
+        None,
+        &lookups,
+    );
+    assert_eq!(lookups.get(), 2);
+}
+
+#[test]
+fn a_block_whose_rule_turns_to_bypass_lasts_no_longer_than_a_pass() {
+    let (mut owners, start, lookups) = (UdpOwners::default(), Instant::now(), Cell::new(0));
+    let local: SocketAddr = "192.0.2.1:5".parse().unwrap();
+    let decide = |owners: &mut UdpOwners, at: Instant, bypassed: bool, rules: &[&str]| {
+        owners.decide(local, at, &|rule| bypassed && rule == "a", || {
+            lookups.set(lookups.get() + 1);
+            Some(rules.iter().map(|rule| rule.to_string()).collect())
+        })
+    };
+    assert_eq!(decide(&mut owners, start, false, &["a"]), Some("a".into()));
+    // Rule A's tunnel stops and A bypasses it; B, whose tunnel runs, takes the endpoint.
+    let soon = start + Duration::from_millis(50);
+    assert_eq!(decide(&mut owners, soon, true, &["b"]), Some("a".into()));
+    let later = start + PASS_HOLD;
+    assert_eq!(decide(&mut owners, later, true, &["b"]), Some("b".into()));
+    assert_eq!(lookups.get(), 2);
 }
