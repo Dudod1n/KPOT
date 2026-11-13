@@ -285,7 +285,10 @@ class SSHFixtures:
             await writer.wait_closed()
 
     async def run_command(self, process, home):
-        """Run an exec request with the local /bin/sh, as a server account with `home`."""
+        """Run an exec request with the local /bin/sh, as a server account with `home`.
+
+        `self.exec_delay` (seconds) holds every command back, like a slow server."""
+        await asyncio.sleep(getattr(self, 'exec_delay', 0))
         env = {'HOME': str(home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
         # A process group of its own: the shell may stay as a parent of the relay, and
         # stopping the command must stop both, as sshd does when a session ends.

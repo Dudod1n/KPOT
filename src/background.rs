@@ -29,7 +29,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     apps::{AppRule, AppRuntime, Apps, DivertReport, DivertStats, Interceptor},
-    config::{Config, Store, atomic_json},
+    config::{Config, Store, Tunnel, atomic_json},
     ssh::{Manager, PendingPrompt, Runtime},
 };
 
@@ -480,7 +480,7 @@ impl Owned {
         self.config
             .tunnels
             .iter()
-            .filter(|tunnel| tunnel.kind == "D" && self.udp.tunnel_enabled(&tunnel.id))
+            .filter(|tunnel| tunnel.kind == "D" && self.udp.consented(tunnel))
             .map(|tunnel| tunnel.id.clone())
             .collect()
     }
@@ -611,6 +611,37 @@ impl Service {
                 next.validate()?;
                 self.store.save(&next)?;
                 let next = self.store.load()?;
+                // Consent ends with the tunnel, its SOCKS mode or its server: the relay leaves
+                // the server it was given for, and the new server needs its own consent.
+                let retired: Vec<Tunnel> = owned
+                    .config
+                    .tunnels
+                    .iter()
+                    .filter(|old| owned.udp.consented(old))
+                    .filter(|old| {
+                        next.tunnels
+                            .iter()
+                            .find(|new| new.id == old.id)
+                            .is_none_or(|new| {
+                                new.kind != "D"
+                                    || crate::udp::consent::server(new)
+                                        != crate::udp::consent::server(old)
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                if !retired.is_empty() {
+                    let mut udp = owned.udp.clone();
+                    for old in &retired {
+                        udp.tunnels.remove(&old.id);
+                    }
+                    if owned.udp_error.is_empty() {
+                        crate::udp::consent::save(&self.store, &udp)?;
+                        owned.udp = udp;
+                    }
+                    let enabled = owned.udp_tunnels();
+                    owned.manager.set_udp(enabled).await;
+                }
                 let changed: Vec<_> = owned
                     .config
                     .tunnels
@@ -618,11 +649,12 @@ impl Service {
                     .filter(|old| !next.tunnels.iter().any(|new| *old == new))
                     .map(|t| t.id.clone())
                     .collect();
+                // Removal talks to the server: it runs apart from this command and its lock,
+                // with the secrets the tunnel holds before it stops.
+                for old in retired {
+                    owned.manager.retire_udp(old).await;
+                }
                 for id in &changed {
-                    // A deleted tunnel takes its relay off the server first.
-                    if !next.tunnels.iter().any(|tunnel| tunnel.id == *id) {
-                        owned.manager.remove_udp(id).await;
-                    }
                     owned.manager.stop(id).await?;
                 }
                 for t in &next.tunnels {
@@ -657,21 +689,38 @@ impl Service {
                         .any(|tunnel| tunnel.id == choice.id && tunnel.kind == "D"),
                     "UDP через сервер доступен только для сохранённого туннеля типа D."
                 );
+                let tunnel = owned
+                    .config
+                    .tunnels
+                    .iter()
+                    .find(|tunnel| tunnel.id == choice.id)
+                    .cloned()
+                    .context("Сохранённый туннель не найден.")?;
                 let mut next = owned.udp.clone();
-                next.tunnels.insert(
-                    choice.id,
-                    crate::udp::consent::TunnelUdp {
-                        enabled: choice.enabled,
-                    },
-                );
+                if choice.enabled {
+                    next.tunnels.insert(
+                        choice.id,
+                        crate::udp::consent::TunnelUdp {
+                            enabled: true,
+                            server: crate::udp::consent::server(&tunnel),
+                        },
+                    );
+                } else {
+                    next.tunnels.remove(&choice.id);
+                }
                 next.retain_known(
                     owned.config.tunnels.iter().map(|tunnel| tunnel.id.as_str()),
                     owned.apps.rules.iter().map(|rule| rule.id.as_str()),
                 );
+                let was = owned.udp.consented(&tunnel);
                 crate::udp::consent::save(&self.store, &next)?;
                 owned.udp = next;
                 let udp = owned.udp_tunnels();
                 owned.manager.set_udp(udp).await;
+                // Consent is revoked at once; taking the relay off the server runs apart.
+                if was && !choice.enabled {
+                    owned.manager.retire_udp(tunnel).await;
+                }
                 Ok(Value::Null)
             }
             "udp_rule" => {

@@ -17,6 +17,10 @@ const MAX_ENTRIES: usize = 512;
 pub struct TunnelUdp {
     /// The user agreed that the relay is uploaded to and run on this tunnel's server.
     pub enabled: bool,
+    /// The account and server the consent was given for, as `user@host:port`. Consent does
+    /// not carry over to another server of the same tunnel.
+    #[serde(default)]
+    pub server: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,9 +79,11 @@ impl UdpSettings {
         Ok(())
     }
 
-    /// The user agreed to the relay on this tunnel and has not switched UDP off.
-    pub fn tunnel_enabled(&self, tunnel: &str) -> bool {
-        self.tunnels.get(tunnel).is_some_and(|entry| entry.enabled)
+    /// The user agreed to the relay on this tunnel's current server and has not switched UDP off.
+    pub fn consented(&self, tunnel: &crate::config::Tunnel) -> bool {
+        self.tunnels
+            .get(&tunnel.id)
+            .is_some_and(|entry| entry.enabled && entry.server == server(tunnel))
     }
 
     pub fn quic(&self, rule: &str) -> bool {
@@ -97,6 +103,11 @@ impl UdpSettings {
         self.rules
             .retain(|id, entry| entry.quic && rules.contains(id.as_str()));
     }
+}
+
+/// The identity consent is bound to: the account on the final SSH server.
+pub fn server(tunnel: &crate::config::Tunnel) -> String {
+    tunnel.server.address()
 }
 
 pub fn path(store: &Store) -> PathBuf {
@@ -147,23 +158,79 @@ mod tests {
         (directory, store)
     }
 
+    fn tunnel(id: &str, host: &str) -> crate::config::Tunnel {
+        crate::config::Tunnel {
+            id: id.into(),
+            kind: "D".into(),
+            server: crate::config::Endpoint {
+                host: host.into(),
+                user: "me".into(),
+                port: 22,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn consent(tunnel: &crate::config::Tunnel) -> TunnelUdp {
+        TunnelUdp {
+            enabled: true,
+            server: server(tunnel),
+        }
+    }
+
     #[test]
     fn missing_file_means_udp_off_and_a_round_trip_keeps_choices() {
         let (_directory, store) = store();
+        let (t1, t2) = (tunnel("t1", "a.example"), tunnel("t2", "a.example"));
         let empty = load(&store).unwrap();
-        assert!(!empty.tunnel_enabled("t1") && !empty.quic("r1"));
+        assert!(!empty.consented(&t1) && !empty.quic("r1"));
 
         let mut settings = UdpSettings::default();
-        settings
-            .tunnels
-            .insert("t1".into(), TunnelUdp { enabled: true });
+        settings.tunnels.insert("t1".into(), consent(&t1));
         settings.rules.insert("r1".into(), RuleUdp { quic: true });
         save(&store, &settings).unwrap();
         assert_eq!(path(&store), store.sidecar(".udp.json"));
         let loaded = load(&store).unwrap();
         assert_eq!(loaded, settings);
-        assert!(loaded.tunnel_enabled("t1") && loaded.quic("r1"));
-        assert!(!loaded.tunnel_enabled("t2") && !loaded.quic("r2"));
+        assert!(loaded.consented(&t1) && loaded.quic("r1"));
+        assert!(!loaded.consented(&t2) && !loaded.quic("r2"));
+    }
+
+    #[test]
+    fn consent_belongs_to_the_account_on_the_server() {
+        let mut settings = UdpSettings::default();
+        let original = tunnel("t1", "a.example");
+        settings.tunnels.insert("t1".into(), consent(&original));
+        assert!(settings.consented(&original));
+        for changed in [
+            tunnel("t1", "b.example"),
+            crate::config::Tunnel {
+                server: crate::config::Endpoint {
+                    user: "other".into(),
+                    ..original.server.clone()
+                },
+                ..original.clone()
+            },
+            crate::config::Tunnel {
+                server: crate::config::Endpoint {
+                    port: 2222,
+                    ..original.server.clone()
+                },
+                ..original.clone()
+            },
+        ] {
+            assert!(!settings.consented(&changed), "{}", server(&changed));
+        }
+        // An entry from before consent was bound to a server is not consent.
+        settings.tunnels.insert(
+            "t1".into(),
+            TunnelUdp {
+                enabled: true,
+                server: String::new(),
+            },
+        );
+        assert!(!settings.consented(&original));
     }
 
     #[test]
@@ -185,7 +252,13 @@ mod tests {
     fn deleted_tunnels_rules_and_defaults_are_forgotten() {
         let mut settings = UdpSettings::default();
         for (id, enabled) in [("kept", true), ("gone", true), ("off", false)] {
-            settings.tunnels.insert(id.into(), TunnelUdp { enabled });
+            settings.tunnels.insert(
+                id.into(),
+                TunnelUdp {
+                    enabled,
+                    server: String::new(),
+                },
+            );
         }
         for (id, quic) in [("rule", true), ("old", true), ("plain", false)] {
             settings.rules.insert(id.into(), RuleUdp { quic });
@@ -201,7 +274,7 @@ mod tests {
         let mut settings = UdpSettings::default();
         settings
             .tunnels
-            .insert("t1".into(), TunnelUdp { enabled: true });
+            .insert("t1".into(), consent(&tunnel("t1", "a.example")));
         save(&store, &settings).unwrap();
         assert!(!store.path.exists());
         assert!(!crate::apps::path(&store).exists());

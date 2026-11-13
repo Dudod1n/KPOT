@@ -1709,7 +1709,7 @@ impl Desktop {
             return;
         };
         ui.separator();
-        let consent = snapshot.udp.tunnel_enabled(&tunnel.id);
+        let consent = snapshot.udp.consented(tunnel);
         let runtime = snapshot
             .udp_runtimes
             .get(&tunnel.id)
@@ -4685,7 +4685,10 @@ mod tests {
         let mut snapshot = app_snapshot("running");
         snapshot.udp.tunnels.insert(
             "socks".into(),
-            crate::udp::consent::TunnelUdp { enabled: true },
+            crate::udp::consent::TunnelUdp {
+                enabled: true,
+                server: crate::udp::consent::server(&app_snapshot("running").config.tunnels[1]),
+            },
         );
         snapshot.udp_runtimes.insert(
             "socks".into(),

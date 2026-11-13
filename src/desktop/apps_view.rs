@@ -434,7 +434,7 @@ impl Desktop {
                 .get(&tunnel.id)
                 .is_some_and(|runtime| runtime.state == "running")
         });
-        let consent = tunnel.is_some_and(|tunnel| snapshot.udp.tunnel_enabled(&tunnel.id));
+        let consent = tunnel.is_some_and(|tunnel| snapshot.udp.consented(tunnel));
         let text = match (running, consent) {
             (true, _) if quic => "Трафик: TCP и UDP через туннель, включая QUIC",
             (true, _) => {

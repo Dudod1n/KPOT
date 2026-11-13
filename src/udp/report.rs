@@ -18,7 +18,7 @@ pub fn metrics(snapshot: &Snapshot, tunnel: Option<&str>) -> Value {
                 item.id.clone(),
                 json!({
                     "name": item.name,
-                    "consent": snapshot.udp.tunnel_enabled(&item.id),
+                    "consent": snapshot.udp.consented(item),
                     "state": snapshot.udp_runtimes.get(&item.id).cloned().unwrap_or_default(),
                     "transport": snapshot.udp_metrics.get(&item.id),
                     "routing": snapshot.udp_routing.get(&item.id).cloned().unwrap_or_default(),

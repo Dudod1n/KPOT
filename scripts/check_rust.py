@@ -139,6 +139,82 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
                     return snapshot, runtime
                 await asyncio.sleep(.05)
 
+    async def relay_removed(self, home, tunnel, timeout=20):
+        """Removal runs on its own: wait until the relay has left the server and says so."""
+        async with asyncio.timeout(timeout):
+            while True:
+                logs = '\n'.join((await self.request('snapshot'))['runtimes'].get(tunnel.id, {}).get('logs', []))
+                if not (home / '.cache' / 'krot').exists() and 'помощник удалён с сервера' in logs:
+                    return
+                await asyncio.sleep(.05)
+
+    async def udp_tunnel_on(self, home, **server):
+        server = await self.server(shell_home=home, **server)
+        tunnel = self.tunnel(server, kind='D')
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
+        return server, tunnel
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell and relay')
+    async def test_udp_relay_leaves_a_stopped_tunnels_server_and_a_replaced_server(self):
+        home = self.path / 'server-a'
+        home.mkdir()
+        _, tunnel = await self.udp_tunnel_on(home)
+        await self.udp_state(tunnel, ('running',))
+        # Stopped tunnel: switching UDP off still removes the relay over a connection of its own.
+        await self.request('stop', tunnel.id)
+        self.assertTrue((home / '.cache' / 'krot').exists())
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': False})
+        await self.relay_removed(home, tunnel)
+
+        # Consent belongs to the server: moving the tunnel to B revokes it and cleans A.
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
+        await self.request('start', tunnel.id)
+        await self.udp_state(tunnel, ('running',))
+        other_home = self.path / 'server-b'
+        other_home.mkdir()
+        other = await self.server(shell_home=other_home)
+        snapshot = await self.request('snapshot')
+        moved = [{**t, 'server': {**t['server'], 'port': other.get_port()}} for t in snapshot['config']['tunnels']]
+        await self.request('save_checked', {'before': snapshot['config'],
+                                            'config': {**snapshot['config'], 'tunnels': moved}})
+        await self.relay_removed(home, tunnel)
+        settings = json.loads(self.store.path.with_name('config.json.udp.json').read_text('utf-8'))
+        self.assertEqual(settings['tunnels'], {})
+        await self.wait(tunnel)
+        await asyncio.sleep(1)
+        self.assertFalse((other_home / '.cache').exists(), 'B needs its own consent')
+        self.assertEqual((await self.request('snapshot'))['udp_runtimes'][tunnel.id]['state'], 'off')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell and relay')
+    async def test_udp_off_during_start_uploads_nothing_and_slow_cleanup_blocks_nothing(self):
+        home = self.path / 'server-home'
+        home.mkdir()
+        self.exec_delay = 1.5
+        _, tunnel = await self.udp_tunnel_on(home)
+        await self.udp_state(tunnel, ('starting',))
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': False})
+        await self.udp_state(tunnel, ('off',))
+        # The probe that was under way does not lead to an upload or a start.
+        await asyncio.sleep(4)
+        self.assertFalse(any((home / '.cache' / 'krot').glob('krot-relay-*'))
+                         if (home / '.cache' / 'krot').exists() else False)
+        self.assertFalse([c for c, p in self.commands if 'exec "$f"' in c])
+
+        # A slow server holds its own removal, never other commands.
+        self.exec_delay = 0
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
+        await self.udp_state(tunnel, ('running',))
+        self.exec_delay = 3
+        started = asyncio.get_running_loop().time()
+        await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': False})
+        await self.request('snapshot')
+        await self.request('stop', tunnel.id)
+        self.assertLess(asyncio.get_running_loop().time() - started, 2)
+        await self.relay_removed(home, tunnel)
+
     # The test server runs commands with the local /bin/sh and the embedded relay is a Linux
     # program, so these scenarios need Linux; the Windows client path has its own checks.
     @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell and relay')
@@ -156,7 +232,8 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
 
         await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
         settings = json.loads(self.store.path.with_name('config.json.udp.json').read_text('utf-8'))
-        self.assertEqual(settings['tunnels'], {tunnel.id: {'enabled': True}})
+        self.assertEqual(settings['tunnels'],
+                         {tunnel.id: {'enabled': True, 'server': f'test@127.0.0.1:{server.get_port()}'}})
         snapshot, runtime = await self.udp_state(tunnel, ('running', 'unavailable'))
         self.assertEqual(runtime['state'], 'running', runtime.get('message'))
         self.assertEqual((runtime['level'], runtime['uploads']), (1, 1))
@@ -174,9 +251,8 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
 
         # Off stops the relay and takes it off the server; on again uploads it again.
         await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': False})
-        snapshot, _ = await self.udp_state(tunnel, ('off',))
-        self.assertFalse((home / '.cache' / 'krot').exists())
-        self.assertIn('помощник удалён с сервера', '\n'.join(snapshot['runtimes'][tunnel.id]['logs']))
+        await self.udp_state(tunnel, ('off',))
+        await self.relay_removed(home, tunnel)
         await self.request('udp_tunnel', {'id': tunnel.id, 'enabled': True})
         _, runtime = await self.udp_state(tunnel, ('running',))
         self.assertEqual((runtime['uploads'], runtime['starts']), (2, 2))
@@ -201,9 +277,9 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.request('snapshot')
         await self.request('save_checked', {'before': snapshot['config'],
                                             'config': {**snapshot['config'], 'tunnels': []}})
-        self.assertFalse((home / '.cache' / 'krot').exists())
         settings = json.loads(self.store.path.with_name('config.json.udp.json').read_text('utf-8'))
         self.assertEqual(settings['tunnels'], {})
+        await self.relay_removed(home, tunnel)
 
     # The test server runs commands with the local /bin/sh and the embedded relay is a Linux
     # program, so these scenarios need Linux; the Windows client path has its own checks.

@@ -163,6 +163,8 @@ struct State {
     udp_enabled: HashSet<String>,
     udp: HashMap<String, UdpRuntime>,
     udp_links: HashMap<String, Arc<crate::udp::transport::Transport>>,
+    /// Secrets of running tunnels, for the relay's removal while the tunnel runs.
+    credentials: HashMap<String, Credentials>,
 }
 struct Inner {
     known_hosts: PathBuf,
@@ -171,6 +173,7 @@ struct Inner {
     trust_write: Mutex<()>,
     udp_sink: StdMutex<Option<mpsc::UnboundedSender<UdpNotice>>>,
     udp_changed: watch::Sender<u64>,
+    retiring: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 #[derive(Clone)]
 pub struct Manager(Arc<Inner>);
@@ -183,6 +186,7 @@ impl Manager {
             trust_write: Mutex::new(()),
             udp_sink: StdMutex::new(None),
             udp_changed: watch::channel(0).0,
+            retiring: StdMutex::new(HashMap::new()),
         }))
     }
     /// Where transports of running relays are announced.
@@ -200,27 +204,75 @@ impl Manager {
                 .send_modify(|generation| *generation += 1);
         }
     }
-    /// Switches the tunnel's UDP off and waits a little for its relay to leave the server.
-    pub async fn remove_udp(&self, id: &str) {
-        let mut enabled = self.0.state.lock().await.udp_enabled.clone();
-        if !enabled.remove(id) {
-            return;
-        }
-        self.set_udp(enabled).await;
-        let _ =
-            tokio::time::timeout(Duration::from_secs(12), async {
-                loop {
-                    let state = self.0.state.lock().await;
-                    if state.udp.get(id).is_none_or(|runtime| {
-                        runtime.state == "off" || runtime.state == "unavailable"
-                    }) {
-                        return;
-                    }
-                    drop(state);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+    /// Takes the relay off the tunnel's server, after its consent was revoked. Runs on its own,
+    /// one removal at a time per tunnel, over a connection of its own, so that it works for a
+    /// stopped tunnel too and never holds up other commands. The relay of a session that is
+    /// still starting or running is stopped first, so that nothing is uploaded afterwards.
+    pub async fn retire_udp(&self, tunnel: Tunnel) {
+        // Secrets the running tunnel holds are reused, taken now: the tunnel may stop next.
+        let credentials = self
+            .0
+            .state
+            .lock()
+            .await
+            .credentials
+            .get(&tunnel.id)
+            .cloned()
+            .unwrap_or_default();
+        let manager = self.clone();
+        tokio::spawn(async move { manager.retire(tunnel, credentials).await });
+    }
+    async fn retire(&self, tunnel: Tunnel, credentials: Credentials) {
+        let serial = self
+            .0
+            .retiring
+            .lock()
+            .unwrap()
+            .entry(tunnel.id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        let _ = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let busy = self
+                    .0
+                    .state
+                    .lock()
+                    .await
+                    .udp
+                    .get(&tunnel.id)
+                    .is_some_and(|runtime| {
+                        matches!(runtime.state.as_str(), "starting" | "running")
+                    });
+                if !busy {
+                    return;
                 }
-            })
-            .await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        let mut attempt = Attempt::new(CancellationToken::new());
+        let removed = tokio::time::timeout(Duration::from_secs(40), async {
+            self.connect(&tunnel, &mut attempt, &credentials, Purpose::Udp)
+                .await
+                .ok()?;
+            let connection = attempt.sessions.last().cloned()?;
+            Some(crate::udp::deliver::remove(&connection).await)
+        })
+        .await
+        .ok()
+        .flatten()
+            == Some(true);
+        attempt.cleanup().await;
+        self.log(
+            &tunnel.id,
+            if removed {
+                "UDP: помощник удалён с сервера."
+            } else {
+                "UDP: помощник не удалён с сервера: сервер недоступен или для входа нужен пароль."
+            },
+        )
+        .await;
     }
     /// UDP state of every tunnel that has one, with the metrics of running transports.
     pub async fn udp_snapshot(
@@ -521,6 +573,12 @@ impl Manager {
     }
     async fn run(&self, tunnel: Tunnel, cancel: CancellationToken) {
         let credentials = Credentials::default();
+        self.0
+            .state
+            .lock()
+            .await
+            .credentials
+            .insert(tunnel.id.clone(), credentials.clone());
         let udp = (tunnel.kind == "D").then(|| {
             let manager = self.clone();
             let tunnel = tunnel.clone();
@@ -569,12 +627,11 @@ impl Manager {
             self.udp_down(&tunnel.id).await;
             self.udp_state(&tunnel.id, "off", "").await;
         }
-        self.0
-            .state
-            .lock()
-            .await
+        let mut state = self.0.state.lock().await;
+        state
             .prompts
             .retain(|_, p| p.prompt.request.tunnel_id != tunnel.id);
+        state.credentials.remove(&tunnel.id);
     }
     async fn udp_down(&self, id: &str) {
         if self.0.state.lock().await.udp_links.remove(id).is_some() {
@@ -646,6 +703,17 @@ impl Manager {
         }
     }
     /// One UDP connection with its relay, until it fails or UDP is switched off (`Ok`).
+    /// Returns once UDP is switched off for the tunnel, at once if it already is.
+    async fn udp_disabled(&self, id: &str, changes: &mut watch::Receiver<u64>) {
+        loop {
+            if !self.0.state.lock().await.udp_enabled.contains(id) {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
     async fn udp_session(
         &self,
         tunnel: &Tunnel,
@@ -653,19 +721,29 @@ impl Manager {
         credentials: &Credentials,
         changes: &mut watch::Receiver<u64>,
     ) -> std::result::Result<(), (&'static str, bool)> {
-        self.connect(tunnel, attempt, credentials, Purpose::Udp)
-            .await
-            .map_err(|problem| (problem.message, problem.retryable))?;
-        let connection = attempt
-            .sessions
-            .last()
-            .cloned()
-            .ok_or((NETWORK.message, true))?;
-        let launched = tokio::select! {
-            _ = attempt.cancel.cancelled() => return Err((CANCELLED.message, false)),
-            launched = crate::udp::deliver::launch(&connection, crate::udp::transport::default_settings()) => launched,
-        }
-        .map_err(|problem| (problem.message(), problem.retryable()))?;
+        let cancel = attempt.cancel.clone();
+        let setup = async {
+            self.connect(tunnel, attempt, credentials, Purpose::Udp)
+                .await
+                .map_err(|problem| (problem.message, problem.retryable))?;
+            let connection = attempt
+                .sessions
+                .last()
+                .cloned()
+                .ok_or((NETWORK.message, true))?;
+            let launched =
+                crate::udp::deliver::launch(&connection, crate::udp::transport::default_settings())
+                    .await
+                    .map_err(|problem| (problem.message(), problem.retryable()))?;
+            Ok((connection, launched))
+        };
+        // Switching UDP off stops the probe, the upload and the start before their next step.
+        let (connection, launched) = tokio::select! {
+            biased;
+            _ = self.udp_disabled(&tunnel.id, changes) => return Ok(()),
+            _ = cancel.cancelled() => return Err((CANCELLED.message, false)),
+            result = setup => result?,
+        };
         let transport = Arc::new(launched.transport);
         {
             let mut state = self.0.state.lock().await;
@@ -694,25 +772,8 @@ impl Manager {
                         _ => crate::udp::deliver::Problem::Failed.message(),
                     }, true));
                 },
-                _ = changes.changed() => {
-                    if !self.0.state.lock().await.udp_enabled.contains(&tunnel.id) {
-                        // Switched off: the relay leaves the server too, while it is reachable.
-                        self.udp_down(&tunnel.id).await;
-                        let removed = tokio::time::timeout(
-                            Duration::from_secs(10),
-                            crate::udp::deliver::remove(&connection),
-                        )
-                        .await
-                        .unwrap_or(false);
-                        self.log(&tunnel.id, if removed {
-                            "UDP: помощник удалён с сервера."
-                        } else {
-                            "UDP: не удалось удалить помощник с сервера."
-                        })
-                        .await;
-                        return Ok(());
-                    }
-                },
+                // Switched off: the relay stops with this session; `retire_udp` removes it.
+                _ = self.udp_disabled(&tunnel.id, changes) => return Ok(()),
                 _ = check.tick() => {
                     if connection.is_closed() {
                         return Err((NETWORK.message, true));
