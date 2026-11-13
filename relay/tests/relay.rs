@@ -41,7 +41,11 @@ struct Relay {
 
 impl Relay {
     fn start() -> Self {
-        let mut child = command()
+        Self::spawn(command())
+    }
+
+    fn spawn(mut command: Command) -> Self {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -511,4 +515,146 @@ fn arguments_are_refused() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(2));
+}
+
+#[test]
+fn a_hello_of_another_layout_is_refused_not_misread() {
+    let mut relay = Relay::start();
+    let mut body = vec![proto::kind::HELLO];
+    body.extend_from_slice(&proto::MAGIC);
+    body.extend_from_slice(&(VERSION + 1).to_be_bytes());
+    body.extend_from_slice(&[0; 17]);
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    relay.write_raw(&frame);
+    let answer = relay.expect(|_| true);
+    assert_eq!(
+        proto::parse(&answer).unwrap().unwrap().0,
+        Frame::Refuse {
+            reason: Refusal::Version,
+            supported: VERSION,
+        }
+    );
+    assert_eq!(relay.exit_code(), 5);
+}
+
+#[test]
+fn strangers_cannot_keep_a_flow_alive() {
+    let mut relay = Relay::started(Settings {
+        idle_ms: 1_000,
+        idle_bidirectional_ms: 1_000,
+        ..settings()
+    });
+    let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+    relay.write(&Frame::Send {
+        flow: 4,
+        peer: silent.local_addr().unwrap(),
+        data: b"hello",
+    });
+    let (_, mapped) = silent.recv_from(&mut [0u8; 64]).unwrap();
+    let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let started = Instant::now();
+    let closer = thread::spawn(move || {
+        // Unsolicited datagrams every 200 ms, longer than the idle timeout.
+        while started.elapsed() < Duration::from_millis(2_500) {
+            let _ = stranger.send_to(b"noise", mapped);
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+    let close = relay.expect(|frame| matches!(frame, Frame::Close { .. }));
+    assert_eq!(
+        proto::parse(&close).unwrap().unwrap().0,
+        Frame::Close {
+            flow: 4,
+            reason: CloseReason::Idle,
+        }
+    );
+    assert!(started.elapsed() < Duration::from_millis(2_500));
+    closer.join().unwrap();
+}
+
+#[test]
+fn a_refused_flow_gets_one_close_and_a_flood_of_its_datagrams_ends_nothing() {
+    let mut relay = Relay::started(Settings {
+        max_flows: 1,
+        ..settings()
+    });
+    let (server, _) = echo_server("127.0.0.1:0");
+    relay.write(&Frame::Send {
+        flow: 1,
+        peer: server,
+        data: b"kept",
+    });
+    relay.expect(is_recv);
+    // Far more small datagrams for refused flows than control frames the relay allows.
+    let mut flood = Vec::new();
+    for round in 0..20_000u32 {
+        proto::encode(
+            &Frame::Send {
+                flow: 2 + round % 3,
+                peer: server,
+                data: b"x",
+            },
+            &mut flood,
+        );
+    }
+    relay.write_raw(&flood);
+    let closes = std::cell::RefCell::new(Vec::new());
+    relay.write(&Frame::Ping {
+        sequence: 9,
+        time_us: 1,
+    });
+    relay.expect(|frame| {
+        if let Frame::Close { flow, reason } = frame {
+            closes.borrow_mut().push((*flow, *reason));
+        }
+        matches!(frame, Frame::Pong { sequence: 9, .. })
+    });
+    let mut closes = closes.into_inner();
+    closes.sort_by_key(|(flow, _)| *flow);
+    assert_eq!(
+        closes,
+        [2, 3, 4].map(|flow| (flow, CloseReason::Limit)),
+        "one CLOSE per refused flow"
+    );
+    // The working flow is untouched.
+    relay.write(&Frame::Send {
+        flow: 1,
+        peer: server,
+        data: b"still",
+    });
+    let answer = relay.expect(is_recv);
+    assert_eq!(received(&answer).2, b"echo:still");
+}
+
+#[test]
+fn flows_are_capped_by_the_descriptors_the_relay_may_open() {
+    use std::os::unix::process::CommandExt;
+    let mut command = command();
+    // SAFETY: setrlimit is async-signal-safe and touches only the child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: 64,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut relay = Relay::spawn(command);
+    relay.write(&Frame::Hello {
+        version: VERSION,
+        settings: Settings {
+            max_flows: 1024,
+            ..settings()
+        },
+    });
+    let answer = relay.expect(|frame| matches!(frame, Frame::HelloOk { .. }));
+    let Frame::HelloOk { settings, .. } = proto::parse(&answer).unwrap().unwrap().0 else {
+        unreachable!()
+    };
+    assert_eq!(settings.max_flows, 64 - 32);
 }

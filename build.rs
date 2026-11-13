@@ -7,6 +7,28 @@ const RELAYS: [(&str, u16); 2] = [("x86_64", 62), ("aarch64", 183)];
 
 /// Embeds the relay binaries from `KROT_RELAY_DIR` with their SHA-256. Without the directory
 /// the client is built without them, and UDP through the server is unavailable.
+/// Whether a 64-bit little-endian ELF asks for a program interpreter (`PT_INTERP`), as
+/// dynamically linked executables do. Malformed program headers count as "yes".
+fn needs_interpreter(elf: &[u8]) -> bool {
+    const PT_INTERP: u32 = 3;
+    let u16_at = |at: usize| {
+        elf.get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let u64_at = |at: usize| {
+        elf.get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    };
+    let (Some(offset), Some(size), Some(count)) = (u64_at(32), u16_at(54), u16_at(56)) else {
+        return true;
+    };
+    (0..usize::from(count)).any(|index| {
+        let at = offset as usize + index * usize::from(size);
+        elf.get(at..at + 4)
+            .is_none_or(|kind| u32::from_le_bytes(kind.try_into().unwrap()) == PT_INTERP)
+    })
+}
+
 fn embed_relays() {
     println!("cargo:rerun-if-env-changed=KROT_RELAY_DIR");
     println!("cargo:rerun-if-env-changed=KROT_REQUIRE_RELAY");
@@ -17,17 +39,31 @@ fn embed_relays() {
         for (arch, machine) in RELAYS {
             let path = directory.join(format!("krot-relay-{arch}"));
             println!("cargo:rerun-if-changed={}", path.display());
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // A misnamed or unreadable file must not pass unnoticed.
+                    println!(
+                        "cargo:warning=KROT_RELAY_DIR has no usable {}: {error}; UDP through \
+                         the server will not work on {arch} servers",
+                        path.display()
+                    );
+                    continue;
+                }
             };
             // A static ELF executable for the named architecture, not a swapped or host build.
             assert!(
-                bytes.len() > 20
+                bytes.len() > 64
                     && bytes[..4] == *b"\x7fELF"
                     && bytes[4] == 2
                     && bytes[5] == 1
                     && u16::from_le_bytes([bytes[18], bytes[19]]) == machine,
                 "{} is not a 64-bit little-endian ELF for {arch}",
+                path.display()
+            );
+            assert!(
+                !needs_interpreter(&bytes),
+                "{} is dynamically linked; the relay must be a static musl build",
                 path.display()
             );
             let path = path

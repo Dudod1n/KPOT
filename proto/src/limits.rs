@@ -21,6 +21,11 @@ pub const MAX_IDLE: Duration = Duration::from_secs(600);
 /// Datagrams and bytes waiting for one flow socket in the relay.
 pub const FLOW_QUEUE_DATAGRAMS: usize = 256;
 pub const FLOW_QUEUE_BYTES: usize = 512 * 1024;
+/// Bytes waiting for all flow sockets of a relay together, so that many slow flows cannot
+/// exhaust a small server's memory.
+pub const RELAY_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// File descriptors a relay keeps for itself besides its flow sockets.
+pub const RELAY_RESERVED_DESCRIPTORS: u64 = 32;
 /// Datagrams and bytes waiting to be written to the channel, on either side.
 pub const CHANNEL_QUEUE_DATAGRAMS: usize = 4096;
 pub const CHANNEL_QUEUE_BYTES: usize = 4 * 1024 * 1024;

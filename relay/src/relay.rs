@@ -5,7 +5,7 @@
 //! being sent, and datagrams towards the client stop once `IN_FLIGHT_WINDOW` bytes are
 //! unacknowledged, so they wait here, where expiry applies, and not in SSH or TCP buffers.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     ops::Range,
@@ -18,7 +18,8 @@ use krot_udp_proto::{
     limits::{
         ACK_INTERVAL, CHANNEL_QUEUE_BYTES, CHANNEL_QUEUE_DATAGRAMS, DATAGRAM_EXPIRY,
         FLOW_QUEUE_BYTES, FLOW_QUEUE_DATAGRAMS, HELLO_TIMEOUT, IN_FLIGHT_WINDOW, MAX_IDLE,
-        MIN_IDLE, RELAY_MAX_FLOWS, REPORT_INTERVAL, WRITE_BATCH,
+        MIN_IDLE, RELAY_MAX_FLOWS, RELAY_QUEUE_BYTES, RELAY_RESERVED_DESCRIPTORS, REPORT_INTERVAL,
+        WRITE_BATCH,
     },
     metrics::DropReason,
 };
@@ -30,6 +31,10 @@ const READ_CHUNK: usize = 256 * 1024;
 const READS_PER_ROUND: usize = 64;
 /// Control frames waiting for stdout; a client that makes more is not following the protocol.
 const MAX_CONTROL: usize = 8192;
+/// Peers a flow remembers having sent to; answers from them keep the flow alive.
+const MAX_PEERS: usize = 32;
+/// Refused flow ids remembered so that each is answered by one `CLOSE` only.
+const MAX_REFUSED: usize = 65_536;
 
 enum Exit {
     /// stdin closed: the SSH channel is gone.
@@ -63,9 +68,12 @@ struct Flow {
     dual: bool,
     queue: VecDeque<Outgoing>,
     queued_bytes: usize,
+    /// The last datagram of the application, or answer from a peer it sent to.
     last: Instant,
     sent: bool,
+    /// A peer the flow sent to has answered.
     received: bool,
+    peers: Vec<SocketAddr>,
 }
 
 /// A datagram frame for the client and when it was queued.
@@ -113,6 +121,13 @@ struct Relay {
     report_at: Instant,
     stats: RelayStats,
     scratch: Vec<u8>,
+    chunk: Vec<u8>,
+    /// Flows refused with `CLOSE`: further datagrams of them are dropped quietly.
+    refused: HashSet<u32>,
+    /// Bytes waiting in all flow queues together.
+    flow_bytes: usize,
+    /// Flows the descriptor limit allows, besides the relay's own descriptors.
+    descriptor_flows: u16,
 }
 
 fn last_error() -> io::Error {
@@ -191,6 +206,28 @@ fn open_socket() -> io::Result<(UdpSocket, bool)> {
     Ok((socket, false))
 }
 
+/// Raises the soft limit of open files to the hard one and tells how many flow sockets fit.
+fn descriptor_flows() -> u16 {
+    // SAFETY: plain value structures passed to getrlimit/setrlimit.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return RELAY_MAX_FLOWS;
+    }
+    if limit.rlim_cur < limit.rlim_max {
+        let raised = libc::rlimit {
+            rlim_cur: limit.rlim_max,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: as above.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            limit = raised;
+        }
+    }
+    let usable = (limit.rlim_cur as u64).saturating_sub(RELAY_RESERVED_DESCRIPTORS);
+    usable.min(u64::from(RELAY_MAX_FLOWS)) as u16
+}
+
 fn target(peer: SocketAddr, dual: bool) -> SocketAddr {
     match peer.ip() {
         IpAddr::V4(ip) if dual => SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), peer.port()),
@@ -236,10 +273,15 @@ impl Relay {
             report_at: now + REPORT_INTERVAL,
             stats: RelayStats::default(),
             scratch: vec![0; 65_536],
+            chunk: vec![0; READ_CHUNK],
+            refused: HashSet::new(),
+            flow_bytes: 0,
+            descriptor_flows: RELAY_MAX_FLOWS,
         }
     }
 
     fn serve(&mut self) -> Result<(), Exit> {
+        self.descriptor_flows = descriptor_flows();
         set_nonblocking(STDIN).map_err(|_| Exit::Io)?;
         set_nonblocking(STDOUT).map_err(|_| Exit::Io)?;
         let mut descriptors: Vec<libc::pollfd> = Vec::new();
@@ -353,8 +395,24 @@ impl Relay {
                 })
                 .map(|(id, _)| *id)
                 .collect();
+            // Stale datagrams leave the queues without waiting for their socket to drain.
+            let mut stale = 0;
+            for flow in self.flows.values_mut() {
+                while flow.queue.front().is_some_and(|queued| {
+                    now.saturating_duration_since(queued.at) > DATAGRAM_EXPIRY
+                }) {
+                    if let Some(old) = flow.queue.pop_front() {
+                        flow.queued_bytes -= old.data.len();
+                        self.flow_bytes -= old.data.len();
+                        stale += 1;
+                    }
+                }
+            }
+            for _ in 0..stale {
+                self.stats.drops.add(DropReason::Expired);
+            }
             for flow in expired {
-                self.flows.remove(&flow);
+                self.remove_flow(flow);
                 self.push_control(&Frame::Close {
                     flow,
                     reason: CloseReason::Idle,
@@ -365,6 +423,12 @@ impl Relay {
             self.stats.to_network_delay = Default::default();
             self.stats.to_client_delay = Default::default();
             self.push_control(&Frame::Stats(Box::new(stats)));
+        }
+    }
+
+    fn remove_flow(&mut self, id: u32) {
+        if let Some(flow) = self.flows.remove(&id) {
+            self.flow_bytes -= flow.queued_bytes;
         }
     }
 
@@ -379,16 +443,13 @@ impl Relay {
             self.input.drain(..self.input_start);
             self.input_start = 0;
         }
-        let length = self.input.len();
-        self.input.resize(length + READ_CHUNK, 0);
-        let result = read_fd(STDIN, &mut self.input[length..]);
-        let count = match result {
+        let count = match read_fd(STDIN, &mut self.chunk) {
             Ok(0) => return Err(Exit::Done),
             Ok(count) => count,
             Err(error) if would_block(&error) => 0,
             Err(_) => return Err(Exit::Io),
         };
-        self.input.truncate(length + count);
+        self.input.extend_from_slice(&self.chunk[..count]);
         let input = std::mem::take(&mut self.input);
         let result = self.consume(&input);
         self.input = input;
@@ -423,7 +484,11 @@ impl Relay {
                             .as_millis() as u32
                     };
                     let settings = Settings {
-                        max_flows: settings.max_flows.clamp(1, RELAY_MAX_FLOWS),
+                        max_flows: settings
+                            .max_flows
+                            .min(RELAY_MAX_FLOWS)
+                            .min(self.descriptor_flows)
+                            .max(1),
                         idle_ms: clamp(settings.idle_ms),
                         idle_bidirectional_ms: clamp(settings.idle_bidirectional_ms),
                     };
@@ -439,7 +504,8 @@ impl Relay {
                     self.send(settings, flow, peer, data, now);
                 }
                 (Some(_), Frame::Close { flow, .. }) => {
-                    self.flows.remove(&flow);
+                    self.remove_flow(flow);
+                    self.refused.remove(&flow);
                 }
                 (Some(_), Frame::Ping { sequence, time_us }) => {
                     self.control.push_back(Control::Pong {
@@ -460,8 +526,18 @@ impl Relay {
 
     fn send(&mut self, settings: Settings, id: u32, peer: SocketAddr, data: &[u8], now: Instant) {
         if !self.flows.contains_key(&id) {
+            // One `CLOSE` per refused flow, not one per datagram: datagrams that were already
+            // on their way are dropped quietly.
+            if self.refused.contains(&id) {
+                self.stats.drops.add(DropReason::Channel);
+                return;
+            }
+            if self.refused.len() >= MAX_REFUSED {
+                self.refused.clear();
+            }
             if self.flows.len() >= usize::from(settings.max_flows) {
                 self.stats.flows_refused += 1;
+                self.refused.insert(id);
                 self.push_control(&Frame::Close {
                     flow: id,
                     reason: CloseReason::Limit,
@@ -470,6 +546,7 @@ impl Relay {
             }
             let Ok((socket, dual)) = open_socket() else {
                 self.stats.drops.add(DropReason::Channel);
+                self.refused.insert(id);
                 self.push_control(&Frame::Close {
                     flow: id,
                     reason: CloseReason::Socket,
@@ -487,6 +564,7 @@ impl Relay {
                     last: now,
                     sent: false,
                     received: false,
+                    peers: Vec::new(),
                 },
             );
         }
@@ -495,6 +573,13 @@ impl Relay {
         };
         flow.last = now;
         flow.sent = true;
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+        if !flow.peers.contains(&peer) {
+            if flow.peers.len() == MAX_PEERS {
+                flow.peers.remove(0);
+            }
+            flow.peers.push(peer);
+        }
         if flow.queue.is_empty() {
             match flow.socket.send_to(data, target(peer, flow.dual)) {
                 Ok(_) => {
@@ -512,14 +597,22 @@ impl Relay {
         }
         while flow.queue.len() >= FLOW_QUEUE_DATAGRAMS
             || flow.queued_bytes + data.len() > FLOW_QUEUE_BYTES
+            || self.flow_bytes + data.len() > RELAY_QUEUE_BYTES
         {
             let Some(old) = flow.queue.pop_front() else {
                 break;
             };
             flow.queued_bytes -= old.data.len();
+            self.flow_bytes -= old.data.len();
             self.stats.drops.add(DropReason::Overflow);
         }
+        // The shared budget is held by other flows: this datagram does not fit.
+        if self.flow_bytes + data.len() > RELAY_QUEUE_BYTES {
+            self.stats.drops.add(DropReason::Overflow);
+            return;
+        }
         flow.queued_bytes += data.len();
+        self.flow_bytes += data.len();
         flow.queue.push_back(Outgoing {
             peer,
             data: data.to_vec(),
@@ -535,6 +628,7 @@ impl Relay {
             let waited = datagram.at.elapsed();
             if waited > DATAGRAM_EXPIRY {
                 flow.queued_bytes -= datagram.data.len();
+                self.flow_bytes -= datagram.data.len();
                 self.stats.drops.add(DropReason::Expired);
                 continue;
             }
@@ -554,6 +648,7 @@ impl Relay {
                 Err(error) => self.stats.drops.add(send_error(&error)),
             }
             flow.queued_bytes -= datagram.data.len();
+            self.flow_bytes -= datagram.data.len();
         }
     }
 
@@ -569,8 +664,13 @@ impl Relay {
                 Err(_) => continue,
             };
             let now = Instant::now();
-            flow.last = now;
-            flow.received = true;
+            // Unsolicited datagrams still reach the client, as STUN needs, but only answers
+            // from peers the flow sent to keep it alive: strangers cannot hold it open.
+            let canonical = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+            if flow.peers.contains(&canonical) {
+                flow.last = now;
+                flow.received = true;
+            }
             self.stats.from_network_datagrams += 1;
             self.stats.from_network_bytes += length as u64;
             if length > proto::MAX_PAYLOAD {
