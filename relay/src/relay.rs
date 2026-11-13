@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
+    ops::Range,
     os::fd::{AsRawFd, FromRawFd, RawFd},
     time::{Duration, Instant},
 };
@@ -42,8 +43,7 @@ enum Exit {
 }
 
 pub fn run() -> i32 {
-    let result = Relay::new().and_then(|mut relay| relay.serve());
-    match result {
+    match Relay::new().serve() {
         Ok(()) | Err(Exit::Done) => 0,
         Err(Exit::Protocol) => 3,
         Err(Exit::Io) => 4,
@@ -74,6 +74,12 @@ struct Pending {
     at: Instant,
 }
 
+/// The position and original enqueue time of a datagram in the stdout batch.
+struct OutputDatagram {
+    bytes: Range<usize>,
+    at: Instant,
+}
+
 enum Control {
     Frame(Vec<u8>),
     /// Encoded when written, so that it reports how long it waited.
@@ -96,7 +102,8 @@ struct Relay {
     /// The batch being written to stdout and how much of it is written.
     output: Vec<u8>,
     written: usize,
-    /// Datagram frame bytes written to and acknowledged by the client.
+    output_datagrams: VecDeque<OutputDatagram>,
+    /// Bytes in complete datagram frames written to stdout and acknowledged by the client.
     sent_bytes: u64,
     acked_bytes: u64,
     /// Datagram frame bytes received from the client and the value last acknowledged.
@@ -207,11 +214,9 @@ fn send_error(error: &io::Error) -> DropReason {
 }
 
 impl Relay {
-    fn new() -> Result<Self, Exit> {
-        set_nonblocking(STDIN).map_err(|_| Exit::Io)?;
-        set_nonblocking(STDOUT).map_err(|_| Exit::Io)?;
+    fn new() -> Self {
         let now = Instant::now();
-        Ok(Self {
+        Self {
             settings: None,
             started: now,
             input: Vec::with_capacity(READ_CHUNK),
@@ -222,6 +227,7 @@ impl Relay {
             data_bytes: 0,
             output: Vec::with_capacity(WRITE_BATCH + proto::MAX_FRAME),
             written: 0,
+            output_datagrams: VecDeque::new(),
             sent_bytes: 0,
             acked_bytes: 0,
             received_bytes: 0,
@@ -230,10 +236,12 @@ impl Relay {
             report_at: now + REPORT_INTERVAL,
             stats: RelayStats::default(),
             scratch: vec![0; 65_536],
-        })
+        }
     }
 
     fn serve(&mut self) -> Result<(), Exit> {
+        set_nonblocking(STDIN).map_err(|_| Exit::Io)?;
+        set_nonblocking(STDOUT).map_err(|_| Exit::Io)?;
         let mut descriptors: Vec<libc::pollfd> = Vec::new();
         let mut owners: Vec<u32> = Vec::new();
         loop {
@@ -242,7 +250,7 @@ impl Relay {
                 return Err(Exit::Protocol);
             }
             self.tick(now);
-            self.flush()?;
+            self.flush(STDOUT)?;
 
             descriptors.clear();
             owners.clear();
@@ -563,10 +571,14 @@ impl Relay {
             let now = Instant::now();
             flow.last = now;
             flow.received = true;
-            let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-            let data = &self.scratch[..length.min(proto::MAX_PAYLOAD)];
             self.stats.from_network_datagrams += 1;
-            self.stats.from_network_bytes += data.len() as u64;
+            self.stats.from_network_bytes += length as u64;
+            if length > proto::MAX_PAYLOAD {
+                self.stats.drops.add(DropReason::Size);
+                continue;
+            }
+            let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+            let data = &self.scratch[..length];
             let mut frame = Vec::with_capacity(proto::datagram_frame_size(&peer, data.len()));
             proto::encode(
                 &Frame::Recv {
@@ -591,10 +603,9 @@ impl Relay {
     }
 
     /// Fills the next batch: control frames first, then datagrams the window allows.
-    fn fill(&mut self) {
+    fn fill(&mut self, now: Instant) {
         self.output.clear();
         self.written = 0;
-        let now = Instant::now();
         while let Some(control) = self.control.pop_front() {
             match control {
                 Control::Frame(frame) => self.output.extend_from_slice(&frame),
@@ -612,15 +623,14 @@ impl Relay {
                 ),
             }
         }
+        let mut in_flight = self.sent_bytes - self.acked_bytes;
         while self.output.len() < WRITE_BATCH {
             let Some(pending) = self.data.front() else {
                 break;
             };
             let waited = now.duration_since(pending.at);
             let size = pending.frame.len() as u64;
-            if waited <= DATAGRAM_EXPIRY
-                && self.sent_bytes - self.acked_bytes + size > IN_FLIGHT_WINDOW
-            {
+            if waited <= DATAGRAM_EXPIRY && in_flight + size > IN_FLIGHT_WINDOW {
                 break;
             }
             let Some(pending) = self.data.pop_front() else {
@@ -631,23 +641,84 @@ impl Relay {
                 self.stats.drops.add(DropReason::Expired);
                 continue;
             }
-            self.stats.to_client_delay.record(waited);
-            self.sent_bytes += size;
+            let start = self.output.len();
             self.output.extend_from_slice(&pending.frame);
+            self.output_datagrams.push_back(OutputDatagram {
+                bytes: start..self.output.len(),
+                at: pending.at,
+            });
+            in_flight += size;
         }
     }
 
+    fn drop_expired_output(&mut self, now: Instant) {
+        // Finish a partially written frame to preserve framing. The remaining datagrams
+        // follow in enqueue order, so the expired ones occupy a single contiguous range.
+        let first_unstarted = usize::from(
+            self.output_datagrams
+                .front()
+                .is_some_and(|datagram| datagram.bytes.start < self.written),
+        );
+        let expired = self
+            .output_datagrams
+            .iter()
+            .skip(first_unstarted)
+            .take_while(|datagram| now.duration_since(datagram.at) > DATAGRAM_EXPIRY)
+            .count();
+        if expired == 0 {
+            return;
+        }
+        let end = first_unstarted + expired;
+        let removed = self.output_datagrams[first_unstarted].bytes.start
+            ..self.output_datagrams[end - 1].bytes.end;
+        let removed_bytes = removed.len();
+        self.output.drain(removed);
+        for _ in self.output_datagrams.drain(first_unstarted..end) {
+            self.stats.drops.add(DropReason::Expired);
+        }
+        for datagram in self.output_datagrams.iter_mut().skip(first_unstarted) {
+            datagram.bytes.start -= removed_bytes;
+            datagram.bytes.end -= removed_bytes;
+        }
+    }
+
+    fn record_write(&mut self, count: usize, now: Instant) {
+        let end = self.written + count;
+        while let Some(datagram) = self.output_datagrams.front() {
+            if datagram.bytes.start >= end {
+                break;
+            }
+            if datagram.bytes.start >= self.written {
+                self.stats
+                    .to_client_delay
+                    .record(now.duration_since(datagram.at));
+            }
+            if datagram.bytes.end > end {
+                break;
+            }
+            self.sent_bytes += datagram.bytes.len() as u64;
+            self.output_datagrams.pop_front();
+        }
+        self.written = end;
+    }
+
     /// Writes until stdout would block or nothing is left to write.
-    fn flush(&mut self) -> Result<(), Exit> {
+    fn flush(&mut self, stdout: RawFd) -> Result<(), Exit> {
         loop {
             if self.written == self.output.len() {
-                self.fill();
+                self.fill(Instant::now());
                 if self.output.is_empty() {
                     return Ok(());
                 }
             }
-            match write_fd(STDOUT, &self.output[self.written..]) {
-                Ok(count) => self.written += count,
+            let now = Instant::now();
+            self.drop_expired_output(now);
+            if self.written == self.output.len() {
+                continue;
+            }
+            match write_fd(stdout, &self.output[self.written..]) {
+                Ok(0) => return Err(Exit::Io),
+                Ok(count) => self.record_write(count, now),
                 Err(error) if would_block(&error) => return Ok(()),
                 Err(_) => return Err(Exit::Io),
             }
@@ -658,7 +729,7 @@ impl Relay {
     fn flush_all(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
-            if self.flush().is_err() {
+            if self.flush(STDOUT).is_err() {
                 return;
             }
             if self.written == self.output.len() && self.control.is_empty() {
@@ -666,5 +737,101 @@ impl Relay {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn queue_reply(relay: &mut Relay, data: &[u8], at: Instant) -> Vec<u8> {
+        let mut frame = Vec::new();
+        proto::encode(
+            &Frame::Recv {
+                flow: 1,
+                peer: "127.0.0.1:9".parse().unwrap(),
+                data,
+            },
+            &mut frame,
+        );
+        relay.data_bytes += frame.len();
+        relay.data.push_back(Pending {
+            frame: frame.clone(),
+            at,
+        });
+        frame
+    }
+
+    #[test]
+    fn full_stdout_drops_an_expired_datagram_before_writing_it() {
+        let (mut reader, writer) = io::pipe().unwrap();
+        let stdout = writer.as_raw_fd();
+        set_nonblocking(stdout).unwrap();
+        set_nonblocking(reader.as_raw_fd()).unwrap();
+        // SAFETY: the pipe writer is open and F_GETPIPE_SZ takes no additional argument.
+        let capacity = unsafe { libc::fcntl(stdout, libc::F_GETPIPE_SZ) };
+        assert!(capacity > 0);
+        let mut filler = vec![0; capacity as usize];
+        assert_eq!(write_fd(stdout, &filler).unwrap(), filler.len());
+
+        let mut relay = Relay::new();
+        let expired = queue_reply(&mut relay, b"stale", Instant::now());
+        assert!(relay.flush(stdout).is_ok());
+        assert_eq!(relay.output, expired);
+        assert_eq!(relay.written, 0);
+
+        std::thread::sleep(DATAGRAM_EXPIRY * 2);
+        reader.read_exact(&mut filler).unwrap();
+        assert!(relay.flush(stdout).is_ok());
+        assert!(
+            matches!(reader.read(&mut [0; 1]), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "expired datagram reached stdout"
+        );
+        assert_eq!(relay.stats.drops.get(DropReason::Expired), 1);
+        assert_eq!(relay.sent_bytes, 0);
+        assert_eq!(relay.stats.to_client_delay.count(), 0);
+
+        let fresh = queue_reply(&mut relay, b"fresh", Instant::now());
+        assert!(relay.flush(stdout).is_ok());
+        let mut received = vec![0; fresh.len()];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(received, fresh);
+        assert_eq!(relay.sent_bytes, fresh.len() as u64);
+        assert_eq!(relay.stats.to_client_delay.count(), 1);
+    }
+
+    #[test]
+    fn dropping_expired_output_preserves_partial_and_fresh_frames() {
+        let mut relay = Relay::new();
+        let queued = Instant::now();
+        let first_write = queued + DATAGRAM_EXPIRY / 2;
+        let retry = queued + DATAGRAM_EXPIRY + Duration::from_millis(1);
+
+        let control = Frame::Ack { received: 42 };
+        relay.push_control(&control);
+        let started = queue_reply(&mut relay, b"started", queued);
+        queue_reply(&mut relay, b"stale", queued);
+        let fresh = queue_reply(&mut relay, b"fresh", first_write);
+        relay.fill(first_write);
+
+        let mut expected = Vec::new();
+        proto::encode(&control, &mut expected);
+        let written = expected.len() + 1;
+        relay.record_write(written, first_write);
+        assert_eq!(relay.sent_bytes, 0);
+        assert_eq!(relay.stats.to_client_delay.count(), 1);
+
+        relay.drop_expired_output(retry);
+        expected.extend_from_slice(&started);
+        expected.extend_from_slice(&fresh);
+        assert_eq!(relay.output, expected);
+        assert_eq!(relay.written, written);
+        assert_eq!(relay.stats.drops.get(DropReason::Expired), 1);
+
+        relay.record_write(expected.len() - written, retry);
+        assert_eq!(relay.sent_bytes, (started.len() + fresh.len()) as u64);
+        assert_eq!(relay.stats.to_client_delay.count(), 2);
+        assert!(relay.output_datagrams.is_empty());
     }
 }
