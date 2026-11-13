@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
 import time
 from uuid import uuid4
@@ -231,6 +232,12 @@ def unused_port():
         return sock.getsockname()[1]
 
 
+def kill_group(process):
+    """Stop a command started by `run_command` together with everything it started."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+
+
 class Server(asyncssh.SSHServer):
     def __init__(self, owner, password, client_key):
         self.owner, self.password, self.client_key = owner, password, client_key
@@ -280,16 +287,19 @@ class SSHFixtures:
     async def run_command(self, process, home):
         """Run an exec request with the local /bin/sh, as a server account with `home`."""
         env = {'HOME': str(home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        # A process group of its own: the shell may stay as a parent of the relay, and
+        # stopping the command must stop both, as sshd does when a session ends.
         local = await asyncio.create_subprocess_shell(
             process.command, env=env, stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
         self.commands.append((process.command, local))
         try:
             await process.redirect(stdin=local.stdin, stdout=local.stdout, stderr=local.stderr)
             process.exit(await local.wait())
         finally:
             if local.returncode is None:
-                local.kill()
+                kill_group(local)
                 await local.wait()
 
     async def server(self, *, port=0, key=None, password=None, client_key=None, shell_home=None):

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tests'))
 
 import asyncssh
-from ssh_support import Client, Config, Endpoint, Frames, SSHFixtures, Store, attach_udp
+from ssh_support import Client, Config, Endpoint, Frames, SSHFixtures, Store, attach_udp, kill_group
 
 BINARY = Path(os.environ.get('KROT_RUST_BIN', ROOT / 'target' / 'debug' / ('krot-cli.exe' if os.name == 'nt' else 'krot-cli'))).resolve()
 
@@ -139,6 +139,9 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
                     return snapshot, runtime
                 await asyncio.sleep(.05)
 
+    # The test server runs commands with the local /bin/sh and the embedded relay is a Linux
+    # program, so these scenarios need Linux; the Windows client path has its own checks.
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell and relay')
     async def test_udp_relay_is_uploaded_started_and_restarted_without_touching_tcp(self):
         home = self.path / 'server-home'
         home.mkdir()
@@ -182,7 +185,7 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         running = [process for command, process in self.commands
                    if 'exec "$f"' in command and process.returncode is None]
         self.assertEqual(len(running), 1)
-        running[0].kill()
+        kill_group(running[0])
         # The restart can be faster than polling, so the start counter tells it happened.
         async with asyncio.timeout(30):
             while True:
@@ -202,6 +205,9 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         settings = json.loads(self.store.path.with_name('config.json.udp.json').read_text('utf-8'))
         self.assertEqual(settings['tunnels'], {})
 
+    # The test server runs commands with the local /bin/sh and the embedded relay is a Linux
+    # program, so these scenarios need Linux; the Windows client path has its own checks.
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell and relay')
     async def test_helper_datagram_travels_through_ssh_and_the_relay_and_back(self):
         home = self.path / 'server-home'
         home.mkdir()
