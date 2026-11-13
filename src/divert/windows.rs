@@ -17,8 +17,13 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
-    NetworkManagement::IpHelper::{GetExtendedTcpTable, GetExtendedUdpTable},
+    Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    },
+    NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+        MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
+    },
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -41,7 +46,8 @@ use windows_sys::Win32::{
 use super::{
     DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
     link::{INBOUND_QUEUE, Inbound, Link},
-    table_owner,
+    owners::{UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners, endpoint_owners},
+    tcp_table_owner,
     udp::{self, Policy},
 };
 use crate::{
@@ -58,11 +64,24 @@ const OUTBOUND: u32 = 1 << 17;
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 23;
 const TCP_TABLE_OWNER_PID_ALL: i32 = 5;
-const UDP_TABLE_OWNER_PID: i32 = 1;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const PORT_TTL: Duration = Duration::from_secs(2);
+const PARENT_TTL: Duration = Duration::from_secs(2);
 const SYNC_TIME: Duration = Duration::from_secs(1);
 const MAX_PENDING_LOGS: usize = 500;
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    // The platform-neutral parser in `owners` relies on these layouts.
+    assert!(offset_of!(MIB_UDPTABLE_OWNER_PID, table) == UDP_TABLE_HEADER);
+    assert!(offset_of!(MIB_UDP6TABLE_OWNER_PID, table) == UDP_TABLE_HEADER);
+    assert!(size_of::<MIB_UDPROW_OWNER_PID>() == UDP4_ROW_SIZE);
+    assert!(size_of::<MIB_UDP6ROW_OWNER_PID>() == UDP6_ROW_SIZE);
+    assert!(offset_of!(MIB_UDPROW_OWNER_PID, dwLocalPort) == 4);
+    assert!(offset_of!(MIB_UDPROW_OWNER_PID, dwOwningPid) == 8);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwLocalScopeId) == 16);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwLocalPort) == 20);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwOwningPid) == 24);
+};
 
 /// `WINDIVERT_ADDRESS`: timestamp, a bit field, a reserved word and 64 bytes of layer data.
 /// For the network layer the data starts with the interface and subinterface indexes, which
@@ -74,6 +93,13 @@ struct Address {
     flags: u32,
     reserved: u32,
     data: [u8; 64],
+}
+
+impl Address {
+    fn interface_index(&self) -> u32 {
+        // The NETWORK layer starts its address data with WINDIVERT_DATA_NETWORK.IfIdx.
+        u32::from_ne_bytes(*self.data.first_chunk::<4>().unwrap())
+    }
 }
 
 type Symbol = unsafe extern "system" fn() -> isize;
@@ -221,7 +247,7 @@ impl Processes for System {
         let mut cached = self.parents.borrow_mut();
         if cached
             .as_ref()
-            .is_none_or(|(_, at)| at.elapsed() > PORT_TTL)
+            .is_none_or(|(_, at)| at.elapsed() > PARENT_TTL)
         {
             *cached = Some((parents(), Instant::now()));
         }
@@ -229,55 +255,65 @@ impl Processes for System {
     }
 }
 
-fn port_owner(tcp: bool, origin: &Origin) -> Option<u32> {
-    let read = |family: u32| {
-        let mut size = 0u32;
-        let mut table: Vec<u8> = Vec::new();
-        for _ in 0..4 {
-            // SAFETY: the buffer is at least `size` bytes; the call reports the size it needs.
-            let status = unsafe {
-                if tcp {
-                    GetExtendedTcpTable(
-                        table.as_mut_ptr().cast(),
-                        &mut size,
-                        0,
-                        family,
-                        TCP_TABLE_OWNER_PID_ALL,
-                        0,
-                    )
-                } else {
-                    GetExtendedUdpTable(
-                        table.as_mut_ptr().cast(),
-                        &mut size,
-                        0,
-                        family,
-                        UDP_TABLE_OWNER_PID,
-                        0,
-                    )
-                }
-            };
-            if status == 0 {
-                return table;
+fn read_port_table(tcp: bool, v6: bool, table: &mut Vec<u8>) -> Option<&[u8]> {
+    let family = if v6 { AF_INET6 } else { AF_INET };
+    for _ in 0..4 {
+        let mut size = table.len() as u32;
+        // SAFETY: the buffer is at least `size` bytes; the call reports the size it needs.
+        let status = unsafe {
+            if tcp {
+                GetExtendedTcpTable(
+                    table.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    family,
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                )
+            } else {
+                GetExtendedUdpTable(
+                    table.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    family,
+                    UDP_TABLE_OWNER_PID,
+                    0,
+                )
             }
-            table = vec![0u8; size as usize + 4096];
-            size = table.len() as u32;
+        };
+        match status {
+            0 => return table.get(..size as usize),
+            ERROR_INSUFFICIENT_BUFFER => table.resize(size.saturating_add(4096) as usize, 0),
+            _ => return None,
         }
-        Vec::new()
-    };
-    let families = if origin.v6 {
-        [(AF_INET6, true), (AF_INET, false)]
-    } else {
-        [(AF_INET, false), (AF_INET6, true)]
-    };
-    families.into_iter().find_map(|(family, v6)| {
-        table_owner(
-            &read(family),
-            tcp,
-            v6,
-            origin.local_port,
-            origin.remote_port,
-        )
+    }
+    None
+}
+
+fn tcp_port_owner(origin: &Origin, buffer: &mut Vec<u8>) -> Option<u32> {
+    let v6 = origin.local.is_ipv6();
+    [v6, !v6].into_iter().find_map(|v6| {
+        let table = read_port_table(true, v6, buffer)?;
+        tcp_table_owner(table, v6, origin.local.port(), origin.remote_port)
     })
+}
+
+/// The rules of the processes whose sockets may have sent from `local`; `None` when the system
+/// tables could not be read.
+fn udp_owner_rules(
+    local: SocketAddr,
+    ipv4: &mut Vec<u8>,
+    ipv6: &mut Vec<u8>,
+    mut rule: impl FnMut(u32) -> Option<String>,
+) -> Option<Vec<String>> {
+    let ipv4 = if local.is_ipv4() {
+        Some(read_port_table(false, false, ipv4)?)
+    } else {
+        None
+    };
+    let ipv6 = read_port_table(false, true, ipv6);
+    let pids = endpoint_owners(ipv4, ipv6, local)?;
+    Some(pids.into_iter().filter_map(&mut rule).collect())
 }
 
 struct Shared {
@@ -343,7 +379,12 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
     let mut generation = u64::MAX;
     let mut policy: HashMap<String, (Policy, Policy)> = HashMap::new();
     let mut quic_logged: HashSet<String> = HashSet::new();
-    let mut udp_ports: HashMap<(u16, bool), (Option<String>, Instant)> = HashMap::new();
+    // Rules whose application goes around its tunnel right now, because the tunnel is down.
+    let mut bypassing: HashSet<String> = HashSet::new();
+    let mut udp_owners = UdpOwners::default();
+    let mut port_table = vec![0u8; 4096];
+    let mut udp4_table = vec![0u8; 4096];
+    let mut udp6_table = vec![0u8; 4096];
     let mut buffer = vec![0u8; 40 + 0xffff];
     let mut purged = Instant::now();
     let mut failures = 0u32;
@@ -375,10 +416,20 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
         if current != generation {
             generation = current;
             let rules = shared.rules.lock().unwrap();
-            matcher.set_rules(&rules);
+            let before = matcher.rules.clone();
             policy = policies(&rules);
+            bypassing = policy
+                .iter()
+                .filter(|(_, (_, fallback))| *fallback == Policy::Direct)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let all_bypass = rules.iter().all(|rule| bypassing.contains(&rule.id));
+            if matcher.set_rules(&rules) {
+                udp_owners.rules_changed(&|id| matcher.unchanged(&before, id), all_bypass);
+            } else {
+                udp_owners.set_all_bypass(all_bypass);
+            }
             drop(rules);
-            udp_ports.clear();
         }
         let data = &mut buffer[..length as usize];
         let linked = shared.link.up();
@@ -387,7 +438,7 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
             if now.duration_since(purged) > Duration::from_secs(10) {
                 purged = now;
                 nat.purge(now);
-                udp_ports.retain(|_, (_, at)| now.duration_since(*at) < PORT_TTL);
+                udp_owners.purge(now);
                 for id in shared.udp.lock().unwrap().purge(now) {
                     shared.link.close(id);
                 }
@@ -398,20 +449,25 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                 &mut nat,
                 now,
                 &mut |protocol, origin| {
+                    if matcher.rules.is_empty() {
+                        return None;
+                    }
                     if protocol == TCP {
-                        return matcher.decide(port_owner(true, origin)?, now, &system);
+                        let pid = tcp_port_owner(origin, &mut port_table)?;
+                        return matcher.decide(pid, now, &system);
                     }
-                    // Datagrams arrive in bursts: one lookup per local port every few seconds.
-                    let key = (origin.local_port, origin.v6);
-                    if let Some((rule, at)) = udp_ports.get(&key)
-                        && now.duration_since(*at) < PORT_TTL
+                    let mut local = origin.local;
+                    if let SocketAddr::V6(addr) = &mut local
+                        && addr.ip().is_unicast_link_local()
                     {
-                        return rule.clone();
+                        addr.set_scope_id(address.interface_index());
                     }
-                    let rule =
-                        port_owner(false, origin).and_then(|pid| matcher.decide(pid, now, &system));
-                    udp_ports.insert(key, (rule.clone(), now));
-                    rule
+                    // The rule as it is; `handle` applies whether it bypasses its tunnel.
+                    udp_owners.decide(local, now, &|rule| bypassing.contains(rule), || {
+                        udp_owner_rules(local, &mut udp4_table, &mut udp6_table, |pid| {
+                            matcher.decide(pid, now, &system)
+                        })
+                    })
                 },
                 &|rule| match policy.get(rule) {
                     Some((tunnel @ Policy::Tunnel { .. }, _)) if linked => *tunnel,

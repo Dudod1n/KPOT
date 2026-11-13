@@ -3,13 +3,15 @@
 //! everywhere; capturing and injecting packets is Windows-only (WinDivert).
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
 use crate::apps::{DivertRule, path_key};
 
 pub mod link;
+#[cfg(any(windows, test))]
+mod owners;
 pub mod udp;
 #[cfg(windows)]
 mod windows;
@@ -240,8 +242,7 @@ pub fn handle(
         return Verdict::Pass;
     };
     let view = Origin {
-        v6: packet.source.is_ipv6(),
-        local_port: packet.source_port,
+        local: SocketAddr::new(packet.source, packet.source_port),
         remote: packet.destination,
         remote_port: packet.destination_port,
     };
@@ -323,8 +324,7 @@ pub fn handle(
 /// What the owner lookup needs to know about a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Origin {
-    pub v6: bool,
-    pub local_port: u16,
+    pub local: SocketAddr,
     pub remote: IpAddr,
     pub remote_port: u16,
 }
@@ -349,7 +349,7 @@ impl Matcher {
             decisions: HashMap::new(),
         }
     }
-    pub fn set_rules(&mut self, rules: &[DivertRule]) {
+    pub fn set_rules(&mut self, rules: &[DivertRule]) -> bool {
         let next: Vec<_> = rules
             .iter()
             .map(|rule| (rule.id.clone(), path_key(&rule.path), rule.children))
@@ -359,7 +359,16 @@ impl Matcher {
         if next != self.rules {
             self.rules = next;
             self.decisions.clear();
+            return true;
         }
+        false
+    }
+    /// Whether rule `id` matches the same executables as it did with `before`, the rules this
+    /// matcher had before its last `set_rules`.
+    pub fn unchanged(&self, before: &[(String, String, bool)], id: &str) -> bool {
+        let find =
+            |rules: &[(String, String, bool)]| rules.iter().find(|rule| rule.0 == id).cloned();
+        find(before).is_some_and(|rule| Some(rule) == find(&self.rules))
     }
     pub fn decide(&mut self, pid: u32, now: Instant, processes: &dyn Processes) -> Option<String> {
         if self.rules.is_empty() {
@@ -411,33 +420,36 @@ impl Matcher {
     }
 }
 
-/// Finds the owner of a local port in a Windows `GetExtended*Table` buffer of the
-/// `OWNER_PID` classes: a `u32` row count followed by fixed-size rows.
+// Windows OWNER_PID tables contain a row count followed by fixed-size rows.
+#[cfg(any(windows, test))]
+fn owner_rows(table: &[u8], row_size: usize) -> impl Iterator<Item = &[u8]> {
+    let (count, rows) = table.split_first_chunk::<4>().unwrap_or((&[0; 4], &[]));
+    rows.chunks_exact(row_size)
+        .take(u32::from_le_bytes(*count) as usize)
+}
+
+#[cfg(any(windows, test))]
+fn table_port(row: &[u8], offset: usize) -> u16 {
+    // The network-order port occupies the first two bytes of the 32-bit field.
+    u16::from_be_bytes([row[offset], row[offset + 1]])
+}
+
+#[cfg(any(windows, test))]
+fn table_pid(row: &[u8]) -> u32 {
+    u32::from_le_bytes(*row.last_chunk::<4>().unwrap())
+}
+
 /// A TCP row that also matches the remote port wins over one that shares only the local port.
-pub fn table_owner(
-    table: &[u8],
-    tcp: bool,
-    v6: bool,
-    local_port: u16,
-    remote_port: u16,
-) -> Option<u32> {
-    // (row size, local port, remote port, pid) offsets as laid out by iphlpapi.
-    let (row, local, remote, pid) = match (tcp, v6) {
-        (true, false) => (24, 8, 16, 20),
-        (true, true) => (56, 20, 44, 52),
-        (false, false) => (12, 4, 0, 8),
-        (false, true) => (28, 20, 0, 24),
-    };
-    let count = u32::from_le_bytes(table.get(..4)?.try_into().ok()?) as usize;
-    // Ports are stored in network byte order in the low half of a 32-bit field.
-    let port = |row: &[u8], at: usize| u16::from_be_bytes([row[at], row[at + 1]]);
+#[cfg(any(windows, test))]
+fn tcp_table_owner(table: &[u8], v6: bool, local_port: u16, remote_port: u16) -> Option<u32> {
+    let (size, local, remote) = if v6 { (56, 20, 44) } else { (24, 8, 16) };
     let mut fallback = None;
-    for row in table[4..].chunks_exact(row).take(count) {
-        if port(row, local) != local_port {
+    for row in owner_rows(table, size) {
+        if table_port(row, local) != local_port {
             continue;
         }
-        let owner = u32::from_le_bytes([row[pid], row[pid + 1], row[pid + 2], row[pid + 3]]);
-        if !tcp || port(row, remote) == remote_port {
+        let owner = table_pid(row);
+        if table_port(row, remote) == remote_port {
             return Some(owner);
         }
         fallback.get_or_insert(owner);
@@ -821,6 +833,34 @@ mod tests {
     }
 
     #[test]
+    fn rule_changes_are_told_apart_from_unchanged_rules() {
+        let mut matcher = Matcher::new(r"C:\KROT\krot.exe");
+        assert!(matcher.set_rules(&[
+            rule("kept", r"C:\Apps\kept.exe", true),
+            rule("edited", r"C:\Apps\old.exe", true),
+            rule("removed", r"C:\Apps\gone.exe", true),
+        ]));
+        let before = matcher.rules.clone();
+        assert!(matcher.set_rules(&[
+            rule("kept", r"C:\Apps\kept.exe", true),
+            rule("edited", r"C:\Apps\new.exe", true),
+            rule("added", r"C:\Apps\added.exe", true),
+        ]));
+        assert!(matcher.unchanged(&before, "kept"));
+        for id in ["edited", "removed", "added", "unknown"] {
+            assert!(!matcher.unchanged(&before, id), "{id}");
+        }
+        // The same rules again are no change at all.
+        let same = matcher.rules.clone();
+        assert!(!matcher.set_rules(&[
+            rule("kept", r"C:\Apps\kept.exe", true),
+            rule("edited", r"C:\Apps\new.exe", true),
+            rule("added", r"C:\Apps\added.exe", true),
+        ]));
+        assert_eq!(matcher.rules, same);
+    }
+
+    #[test]
     fn matcher_follows_paths_children_and_never_captures_krot_itself() {
         let tree = Tree(HashMap::from([
             (10, (r"C:\Apps\Browser.exe", 1)),
@@ -881,8 +921,14 @@ mod tests {
         assert_eq!(missing_components(directory.path()).len(), 2);
     }
 
+    fn owner_table(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut table = (rows.len() as u32).to_le_bytes().to_vec();
+        table.extend(rows.iter().flatten());
+        table
+    }
+
     #[test]
-    fn port_owner_is_read_from_all_four_system_table_layouts() {
+    fn tcp_owner_is_read_from_both_system_table_layouts() {
         fn row(size: usize, fields: &[(usize, u32)], ports: &[(usize, u16)]) -> Vec<u8> {
             let mut row = vec![0u8; size];
             for (at, value) in fields {
@@ -893,30 +939,21 @@ mod tests {
             }
             row
         }
-        fn table(rows: &[Vec<u8>]) -> Vec<u8> {
-            let mut table = (rows.len() as u32).to_le_bytes().to_vec();
-            rows.iter().for_each(|row| table.extend(row));
-            table
-        }
-        let tcp4 = table(&[
+        let tcp4 = owner_table(&[
             row(24, &[(20, 100)], &[(8, 50000), (16, 80)]),
             row(24, &[(20, 200)], &[(8, 50000), (16, 443)]),
             row(24, &[(20, 300)], &[(8, 50001), (16, 443)]),
         ]);
-        assert_eq!(table_owner(&tcp4, true, false, 50000, 443), Some(200));
-        assert_eq!(table_owner(&tcp4, true, false, 50000, 22), Some(100));
-        assert_eq!(table_owner(&tcp4, true, false, 50002, 443), None);
-        let tcp6 = table(&[row(56, &[(52, 400)], &[(20, 50000), (44, 443)])]);
-        assert_eq!(table_owner(&tcp6, true, true, 50000, 443), Some(400));
-        let udp4 = table(&[row(12, &[(8, 500)], &[(4, 50000)])]);
-        assert_eq!(table_owner(&udp4, false, false, 50000, 9), Some(500));
-        let udp6 = table(&[row(28, &[(24, 600)], &[(20, 50000)])]);
-        assert_eq!(table_owner(&udp6, false, true, 50000, 9), Some(600));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50000, 443), Some(200));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50000, 22), Some(100));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50002, 443), None);
+        let tcp6 = owner_table(&[row(56, &[(52, 400)], &[(20, 50000), (44, 443)])]);
+        assert_eq!(tcp_table_owner(&tcp6, true, 50000, 443), Some(400));
         // A count larger than the buffer and a truncated buffer are both harmless.
         let mut short = tcp4.clone();
         short[0] = 200;
         short.truncate(4 + 24 + 10);
-        assert_eq!(table_owner(&short, true, false, 50000, 80), Some(100));
-        assert_eq!(table_owner(&[1, 0], true, false, 1, 1), None);
+        assert_eq!(tcp_table_owner(&short, false, 50000, 80), Some(100));
+        assert_eq!(tcp_table_owner(&[1, 0], false, 1, 1), None);
     }
 }
