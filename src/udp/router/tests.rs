@@ -215,3 +215,71 @@ async fn pings_are_answered_and_garbage_ends_the_channel() {
     .await;
     assert!(closed.is_ok(), "the router must close a broken channel");
 }
+
+#[tokio::test]
+async fn flows_of_a_rule_that_moved_to_another_tunnel_are_closed() {
+    let (router, _notices, mut helper) = setup().await;
+    helper
+        .write(&Frame::Open {
+            flow: 3,
+            rule: "r1",
+        })
+        .await;
+    helper
+        .write(&Frame::Send {
+            flow: 3,
+            peer: peer(),
+            data: b"a",
+        })
+        .await;
+    helper.next().await;
+    // The rule now points at another tunnel: the open flow must not keep using t1.
+    router.set_rules(HashMap::from([("r1".to_owned(), "t2".to_owned())]));
+    assert_eq!(
+        proto::parse(&helper.next().await).unwrap().unwrap().0,
+        Frame::Close {
+            flow: 3,
+            reason: CloseReason::Client,
+        }
+    );
+    let metrics = router.rule_metrics();
+    assert_eq!(
+        (metrics["r1"].flows_active, metrics["r1"].sent.datagrams),
+        (0, 1)
+    );
+    // Its next datagram opens the flow again, on the new route (no relay on t2 yet).
+    helper
+        .write(&Frame::Open {
+            flow: 3,
+            rule: "r1",
+        })
+        .await;
+    assert!(matches!(
+        proto::parse(&helper.next().await).unwrap().unwrap().0,
+        Frame::Close {
+            flow: 3,
+            reason: CloseReason::Socket
+        }
+    ));
+    // An unchanged route keeps its flows.
+    router.set_rules(HashMap::from([("r1".to_owned(), "t1".to_owned())]));
+    helper
+        .write(&Frame::Open {
+            flow: 4,
+            rule: "r1",
+        })
+        .await;
+    helper
+        .write(&Frame::Send {
+            flow: 4,
+            peer: peer(),
+            data: b"b",
+        })
+        .await;
+    assert!(matches!(
+        proto::parse(&helper.next().await).unwrap().unwrap().0,
+        Frame::Recv { flow: 4, .. }
+    ));
+    router.set_rules(HashMap::from([("r1".to_owned(), "t1".to_owned())]));
+    assert_eq!(router.rule_metrics()["r1"].flows_active, 1);
+}

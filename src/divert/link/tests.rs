@@ -181,3 +181,54 @@ async fn a_lost_channel_ends_every_flow_and_reconnects() {
     ));
     assert!(*attempts.lock().unwrap() >= 2);
 }
+
+#[tokio::test]
+async fn a_saturated_channel_in_both_directions_keeps_moving() {
+    let link = Arc::new(Link::default());
+    let router = router().await;
+    let (send, mut inbound) = mpsc::channel(INBOUND_QUEUE);
+    // Tiny buffers: both sides fill them at once and must still read while they cannot write.
+    let connect = move || {
+        let router = router.clone();
+        async move {
+            let (helper, background) = duplex(512);
+            let (read, write) = split(background);
+            tokio::spawn(router.serve(read, write));
+            Ok(split(helper))
+        }
+    };
+    tokio::spawn(link.clone().run(connect, send));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !link.up() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Echoed answers come back while far more is still being sent; nobody reads `inbound`
+    // during the burst, so answers also pile up on this side.
+    let payload = vec![7u8; 1200];
+    for round in 0..2000u32 {
+        link.send("r1", 1 + round % 8, round < 8, peer(), &payload);
+        if round % 100 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while inbound.try_recv().is_ok() {}
+    // A fresh datagram still makes the round trip on the same channel.
+    link.send("r1", 99, true, peer(), b"after");
+    let answer = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match inbound.recv().await {
+                Some(Inbound::Datagram { id: 99, data, .. }) => return data,
+                Some(_) => {}
+                None => panic!("the link stopped"),
+            }
+        }
+    })
+    .await
+    .expect("the channel stalled under load");
+    assert_eq!(answer, b"after");
+    assert!(link.up());
+}

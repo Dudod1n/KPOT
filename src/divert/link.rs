@@ -246,16 +246,24 @@ impl Link {
         }
     }
 
-    async fn serve<R, W>(&self, mut reader: R, mut writer: W, inbound: &mpsc::Sender<Inbound>)
+    /// Reads and writes at the same time: a side that cannot write must still read, or two
+    /// full buffers would wait for each other forever. A write that stays blocked for
+    /// `SILENCE_TIMEOUT` ends the channel like silence does.
+    async fn serve<R, W>(&self, reader: R, writer: W, inbound: &mpsc::Sender<Inbound>)
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let mut buffer = Vec::new();
-        let mut chunk = vec![0u8; 128 * 1024];
+        let heard = Heard::new();
+        tokio::select! {
+            _ = self.write_loop(writer, &heard) => {}
+            _ = self.read_loop(reader, inbound, &heard) => {}
+        }
+    }
+
+    async fn write_loop<W: AsyncWrite + Unpin>(&self, mut writer: W, heard: &Heard) {
         let mut batch = Vec::with_capacity(WRITE_BATCH + proto::MAX_FRAME);
         let mut ping = tokio::time::interval(REPORT_INTERVAL);
-        let mut heard = Instant::now();
         let mut sequence = 0u32;
         loop {
             batch.clear();
@@ -280,7 +288,12 @@ impl Link {
                 }
             }
             if !batch.is_empty() {
-                if writer.write_all(&batch).await.is_err() || writer.flush().await.is_err() {
+                let written = tokio::time::timeout(SILENCE_TIMEOUT, async {
+                    writer.write_all(&batch).await?;
+                    writer.flush().await
+                })
+                .await;
+                if !matches!(written, Ok(Ok(()))) {
                     return;
                 }
                 continue;
@@ -288,7 +301,7 @@ impl Link {
             tokio::select! {
                 _ = self.wake.notified() => {}
                 _ = ping.tick() => {
-                    if heard.elapsed() > SILENCE_TIMEOUT {
+                    if heard.silent_for() > SILENCE_TIMEOUT {
                         return;
                     }
                     sequence = sequence.wrapping_add(1);
@@ -300,41 +313,81 @@ impl Link {
                     proto::encode(&Frame::Ping { sequence, time_us: 0 }, &mut frame);
                     state.queue.push_front(Queued { frame, rule: None, payload: 0, at: Instant::now() });
                 }
-                read = reader.read(&mut chunk) => {
-                    let count = match read {
-                        Ok(0) | Err(_) => return,
-                        Ok(count) => count,
-                    };
-                    heard = Instant::now();
-                    buffer.extend_from_slice(&chunk[..count]);
-                    let mut start = 0;
-                    loop {
-                        let parsed = match proto::parse(&buffer[start..]) {
-                            Ok(parsed) => parsed,
-                            Err(_) => return,
-                        };
-                        let Some((frame, used)) = parsed else { break };
-                        start += used;
-                        let message = match frame {
-                            Frame::Recv { flow, peer, data } => Inbound::Datagram { id: flow, peer, data: data.to_vec() },
-                            Frame::Close { flow, .. } => {
-                                self.state.lock().unwrap().flow_rules.remove(&flow);
-                                Inbound::Closed { id: flow }
-                            }
-                            Frame::Pong { .. } => continue,
-                            _ => return,
-                        };
-                        if let Err(mpsc::error::TrySendError::Full(Inbound::Datagram { id, .. })) = inbound.try_send(message) {
-                            let mut state = self.state.lock().unwrap();
-                            if let Some(rule) = state.flow_rules.get(&id).cloned() {
-                                state.rule(&rule).drops.add(DropReason::Overflow);
-                            }
-                        }
-                    }
-                    buffer.drain(..start);
-                }
             }
         }
+    }
+
+    async fn read_loop<R: AsyncRead + Unpin>(
+        &self,
+        mut reader: R,
+        inbound: &mpsc::Sender<Inbound>,
+        heard: &Heard,
+    ) {
+        let mut buffer = Vec::new();
+        let mut chunk = vec![0u8; 128 * 1024];
+        loop {
+            let count = match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(count) => count,
+            };
+            heard.now();
+            buffer.extend_from_slice(&chunk[..count]);
+            let mut start = 0;
+            loop {
+                let parsed = match proto::parse(&buffer[start..]) {
+                    Ok(parsed) => parsed,
+                    Err(_) => return,
+                };
+                let Some((frame, used)) = parsed else { break };
+                start += used;
+                let message = match frame {
+                    Frame::Recv { flow, peer, data } => Inbound::Datagram {
+                        id: flow,
+                        peer,
+                        data: data.to_vec(),
+                    },
+                    Frame::Close { flow, .. } => {
+                        self.state.lock().unwrap().flow_rules.remove(&flow);
+                        Inbound::Closed { id: flow }
+                    }
+                    Frame::Pong { .. } => continue,
+                    _ => return,
+                };
+                // Never wait for the consumer here: answers that do not fit are dropped.
+                if let Err(mpsc::error::TrySendError::Full(Inbound::Datagram { id, .. })) =
+                    inbound.try_send(message)
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if let Some(rule) = state.flow_rules.get(&id).cloned() {
+                        state.rule(&rule).drops.add(DropReason::Overflow);
+                    }
+                }
+            }
+            buffer.drain(..start);
+        }
+    }
+}
+
+/// When the channel last delivered bytes, shared by its reading and writing halves.
+struct Heard {
+    start: Instant,
+    micros: std::sync::atomic::AtomicU64,
+}
+
+impl Heard {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            micros: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    fn now(&self) {
+        let micros = self.start.elapsed().as_micros() as u64;
+        self.micros.store(micros, Ordering::Relaxed);
+    }
+    fn silent_for(&self) -> Duration {
+        let last = Duration::from_micros(self.micros.load(Ordering::Relaxed));
+        self.start.elapsed().saturating_sub(last)
     }
 }
 

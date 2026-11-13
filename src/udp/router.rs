@@ -4,7 +4,7 @@
 //! router picks the transport of that rule's tunnel and gives the flow an id of its own there,
 //! so answers find their way back and counters add up per rule.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Instant,
@@ -12,13 +12,16 @@ use std::{
 
 use krot_udp_proto::{
     self as proto, CloseReason, Frame,
-    limits::{DATAGRAM_EXPIRY, DELIVERY_QUEUE_DATAGRAMS, REPORT_INTERVAL, WRITE_BATCH},
+    limits::{
+        CHANNEL_QUEUE_BYTES, CHANNEL_QUEUE_DATAGRAMS, DATAGRAM_EXPIRY, DELIVERY_QUEUE_DATAGRAMS,
+        REPORT_INTERVAL, SILENCE_TIMEOUT, WRITE_BATCH,
+    },
     metrics::{DropReason, Drops},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
+    sync::{Notify, mpsc},
 };
 
 use super::{
@@ -138,7 +141,29 @@ impl Router {
 
     /// Rules that may use UDP through their tunnel; called whenever rules or tunnels change.
     pub fn set_rules(&self, rules: HashMap<String, String>) {
-        self.state.lock().unwrap().rules = rules;
+        let mut state = self.state.lock().unwrap();
+        // Open flows whose rule now goes through another tunnel, or none, end here: the
+        // helper opens them again with the next datagram, on the current route.
+        let moved: Vec<(String, u32, String)> = state
+            .flows
+            .iter()
+            .filter(|((tunnel, _), rule)| rules.get(*rule) != Some(tunnel))
+            .map(|((tunnel, flow), rule)| (tunnel.clone(), *flow, rule.clone()))
+            .collect();
+        state.rules = rules;
+        for (tunnel, flow, rule) in moved {
+            state.flows.remove(&(tunnel.clone(), flow));
+            if let Some(counters) = state.links.get(&tunnel).and_then(|link| link.close(flow)) {
+                state.add_closed(&rule, &counters);
+            }
+            if let Some((_, channel)) = &state.channel {
+                let _ = channel.try_send(Delivery::Closed {
+                    tunnel,
+                    flow,
+                    reason: CloseReason::Client,
+                });
+            }
+        }
     }
 
     /// Whether the tunnel has a running relay.
@@ -273,7 +298,7 @@ impl Router {
     }
 
     /// Serves the helper's binary channel until it ends. A newer channel replaces this one.
-    pub async fn serve<R, W>(self: Arc<Self>, mut reader: R, mut writer: W)
+    pub async fn serve<R, W>(self: Arc<Self>, mut reader: R, writer: W)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -317,10 +342,14 @@ impl Router {
         // helper flow → (tunnel, transport flow, rule, transport)
         let mut flows: HashMap<u32, (String, u32, String, Arc<Transport>)> = HashMap::new();
         let mut back: HashMap<(String, u32), u32> = HashMap::new();
-        let mut batch = Vec::with_capacity(WRITE_BATCH + proto::MAX_FRAME);
+        // Writing runs apart from reading: a helper that does not read for a while must never
+        // stop this side from reading what the helper sends.
+        let outbox = Arc::new(Outbox::default());
+        let mut writing = tokio::spawn(write_out(self.clone(), outbox.clone(), writer));
+        let mut out = Outgoing::default();
         loop {
-            batch.clear();
             tokio::select! {
+                _ = &mut writing => break,
                 frame = frames.recv() => {
                     let Some(Ok(frame)) = frame else { break };
                     let Ok(Some((frame, _))) = proto::parse(&frame) else { break };
@@ -335,7 +364,7 @@ impl Router {
                                     back.insert((tunnel.clone(), tflow), flow);
                                     flows.insert(flow, (tunnel, tflow, rule.to_owned(), transport));
                                 }
-                                None => proto::encode(&Frame::Close { flow, reason: CloseReason::Socket }, &mut batch),
+                                None => out.control(&Frame::Close { flow, reason: CloseReason::Socket }),
                             }
                         }
                         Frame::Send { flow, peer, data } => {
@@ -350,30 +379,28 @@ impl Router {
                             }
                         }
                         // Pings keep the local channel's liveness visible to the helper.
-                        Frame::Ping { sequence, time_us } => proto::encode(
-                            &Frame::Pong { sequence, time_us, held_us: 0 },
-                            &mut batch,
-                        ),
+                        Frame::Ping { sequence, time_us } => {
+                            out.control(&Frame::Pong { sequence, time_us, held_us: 0 });
+                        }
                         _ => break,
                     }
                 }
                 delivery = deliveries.recv() => {
                     let Some(delivery) = delivery else { break };
-                    self.write_delivery(delivery, &mut flows, &mut back, &mut batch);
-                    // Take whatever else is ready, up to one batch.
-                    while batch.len() < WRITE_BATCH {
+                    self.write_delivery(delivery, &mut flows, &mut back, &mut out);
+                    // Take whatever else is ready.
+                    while out.0.len() < 256 {
                         let Ok(delivery) = deliveries.try_recv() else { break };
-                        self.write_delivery(delivery, &mut flows, &mut back, &mut batch);
+                        self.write_delivery(delivery, &mut flows, &mut back, &mut out);
                     }
                 }
             }
-            if !batch.is_empty()
-                && (writer.write_all(&batch).await.is_err() || writer.flush().await.is_err())
-            {
-                break;
+            if !out.0.is_empty() {
+                outbox.push(&self, std::mem::take(&mut out.0));
             }
         }
         reading.abort();
+        writing.abort();
         for (_, (tunnel, tflow, rule, transport)) in flows {
             self.close_flow(&tunnel, tflow, &rule, &transport);
         }
@@ -420,7 +447,7 @@ impl Router {
         delivery: Delivery,
         flows: &mut HashMap<u32, (String, u32, String, Arc<Transport>)>,
         back: &mut HashMap<(String, u32), u32>,
-        batch: &mut Vec<u8>,
+        out: &mut Outgoing,
     ) {
         match delivery {
             Delivery::Datagram {
@@ -430,25 +457,19 @@ impl Router {
                 data,
                 at,
             } => {
-                let waited = at.elapsed();
-                let mut state = self.state.lock().unwrap();
-                let totals = state.tunnels.entry(tunnel.clone()).or_default();
-                if waited > DATAGRAM_EXPIRY {
-                    totals.to_helper_drops.add(DropReason::Expired);
-                    return;
-                }
-                let Some(helper) = back.get(&(tunnel, flow)) else {
+                let Some(helper) = back.get(&(tunnel.clone(), flow)) else {
                     return;
                 };
-                totals.to_helper_delay.record(waited);
+                let mut frame = Vec::with_capacity(proto::datagram_frame_size(&peer, data.len()));
                 proto::encode(
                     &Frame::Recv {
                         flow: *helper,
                         peer,
                         data: &data,
                     },
-                    batch,
+                    &mut frame,
                 );
+                out.0.push(Out::Data { frame, tunnel, at });
             }
             Delivery::Closed {
                 tunnel,
@@ -457,13 +478,10 @@ impl Router {
             } => {
                 if let Some(helper) = back.remove(&(tunnel, flow)) {
                     flows.remove(&helper);
-                    proto::encode(
-                        &Frame::Close {
-                            flow: helper,
-                            reason,
-                        },
-                        batch,
-                    );
+                    out.control(&Frame::Close {
+                        flow: helper,
+                        reason,
+                    });
                 }
             }
             Delivery::Down { tunnel } => {
@@ -476,15 +494,130 @@ impl Router {
                     if let Some((tunnel, tflow, ..)) = flows.remove(&helper) {
                         back.remove(&(tunnel, tflow));
                     }
-                    proto::encode(
-                        &Frame::Close {
-                            flow: helper,
-                            reason: CloseReason::Socket,
-                        },
-                        batch,
-                    );
+                    out.control(&Frame::Close {
+                        flow: helper,
+                        reason: CloseReason::Socket,
+                    });
                 }
             }
+        }
+    }
+}
+
+/// Frames for the helper. Control frames are never given up; answers are, when they wait too
+/// long or do not fit.
+enum Out {
+    Control(Vec<u8>),
+    Data {
+        frame: Vec<u8>,
+        tunnel: String,
+        at: Instant,
+    },
+}
+
+#[derive(Default)]
+struct Outgoing(Vec<Out>);
+
+impl Outgoing {
+    fn control(&mut self, frame: &Frame<'_>) {
+        let mut bytes = Vec::new();
+        proto::encode(frame, &mut bytes);
+        self.0.push(Out::Control(bytes));
+    }
+}
+
+#[derive(Default)]
+struct OutboxState {
+    items: VecDeque<Out>,
+    data: usize,
+    data_bytes: usize,
+}
+
+#[derive(Default)]
+struct Outbox {
+    state: Mutex<OutboxState>,
+    wake: Notify,
+}
+
+impl Outbox {
+    fn push(&self, router: &Router, items: Vec<Out>) {
+        let mut state = self.state.lock().unwrap();
+        for item in items {
+            if let Out::Data { frame, .. } = &item {
+                state.data += 1;
+                state.data_bytes += frame.len();
+            }
+            state.items.push_back(item);
+        }
+        while state.data > CHANNEL_QUEUE_DATAGRAMS || state.data_bytes > CHANNEL_QUEUE_BYTES {
+            let Some(index) = state
+                .items
+                .iter()
+                .position(|item| matches!(item, Out::Data { .. }))
+            else {
+                break;
+            };
+            if let Some(Out::Data { frame, tunnel, .. }) = state.items.remove(index) {
+                state.data -= 1;
+                state.data_bytes -= frame.len();
+                router.count_to_helper(&tunnel, Err(DropReason::Overflow));
+            }
+        }
+        drop(state);
+        self.wake.notify_one();
+    }
+}
+
+impl Router {
+    fn count_to_helper(&self, tunnel: &str, outcome: Result<std::time::Duration, DropReason>) {
+        let mut state = self.state.lock().unwrap();
+        let totals = state.tunnels.entry(tunnel.to_owned()).or_default();
+        match outcome {
+            Ok(waited) => totals.to_helper_delay.record(waited),
+            Err(reason) => totals.to_helper_drops.add(reason),
+        }
+    }
+}
+
+/// Writes queued frames to the helper; a write blocked for `SILENCE_TIMEOUT` ends the channel.
+async fn write_out<W: AsyncWrite + Unpin>(router: Arc<Router>, outbox: Arc<Outbox>, mut writer: W) {
+    let mut batch = Vec::with_capacity(WRITE_BATCH + proto::MAX_FRAME);
+    loop {
+        batch.clear();
+        {
+            let now = Instant::now();
+            let mut state = outbox.state.lock().unwrap();
+            while batch.len() < WRITE_BATCH {
+                let Some(item) = state.items.pop_front() else {
+                    break;
+                };
+                match item {
+                    Out::Control(frame) => batch.extend_from_slice(&frame),
+                    Out::Data { frame, tunnel, at } => {
+                        state.data -= 1;
+                        state.data_bytes -= frame.len();
+                        let waited = now.saturating_duration_since(at);
+                        if waited > DATAGRAM_EXPIRY {
+                            router.count_to_helper(&tunnel, Err(DropReason::Expired));
+                            continue;
+                        }
+                        router.count_to_helper(&tunnel, Ok(waited));
+                        batch.extend_from_slice(&frame);
+                    }
+                }
+            }
+        }
+        if batch.is_empty() {
+            outbox.wake.notified().await;
+            continue;
+        }
+        let written = tokio::time::timeout(SILENCE_TIMEOUT, async {
+            writer.write_all(&batch).await?;
+            writer.flush().await
+        })
+        .await;
+        if !matches!(written, Ok(Ok(()))) {
+            return;
         }
     }
 }
