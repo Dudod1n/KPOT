@@ -18,13 +18,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE,
-        INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     },
     NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, GetExtendedUdpTable, MIB_UDP6ROW_OWNER_MODULE,
-        MIB_UDP6TABLE_OWNER_MODULE, MIB_UDPROW_OWNER_MODULE, MIB_UDPTABLE_OWNER_MODULE,
-        UDP_TABLE_OWNER_MODULE,
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+        MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
     },
     System::{
         Diagnostics::ToolHelp::{
@@ -32,9 +30,8 @@ use windows_sys::Win32::{
             TH32CS_SNAPPROCESS,
         },
         LibraryLoader::{GetProcAddress, LoadLibraryW},
-        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         RemoteDesktop::ProcessIdToSessionId,
-        SystemInformation::{GetSystemDirectoryW, GetSystemTimePreciseAsFileTime},
+        SystemInformation::GetSystemDirectoryW,
         Threading::{
             GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             QueryFullProcessImageNameW,
@@ -47,9 +44,9 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    CaptureTime, DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, UDP_TABLE_HEADER,
-    UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpDecision, UdpHistory, Verdict, handle, tcp_table_owner,
-    udp_sockets, udp_table_owners,
+    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
+    owners::{UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners, endpoint_owners},
+    tcp_table_owner,
 };
 use crate::{
     apps::{DivertReport, DivertRule, DivertStats},
@@ -71,12 +68,16 @@ const MAX_PENDING_LOGS: usize = 500;
 
 const _: () = {
     use std::mem::{offset_of, size_of};
-    assert!(offset_of!(MIB_UDPTABLE_OWNER_MODULE, table) == UDP_TABLE_HEADER);
-    assert!(offset_of!(MIB_UDP6TABLE_OWNER_MODULE, table) == UDP_TABLE_HEADER);
-    assert!(size_of::<MIB_UDPROW_OWNER_MODULE>() == UDP4_ROW_SIZE);
-    assert!(size_of::<MIB_UDP6ROW_OWNER_MODULE>() == UDP6_ROW_SIZE);
-    assert!(offset_of!(MIB_UDPROW_OWNER_MODULE, liCreateTimestamp) == 16);
-    assert!(offset_of!(MIB_UDP6ROW_OWNER_MODULE, liCreateTimestamp) == 32);
+    // The platform-neutral parser in `owners` relies on these layouts.
+    assert!(offset_of!(MIB_UDPTABLE_OWNER_PID, table) == UDP_TABLE_HEADER);
+    assert!(offset_of!(MIB_UDP6TABLE_OWNER_PID, table) == UDP_TABLE_HEADER);
+    assert!(size_of::<MIB_UDPROW_OWNER_PID>() == UDP4_ROW_SIZE);
+    assert!(size_of::<MIB_UDP6ROW_OWNER_PID>() == UDP6_ROW_SIZE);
+    assert!(offset_of!(MIB_UDPROW_OWNER_PID, dwLocalPort) == 4);
+    assert!(offset_of!(MIB_UDPROW_OWNER_PID, dwOwningPid) == 8);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwLocalScopeId) == 16);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwLocalPort) == 20);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwOwningPid) == 24);
 };
 
 /// `WINDIVERT_ADDRESS`: timestamp, a bit field, a reserved word and 64 bytes of layer data.
@@ -267,7 +268,7 @@ fn read_port_table(tcp: bool, v6: bool, table: &mut Vec<u8>) -> Option<&[u8]> {
                     &mut size,
                     0,
                     family,
-                    UDP_TABLE_OWNER_MODULE,
+                    UDP_TABLE_OWNER_PID,
                     0,
                 )
             }
@@ -289,94 +290,22 @@ fn tcp_port_owner(origin: &Origin, buffer: &mut Vec<u8>) -> Option<u32> {
     })
 }
 
-fn file_time() -> u64 {
-    let mut time = FILETIME::default();
-    // SAFETY: the function writes a FILETIME through a valid pointer.
-    unsafe { GetSystemTimePreciseAsFileTime(&mut time) };
-    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
-}
-
-fn packet_file_time(captured: i64, frequency: i64) -> CaptureTime {
-    let mut counter = 0;
-    // SAFETY: writes one i64 through a valid pointer. Windows always provides QPC.
-    unsafe { QueryPerformanceCounter(&mut counter) };
-    let before = counter;
-    let time = file_time();
-    // SAFETY: writes one i64 through a valid pointer.
-    unsafe { QueryPerformanceCounter(&mut counter) };
-    let from_counter = |reference: i64| {
-        let elapsed = i128::from(reference.saturating_sub(captured).max(0));
-        let elapsed = (elapsed * 10_000_000 / i128::from(frequency)) as u64;
-        time.saturating_sub(elapsed)
-    };
-    CaptureTime {
-        earliest: from_counter(counter),
-        latest: from_counter(before),
-    }
-}
-
-fn udp_port_decision(
+/// The rules of the processes whose sockets may have sent from `local`; `None` when the system
+/// tables could not be read.
+fn udp_owner_rules(
     local: SocketAddr,
-    captured: CaptureTime,
-    buffer: &mut Vec<u8>,
-    mut blocking_rule: impl FnMut(u32) -> Option<String>,
-) -> UdpDecision {
-    let mut decision = UdpDecision::default();
-    let local_v4 = match local {
-        SocketAddr::V4(addr) => addr,
-        SocketAddr::V6(_) => {
-            if let Some(table) = read_port_table(false, true, buffer) {
-                decision.complete = true;
-                decision.add(
-                    udp_table_owners(table, local, true),
-                    captured,
-                    &mut blocking_rule,
-                );
-            }
-            return decision;
-        }
+    ipv4: &mut Vec<u8>,
+    ipv6: &mut Vec<u8>,
+    mut rule: impl FnMut(u32) -> Option<String>,
+) -> Option<Vec<String>> {
+    let ipv4 = if local.is_ipv4() {
+        Some(read_port_table(false, false, ipv4)?)
+    } else {
+        None
     };
-    let mut read_v4 = false;
-    if let Some(table) = read_port_table(false, false, buffer) {
-        read_v4 = true;
-        decision.add(
-            udp_table_owners(table, local, true),
-            captured,
-            &mut blocking_rule,
-        );
-    }
-    if let Some(table) = read_port_table(false, true, buffer) {
-        decision.complete = read_v4;
-        let mapped = SocketAddr::new(local_v4.ip().to_ipv6_mapped().into(), local_v4.port());
-        decision.add(
-            udp_table_owners(table, mapped, false),
-            captured,
-            &mut blocking_rule,
-        );
-        // An IPv6 wildcard can belong to a dual-stack socket.
-        if decision.owners.is_empty() {
-            decision.add(
-                udp_table_owners(table, mapped, true),
-                captured,
-                &mut blocking_rule,
-            );
-        }
-    }
-    decision
-}
-
-fn prune_udp_history(history: &mut UdpHistory, buffer: &mut Vec<u8>, captured: u64) {
-    if history.ports.is_empty() {
-        return;
-    }
-    let mut live = HashSet::new();
-    for v6 in [false, true] {
-        let Some(table) = read_port_table(false, v6, buffer) else {
-            return;
-        };
-        live.extend(udp_sockets(table, v6));
-    }
-    history.prune(captured, file_time(), &live);
+    let ipv6 = read_port_table(false, true, ipv6);
+    let pids = endpoint_owners(ipv4, ipv6, local)?;
+    Some(pids.into_iter().filter_map(&mut rule).collect())
 }
 
 struct Shared {
@@ -405,7 +334,7 @@ impl Shared {
     }
 }
 
-fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>, frequency: i64) {
+fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
     let own = std::env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
@@ -419,8 +348,10 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>, frequ
     let mut generation = u64::MAX;
     // Rules whose application goes around its tunnel right now, because the tunnel is down.
     let mut bypassing: HashSet<String> = HashSet::new();
-    let mut udp_history = UdpHistory::default();
+    let mut udp_owners = UdpOwners::default();
     let mut port_table = vec![0u8; 4096];
+    let mut udp4_table = vec![0u8; 4096];
+    let mut udp6_table = vec![0u8; 4096];
     let mut buffer = vec![0u8; 40 + 0xffff];
     let mut purged = Instant::now();
     let mut failures = 0u32;
@@ -452,15 +383,18 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>, frequ
         if current != generation {
             generation = current;
             let rules = shared.rules.lock().unwrap();
-            if matcher.set_rules(&rules) {
-                udp_history = UdpHistory::default();
-            }
+            let before = matcher.rules.clone();
             bypassing = rules
                 .iter()
                 .filter(|rule| rule.direct && rule.proxy.is_none())
                 .map(|rule| rule.id.clone())
                 .collect();
-            udp_history.allow_bypassing(&bypassing);
+            let all_bypass = rules.iter().all(|rule| bypassing.contains(&rule.id));
+            if matcher.set_rules(&rules) {
+                udp_owners.rules_changed(&|id| matcher.unchanged(&before, id), all_bypass);
+            } else {
+                udp_owners.set_all_bypass(all_bypass);
+            }
         }
         let data = &mut buffer[..length as usize];
         let verdict = {
@@ -468,11 +402,7 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>, frequ
             if now.duration_since(purged) > Duration::from_secs(10) {
                 purged = now;
                 nat.purge(now);
-                prune_udp_history(
-                    &mut udp_history,
-                    &mut port_table,
-                    packet_file_time(address.timestamp, frequency).earliest,
-                );
+                udp_owners.purge(now);
             }
             handle(
                 data,
@@ -493,13 +423,12 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>, frequ
                     {
                         addr.set_scope_id(address.interface_index());
                     }
-                    let captured = packet_file_time(address.timestamp, frequency);
-                    let decision = udp_port_decision(local, captured, &mut port_table, |pid| {
-                        matcher
-                            .decide(pid, now, &system)
-                            .filter(|rule| !bypassing.contains(rule))
-                    });
-                    udp_history.decide(local, captured, file_time(), decision)
+                    // The rule as it is; `handle` applies whether it bypasses its tunnel.
+                    udp_owners.decide(local, now, &|rule| bypassing.contains(rule), || {
+                        udp_owner_rules(local, &mut udp4_table, &mut udp6_table, |pid| {
+                            matcher.decide(pid, now, &system)
+                        })
+                    })
                 },
                 &|rule| bypassing.contains(rule),
             )
@@ -633,12 +562,6 @@ async fn serve(store: Store) -> Result<()> {
     });
     let start = || -> Result<u16> {
         let api = load()?;
-        let mut frequency = 0;
-        // SAFETY: writes one i64 through a valid pointer.
-        ensure!(
-            unsafe { QueryPerformanceFrequency(&mut frequency) } != 0 && frequency > 0,
-            "Не удалось получить частоту счётчика времени WinDivert."
-        );
         let relay = listener("0.0.0.0:0")
             .context("Не удалось открыть порт для перехваченных соединений.")?;
         let port = relay.local_addr()?.port();
@@ -652,7 +575,7 @@ async fn serve(store: Store) -> Result<()> {
         let shared = shared.clone();
         std::thread::Builder::new()
             .name("divert".into())
-            .spawn(move || packets(api, device, port, shared, frequency))?;
+            .spawn(move || packets(api, device, port, shared))?;
         Ok(port)
     };
     if let Err(error) = start() {
