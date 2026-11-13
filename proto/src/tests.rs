@@ -295,3 +295,35 @@ fn drop_reasons_are_counted_separately() {
         assert_eq!(drops.get(reason), reason as u64 + 1, "{}", reason.name());
     }
 }
+
+#[test]
+fn a_hello_of_another_version_is_read_for_its_version_only() {
+    // A future version with one more field, and an older one with fewer.
+    for (version, extra) in [(VERSION + 1, vec![1u8, 2, 3, 4]), (0, vec![])] {
+        let mut body = vec![kind::HELLO];
+        body.extend_from_slice(&MAGIC);
+        body.extend_from_slice(&version.to_be_bytes());
+        if version == 0 {
+            body.extend_from_slice(&[0, 1]);
+        } else {
+            body.extend_from_slice(&[0; 10]);
+            body.extend_from_slice(&extra);
+        }
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        match parse(&frame) {
+            Ok(Some((Frame::Hello { version: read, .. }, used))) => {
+                assert_eq!((read, used), (version, frame.len()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // The current version keeps its exact layout.
+    let mut body = vec![kind::HELLO];
+    body.extend_from_slice(&MAGIC);
+    body.extend_from_slice(&VERSION.to_be_bytes());
+    body.extend_from_slice(&[0; 11]);
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    assert_eq!(parse(&frame), Err(Error::Malformed));
+}

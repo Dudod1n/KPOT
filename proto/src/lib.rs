@@ -434,8 +434,21 @@ impl<'a> Reader<'a> {
         if self.array::<4>()? != MAGIC {
             return Err(Error::Magic);
         }
+        let version = self.u16()?;
+        // Another version may lay out the rest differently: it is only refused, never read.
+        if version != VERSION {
+            self.rest();
+            return Ok((
+                version,
+                Settings {
+                    max_flows: 0,
+                    idle_ms: 0,
+                    idle_bidirectional_ms: 0,
+                },
+            ));
+        }
         Ok((
-            self.u16()?,
+            version,
             Settings {
                 max_flows: self.u16()?,
                 idle_ms: self.u32()?,
