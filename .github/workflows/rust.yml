@@ -2,7 +2,10 @@ name: Rust desktop
 on:
   push:
     branches: ['**']
+  # Pushes already run CI on every branch; a pull request runs it again only for main,
+  # where the merge result with main is what gets checked and its build can be tested.
   pull_request:
+    branches: [main]
   workflow_dispatch:
   workflow_call:
 permissions:
