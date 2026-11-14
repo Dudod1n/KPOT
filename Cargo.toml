@@ -1,6 +1,6 @@
 [package]
 name = "krot"
-version = "0.5.8"
+version = "0.6.0"
 edition = "2024"
 default-run = "krot"
 rust-version = "1.90"
