@@ -1,0 +1,122 @@
+name: Claude fix
+# The maintainer puts `fix:approved` on a review-fix issue: the agent fixes the confirmed
+# findings in the pull request's branch, then the next review round starts.
+# An `issues` event always runs the workflow from the default branch.
+on:
+  issues:
+    types: [labeled]
+permissions:
+  contents: read
+concurrency:
+  group: claude-fix-${{ github.event.issue.number }}
+jobs:
+  fix:
+    # Only the maintainer's own label starts the agent.
+    if: >-
+      github.event.label.name == 'fix:approved' &&
+      github.event.sender.login == github.repository_owner &&
+      github.event.issue.state == 'open' &&
+      contains(github.event.issue.labels.*.name, 'review-fix') &&
+      !contains(github.event.issue.labels.*.name, 'needs-maintainer')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    outputs:
+      pr: ${{ steps.meta.outputs.pr }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.issue.number }}
+    steps:
+      - name: Find the pull request
+        id: meta
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          pr=$(grep -oE '<!-- review-fix pr=[0-9]+ ' <<<"$BODY" | head -n1 | grep -oE '[0-9]+' || true)
+          if [ -z "$pr" ]; then
+            echo "::error::Issue #$ISSUE has no review-fix marker"
+            exit 1
+          fi
+          gh pr view "$pr" --json state,isCrossRepository,headRefName > "$RUNNER_TEMP/pr.json"
+          if [ "$(jq -r .state "$RUNNER_TEMP/pr.json")" != OPEN ] ||
+             [ "$(jq -r .isCrossRepository "$RUNNER_TEMP/pr.json")" != false ]; then
+            echo "::error::PR #$pr is not an open pull request from this repository"
+            exit 1
+          fi
+          printf '%s\n' "$BODY" > "$RUNNER_TEMP/task.md"
+          {
+            echo "pr=$pr"
+            echo "branch=$(jq -r .headRefName "$RUNNER_TEMP/pr.json")"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.meta.outputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the task
+        id: prep
+        run: |
+          set -euo pipefail
+          mkdir .claude-fix
+          echo .claude-fix/ >> .git/info/exclude
+          cp "$RUNNER_TEMP/task.md" .claude-fix/task.md
+          echo "start=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Fix
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Set one of the two secrets in the repository settings.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Исправь подтверждённые замечания ревью pull request #${{ steps.meta.outputs.pr }}.
+            Ветка PR уже извлечена в рабочий каталог. Замечания лежат в `.claude-fix/task.md`.
+
+            Правила:
+            1. Исправляй причину каждого замечания и проверь остальные вызовы на тот же
+               класс ошибки (REVIEW.md). Не меняй ничего сверх этих замечаний.
+            2. Каждую регрессию закрепи воспроизводимым тестом.
+            3. Выполни проверки из CONTRIBUTING.md, соразмерные изменению: как минимум
+               `cargo fmt --all --check`, `cargo clippy` и затронутые тесты.
+            4. Пользовательские исправления добавь в раздел «Не выпущено» CHANGELOG.md.
+            5. Закоммить результат по правилам AGENTS.md и docs/WORKFLOW.md. Не делай push
+               и не изменяй файлы в `.github/`.
+            6. Если замечание исправить нельзя или оно неверно, не коммить обходной путь:
+               опиши причину в итоговом ответе.
+          claude_args: |
+            --allowedTools "Read,Edit,Write,Grep,Glob,Task,Agent,Bash"
+      - name: Push and start the next round
+        env:
+          PR: ${{ steps.meta.outputs.pr }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
+          START: ${{ steps.prep.outputs.start }}
+        run: |
+          set -euo pipefail
+          new=$(git rev-parse HEAD)
+          if [ "$new" = "$START" ]; then
+            gh issue comment "$ISSUE" --body "Агент не сделал ни одного коммита. Нужен разбор сопровождающего: журнал запуска $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+            gh api -X POST "repos/$GH_REPO/issues/$ISSUE/labels" -f 'labels[]=needs-maintainer' --silent
+            exit 1
+          fi
+          git push "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$BRANCH"
+          # A push made with the workflow token starts no workflows, so CI is started here.
+          gh workflow run rust.yml --ref "$BRANCH" || echo "::warning::Could not start CI for $BRANCH"
+          gh issue close "$ISSUE" --comment "Исправления отправлены в #$PR: \`$START\` → \`$new\`. Начат следующий раунд ревью."
+          gh pr ready "$PR" || echo "::warning::Could not mark PR #$PR as ready for review"
+  review:
+    needs: fix
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: ./.github/workflows/claude-review.yml
+    with:
+      pr_number: ${{ fromJSON(needs.fix.outputs.pr) }}
+    secrets: inherit
