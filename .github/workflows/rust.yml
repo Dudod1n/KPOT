@@ -2,10 +2,10 @@ name: Rust desktop
 on:
   push:
     branches: ['**']
-  # Pushes already run CI on every branch; a pull request runs it again only for main,
-  # where the merge result with main is what gets checked and its build can be tested.
+  # Pushes already run CI on every branch of this repository. A pull request runs it again
+  # only into main, where the merge result is checked and its build can be tested, and
+  # from forks, whose pushes never run here. See the condition on the relay job.
   pull_request:
-    branches: [main]
   workflow_dispatch:
   workflow_call:
 permissions:
@@ -13,6 +13,11 @@ permissions:
 jobs:
   relay:
     # The server UDP relay: static Linux builds that the client embeds.
+    # `rust` needs this job, so the condition skips the whole run.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.base_ref == 'main'
+      || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-22.04
     env:
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
