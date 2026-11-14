@@ -3,12 +3,16 @@
 //! everywhere; capturing and injecting packets is Windows-only (WinDivert).
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
 use crate::apps::{DivertRule, path_key};
 
+pub mod link;
+#[cfg(any(windows, test))]
+mod owners;
+pub mod udp;
 #[cfg(windows)]
 mod windows;
 
@@ -53,18 +57,33 @@ pub fn missing_components(directory: &std::path::Path) -> Vec<&'static Component
 const TCP: u8 = 6;
 const UDP: u8 = 17;
 const DNS_PORT: u16 = 53;
+const QUIC_PORT: u16 = 443;
+/// How long the rest of a dropped fragmented datagram is expected.
+const FRAGMENT_WINDOW: Duration = Duration::from_secs(2);
 const CLOSED_FLOW: Duration = Duration::from_secs(60);
 const IDLE_FLOW: Duration = Duration::from_secs(2 * 60 * 60);
 const DECISION_TTL: Duration = Duration::from_secs(5);
 const MAX_ANCESTORS: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Reinject unchanged.
     Pass,
     Drop,
     /// The packet was rewritten in place and must be injected as inbound.
     Reflect,
+    /// A datagram of `rule` that goes through the tunnel's relay instead of the network.
+    Capture {
+        rule: String,
+    },
+    /// UDP 443 of `rule`, blocked so that the browser falls back to TCP.
+    Quic {
+        rule: String,
+    },
+    /// A fragmented datagram of `rule`: it cannot be carried and is dropped.
+    Fragment {
+        rule: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +177,8 @@ pub struct Flow {
 #[derive(Default)]
 pub struct Nat {
     flows: HashMap<(IpAddr, u16), Flow>,
+    /// First fragments of captured datagrams that were dropped: their followers go too.
+    fragments: HashMap<(IpAddr, IpAddr, u16), Instant>,
 }
 
 impl Nat {
@@ -183,6 +204,8 @@ impl Nat {
         }
     }
     pub fn purge(&mut self, now: Instant) {
+        self.fragments
+            .retain(|_, at| now.duration_since(*at) < FRAGMENT_WINDOW);
         self.flows.retain(|_, flow| match flow.closed {
             Some(closed) => now.duration_since(closed) < CLOSED_FLOW,
             None => now.duration_since(flow.seen) < IDLE_FLOW,
@@ -197,29 +220,52 @@ impl Nat {
 }
 
 /// Decides what happens to one outbound packet. `owner` names the rule of the process that
-/// owns a local port, or `None` when the process is not covered by any rule.
+/// owns a local port, or `None` when the process is not covered by any rule. `udp` tells how
+/// a rule's datagrams are handled right now.
 pub fn handle(
     data: &mut [u8],
     relay_port: u16,
     nat: &mut Nat,
     now: Instant,
     owner: &mut dyn FnMut(u8, &Origin) -> Option<String>,
+    udp: &dyn Fn(&str) -> udp::Policy,
 ) -> Verdict {
+    // Later fragments carry no ports: they follow the fate of their first fragment.
+    if let Some((key, false)) = udp::fragment(data) {
+        return if nat.fragments.contains_key(&key) {
+            Verdict::Drop
+        } else {
+            Verdict::Pass
+        };
+    }
     let Some(packet) = parse(data) else {
         return Verdict::Pass;
     };
     let view = Origin {
-        v6: packet.source.is_ipv6(),
-        local_port: packet.source_port,
+        local: SocketAddr::new(packet.source, packet.source_port),
         remote: packet.destination,
         remote_port: packet.destination_port,
     };
     if packet.protocol == UDP {
-        // Names are resolved by this computer; everything else would bypass the tunnel.
-        return if packet.destination_port != DNS_PORT && owner(UDP, &view).is_some() {
-            Verdict::Drop
-        } else {
-            Verdict::Pass
+        let Some(rule) = owner(UDP, &view) else {
+            return Verdict::Pass;
+        };
+        return match udp(&rule) {
+            udp::Policy::Direct => Verdict::Pass,
+            // Without the relay names are resolved by this computer; everything else would
+            // bypass the tunnel.
+            udp::Policy::Block if packet.destination_port == DNS_PORT => Verdict::Pass,
+            udp::Policy::Block => Verdict::Drop,
+            udp::Policy::Tunnel { quic: false } if packet.destination_port == QUIC_PORT => {
+                Verdict::Quic { rule }
+            }
+            udp::Policy::Tunnel { .. } => match udp::fragment(data) {
+                Some((key, true)) => {
+                    nat.fragments.insert(key, now);
+                    Verdict::Fragment { rule }
+                }
+                _ => Verdict::Capture { rule },
+            },
         };
     }
     if packet.source_port == relay_port {
@@ -278,8 +324,7 @@ pub fn handle(
 /// What the owner lookup needs to know about a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Origin {
-    pub v6: bool,
-    pub local_port: u16,
+    pub local: SocketAddr,
     pub remote: IpAddr,
     pub remote_port: u16,
 }
@@ -304,7 +349,7 @@ impl Matcher {
             decisions: HashMap::new(),
         }
     }
-    pub fn set_rules(&mut self, rules: &[DivertRule]) {
+    pub fn set_rules(&mut self, rules: &[DivertRule]) -> bool {
         let next: Vec<_> = rules
             .iter()
             .map(|rule| (rule.id.clone(), path_key(&rule.path), rule.children))
@@ -314,7 +359,16 @@ impl Matcher {
         if next != self.rules {
             self.rules = next;
             self.decisions.clear();
+            return true;
         }
+        false
+    }
+    /// Whether rule `id` matches the same executables as it did with `before`, the rules this
+    /// matcher had before its last `set_rules`.
+    pub fn unchanged(&self, before: &[(String, String, bool)], id: &str) -> bool {
+        let find =
+            |rules: &[(String, String, bool)]| rules.iter().find(|rule| rule.0 == id).cloned();
+        find(before).is_some_and(|rule| Some(rule) == find(&self.rules))
     }
     pub fn decide(&mut self, pid: u32, now: Instant, processes: &dyn Processes) -> Option<String> {
         if self.rules.is_empty() {
@@ -366,33 +420,36 @@ impl Matcher {
     }
 }
 
-/// Finds the owner of a local port in a Windows `GetExtended*Table` buffer of the
-/// `OWNER_PID` classes: a `u32` row count followed by fixed-size rows.
+// Windows OWNER_PID tables contain a row count followed by fixed-size rows.
+#[cfg(any(windows, test))]
+fn owner_rows(table: &[u8], row_size: usize) -> impl Iterator<Item = &[u8]> {
+    let (count, rows) = table.split_first_chunk::<4>().unwrap_or((&[0; 4], &[]));
+    rows.chunks_exact(row_size)
+        .take(u32::from_le_bytes(*count) as usize)
+}
+
+#[cfg(any(windows, test))]
+fn table_port(row: &[u8], offset: usize) -> u16 {
+    // The network-order port occupies the first two bytes of the 32-bit field.
+    u16::from_be_bytes([row[offset], row[offset + 1]])
+}
+
+#[cfg(any(windows, test))]
+fn table_pid(row: &[u8]) -> u32 {
+    u32::from_le_bytes(*row.last_chunk::<4>().unwrap())
+}
+
 /// A TCP row that also matches the remote port wins over one that shares only the local port.
-pub fn table_owner(
-    table: &[u8],
-    tcp: bool,
-    v6: bool,
-    local_port: u16,
-    remote_port: u16,
-) -> Option<u32> {
-    // (row size, local port, remote port, pid) offsets as laid out by iphlpapi.
-    let (row, local, remote, pid) = match (tcp, v6) {
-        (true, false) => (24, 8, 16, 20),
-        (true, true) => (56, 20, 44, 52),
-        (false, false) => (12, 4, 0, 8),
-        (false, true) => (28, 20, 0, 24),
-    };
-    let count = u32::from_le_bytes(table.get(..4)?.try_into().ok()?) as usize;
-    // Ports are stored in network byte order in the low half of a 32-bit field.
-    let port = |row: &[u8], at: usize| u16::from_be_bytes([row[at], row[at + 1]]);
+#[cfg(any(windows, test))]
+fn tcp_table_owner(table: &[u8], v6: bool, local_port: u16, remote_port: u16) -> Option<u32> {
+    let (size, local, remote) = if v6 { (56, 20, 44) } else { (24, 8, 16) };
     let mut fallback = None;
-    for row in table[4..].chunks_exact(row).take(count) {
-        if port(row, local) != local_port {
+    for row in owner_rows(table, size) {
+        if table_port(row, local) != local_port {
             continue;
         }
-        let owner = u32::from_le_bytes([row[pid], row[pid + 1], row[pid + 2], row[pid + 3]]);
-        if !tcp || port(row, remote) == remote_port {
+        let owner = table_pid(row);
+        if table_port(row, remote) == remote_port {
             return Some(owner);
         }
         fallback.get_or_insert(owner);
@@ -470,6 +527,18 @@ mod tests {
     fn foreign(_: u8, _: &Origin) -> Option<String> {
         None
     }
+    fn blocked(_: &str) -> udp::Policy {
+        udp::Policy::Block
+    }
+    fn direct(_: &str) -> udp::Policy {
+        udp::Policy::Direct
+    }
+    fn tunnel(_: &str) -> udp::Policy {
+        udp::Policy::Tunnel { quic: false }
+    }
+    fn tunnel_quic(_: &str) -> udp::Policy {
+        udp::Policy::Tunnel { quic: true }
+    }
 
     #[test]
     fn covered_connection_is_reflected_into_the_relay_and_back_for_both_families() {
@@ -486,7 +555,7 @@ mod tests {
             let (mut nat, now) = (Nat::default(), Instant::now());
             let mut syn = tcp(app, remote, 0x02);
             assert_eq!(
-                handle(&mut syn, RELAY, &mut nat, now, &mut covered),
+                handle(&mut syn, RELAY, &mut nat, now, &mut covered, &blocked),
                 Verdict::Reflect
             );
             // The relay accepts a connection that seems to come from the remote address.
@@ -496,7 +565,7 @@ mod tests {
 
             let mut answer = tcp(relay, &as_peer, 0x12);
             assert_eq!(
-                handle(&mut answer, RELAY, &mut nat, now, &mut foreign),
+                handle(&mut answer, RELAY, &mut nat, now, &mut foreign, &blocked),
                 Verdict::Reflect
             );
             // The application sees the answer as coming from the real destination.
@@ -505,7 +574,7 @@ mod tests {
             // Later packets follow the table, not the process lookup.
             let mut data = tcp(app, remote, 0x18);
             assert_eq!(
-                handle(&mut data, RELAY, &mut nat, now, &mut foreign),
+                handle(&mut data, RELAY, &mut nat, now, &mut foreign, &blocked),
                 Verdict::Reflect
             );
             assert_eq!(endpoints(&data).1, relay);
@@ -519,7 +588,7 @@ mod tests {
             let original = tcp("192.168.1.5:50001", "10.0.0.1:22", flags);
             let mut packet = original.clone();
             assert_eq!(
-                handle(&mut packet, RELAY, &mut nat, now, &mut foreign),
+                handle(&mut packet, RELAY, &mut nat, now, &mut foreign, &blocked),
                 Verdict::Pass
             );
             assert_eq!(packet, original);
@@ -527,31 +596,38 @@ mod tests {
         assert!(nat.is_empty());
         let mut stray = tcp("192.168.1.5:40000", "10.0.0.1:50001", 0x12);
         assert_eq!(
-            handle(&mut stray, RELAY, &mut nat, now, &mut covered),
+            handle(&mut stray, RELAY, &mut nat, now, &mut covered, &blocked),
             Verdict::Drop
         );
         // A reused local port that now belongs to a foreign process leaves the table.
         let mut syn = tcp("192.168.1.5:50002", "10.0.0.1:80", 0x02);
-        handle(&mut syn, RELAY, &mut nat, now, &mut covered);
+        handle(&mut syn, RELAY, &mut nat, now, &mut covered, &blocked);
         let mut reused = tcp("192.168.1.5:50002", "10.0.0.1:80", 0x02);
         assert_eq!(
-            handle(&mut reused, RELAY, &mut nat, now, &mut foreign),
+            handle(&mut reused, RELAY, &mut nat, now, &mut foreign, &blocked),
             Verdict::Pass
         );
         assert!(nat.is_empty());
         // Same port and address, other destination port: not this flow.
-        handle(&mut syn.clone(), RELAY, &mut nat, now, &mut covered);
+        handle(
+            &mut syn.clone(),
+            RELAY,
+            &mut nat,
+            now,
+            &mut covered,
+            &blocked,
+        );
         let mut syn = tcp("192.168.1.5:50002", "10.0.0.1:80", 0x02);
-        handle(&mut syn, RELAY, &mut nat, now, &mut covered);
+        handle(&mut syn, RELAY, &mut nat, now, &mut covered, &blocked);
         let mut other = tcp("192.168.1.5:50002", "10.0.0.1:8080", 0x10);
         assert_eq!(
-            handle(&mut other, RELAY, &mut nat, now, &mut foreign),
+            handle(&mut other, RELAY, &mut nat, now, &mut foreign, &blocked),
             Verdict::Pass
         );
         for garbage in [&[][..], &[0x45, 0, 0], &[0x10; 40]] {
             let mut packet = garbage.to_vec();
             assert_eq!(
-                handle(&mut packet, RELAY, &mut nat, now, &mut covered),
+                handle(&mut packet, RELAY, &mut nat, now, &mut covered, &blocked),
                 Verdict::Pass
             );
         }
@@ -566,15 +642,144 @@ mod tests {
             packet
         };
         assert_eq!(
-            handle(&mut udp(443), RELAY, &mut nat, now, &mut covered),
+            handle(&mut udp(443), RELAY, &mut nat, now, &mut covered, &blocked),
             Verdict::Drop
         );
         assert_eq!(
-            handle(&mut udp(53), RELAY, &mut nat, now, &mut covered),
+            handle(&mut udp(53), RELAY, &mut nat, now, &mut covered, &blocked),
             Verdict::Pass
         );
         assert_eq!(
-            handle(&mut udp(443), RELAY, &mut nat, now, &mut foreign),
+            handle(&mut udp(443), RELAY, &mut nat, now, &mut foreign, &blocked),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn covered_udp_goes_direct_while_the_rule_bypasses_a_stopped_tunnel() {
+        let (mut nat, now) = (Nat::default(), Instant::now());
+        for (source, destination) in [
+            ("192.168.1.5:50003", "8.8.8.8:443"),
+            ("[fd00::5]:50003", "[2001:db8::8]:3478"),
+        ] {
+            let mut packet = tcp(source, destination, 0);
+            packet[if source.starts_with('[') { 6 } else { 9 }] = UDP;
+            let original = packet.clone();
+            assert_eq!(
+                handle(&mut packet, RELAY, &mut nat, now, &mut covered, &direct),
+                Verdict::Pass
+            );
+            assert_eq!(packet, original);
+            assert_eq!(
+                handle(&mut packet, RELAY, &mut nat, now, &mut covered, &blocked),
+                Verdict::Drop
+            );
+        }
+        assert!(nat.is_empty());
+    }
+
+    #[test]
+    fn covered_udp_goes_to_the_relay_with_dns_and_quic_only_when_chosen() {
+        let (mut nat, now) = (Nat::default(), Instant::now());
+        let capture = Verdict::Capture {
+            rule: "rule".into(),
+        };
+        for (source, port) in [("192.168.1.5:50003", 3478), ("[fd00::5]:50003", 53)] {
+            let destination = if source.starts_with('[') {
+                format!("[2001:db8::8]:{port}")
+            } else {
+                format!("8.8.8.8:{port}")
+            };
+            let mut packet = tcp(source, &destination, 0);
+            packet[if source.starts_with('[') { 6 } else { 9 }] = UDP;
+            let original = packet.clone();
+            assert_eq!(
+                handle(&mut packet, RELAY, &mut nat, now, &mut covered, &tunnel),
+                capture
+            );
+            assert_eq!(packet, original, "captured packets are not rewritten");
+        }
+        let udp = |port: u16| {
+            let mut packet = tcp("192.168.1.5:50004", &format!("8.8.8.8:{port}"), 0);
+            packet[9] = UDP;
+            packet
+        };
+        assert_eq!(
+            handle(&mut udp(443), RELAY, &mut nat, now, &mut covered, &tunnel),
+            Verdict::Quic {
+                rule: "rule".into()
+            }
+        );
+        assert_eq!(
+            handle(
+                &mut udp(443),
+                RELAY,
+                &mut nat,
+                now,
+                &mut covered,
+                &tunnel_quic
+            ),
+            capture
+        );
+        assert_eq!(
+            handle(&mut udp(443), RELAY, &mut nat, now, &mut foreign, &tunnel),
+            Verdict::Pass
+        );
+        assert!(nat.is_empty());
+    }
+
+    #[test]
+    fn fragmented_datagrams_of_tunnelled_rules_are_dropped_whole() {
+        let (mut nat, now) = (Nat::default(), Instant::now());
+        let first = |more: bool, offset: u16| {
+            let mut packet = tcp("192.168.1.5:50003", "8.8.8.8:3478", 0);
+            packet[9] = UDP;
+            packet[4..6].copy_from_slice(&900u16.to_be_bytes());
+            let field = offset | if more { 0x2000 } else { 0 };
+            packet[6..8].copy_from_slice(&field.to_be_bytes());
+            packet
+        };
+        assert_eq!(
+            handle(
+                &mut first(true, 0),
+                RELAY,
+                &mut nat,
+                now,
+                &mut covered,
+                &tunnel
+            ),
+            Verdict::Fragment {
+                rule: "rule".into()
+            }
+        );
+        assert_eq!(
+            handle(
+                &mut first(false, 185),
+                RELAY,
+                &mut nat,
+                now,
+                &mut covered,
+                &tunnel
+            ),
+            Verdict::Drop
+        );
+        // Followers of datagrams that were not dropped pass, and the memory fades.
+        let mut other = first(false, 185);
+        other[4..6].copy_from_slice(&901u16.to_be_bytes());
+        assert_eq!(
+            handle(&mut other, RELAY, &mut nat, now, &mut covered, &tunnel),
+            Verdict::Pass
+        );
+        nat.purge(now + FRAGMENT_WINDOW);
+        assert_eq!(
+            handle(
+                &mut first(false, 185),
+                RELAY,
+                &mut nat,
+                now,
+                &mut covered,
+                &tunnel
+            ),
             Verdict::Pass
         );
     }
@@ -584,20 +789,20 @@ mod tests {
         let (mut nat, start) = (Nat::default(), Instant::now());
         let open = |nat: &mut Nat, port: u16| {
             let mut syn = tcp(&format!("192.168.1.5:{port}"), "10.0.0.1:443", 0x02);
-            handle(&mut syn, RELAY, nat, start, &mut covered);
+            handle(&mut syn, RELAY, nat, start, &mut covered, &blocked);
         };
         open(&mut nat, 1);
         open(&mut nat, 2);
         open(&mut nat, 3);
         // 1: both sides finish. 2: reset. 3: stays idle.
         let mut fin = tcp("192.168.1.5:1", "10.0.0.1:443", 0x11);
-        handle(&mut fin, RELAY, &mut nat, start, &mut foreign);
+        handle(&mut fin, RELAY, &mut nat, start, &mut foreign, &blocked);
         nat.purge(start + CLOSED_FLOW * 2);
         assert_eq!(nat.len(), 3, "a half-closed connection is still alive");
         let mut fin = tcp("192.168.1.5:40000", "10.0.0.1:1", 0x11);
-        handle(&mut fin, RELAY, &mut nat, start, &mut foreign);
+        handle(&mut fin, RELAY, &mut nat, start, &mut foreign, &blocked);
         let mut reset = tcp("192.168.1.5:2", "10.0.0.1:443", 0x04);
-        handle(&mut reset, RELAY, &mut nat, start, &mut foreign);
+        handle(&mut reset, RELAY, &mut nat, start, &mut foreign, &blocked);
         nat.purge(start + CLOSED_FLOW / 2);
         assert_eq!(nat.len(), 3);
         nat.purge(start + CLOSED_FLOW * 2);
@@ -622,7 +827,37 @@ mod tests {
             children,
             direct: false,
             proxy: None,
+            udp: false,
+            quic: false,
         }
+    }
+
+    #[test]
+    fn rule_changes_are_told_apart_from_unchanged_rules() {
+        let mut matcher = Matcher::new(r"C:\KROT\krot.exe");
+        assert!(matcher.set_rules(&[
+            rule("kept", r"C:\Apps\kept.exe", true),
+            rule("edited", r"C:\Apps\old.exe", true),
+            rule("removed", r"C:\Apps\gone.exe", true),
+        ]));
+        let before = matcher.rules.clone();
+        assert!(matcher.set_rules(&[
+            rule("kept", r"C:\Apps\kept.exe", true),
+            rule("edited", r"C:\Apps\new.exe", true),
+            rule("added", r"C:\Apps\added.exe", true),
+        ]));
+        assert!(matcher.unchanged(&before, "kept"));
+        for id in ["edited", "removed", "added", "unknown"] {
+            assert!(!matcher.unchanged(&before, id), "{id}");
+        }
+        // The same rules again are no change at all.
+        let same = matcher.rules.clone();
+        assert!(!matcher.set_rules(&[
+            rule("kept", r"C:\Apps\kept.exe", true),
+            rule("edited", r"C:\Apps\new.exe", true),
+            rule("added", r"C:\Apps\added.exe", true),
+        ]));
+        assert_eq!(matcher.rules, same);
     }
 
     #[test]
@@ -686,8 +921,14 @@ mod tests {
         assert_eq!(missing_components(directory.path()).len(), 2);
     }
 
+    fn owner_table(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut table = (rows.len() as u32).to_le_bytes().to_vec();
+        table.extend(rows.iter().flatten());
+        table
+    }
+
     #[test]
-    fn port_owner_is_read_from_all_four_system_table_layouts() {
+    fn tcp_owner_is_read_from_both_system_table_layouts() {
         fn row(size: usize, fields: &[(usize, u32)], ports: &[(usize, u16)]) -> Vec<u8> {
             let mut row = vec![0u8; size];
             for (at, value) in fields {
@@ -698,30 +939,21 @@ mod tests {
             }
             row
         }
-        fn table(rows: &[Vec<u8>]) -> Vec<u8> {
-            let mut table = (rows.len() as u32).to_le_bytes().to_vec();
-            rows.iter().for_each(|row| table.extend(row));
-            table
-        }
-        let tcp4 = table(&[
+        let tcp4 = owner_table(&[
             row(24, &[(20, 100)], &[(8, 50000), (16, 80)]),
             row(24, &[(20, 200)], &[(8, 50000), (16, 443)]),
             row(24, &[(20, 300)], &[(8, 50001), (16, 443)]),
         ]);
-        assert_eq!(table_owner(&tcp4, true, false, 50000, 443), Some(200));
-        assert_eq!(table_owner(&tcp4, true, false, 50000, 22), Some(100));
-        assert_eq!(table_owner(&tcp4, true, false, 50002, 443), None);
-        let tcp6 = table(&[row(56, &[(52, 400)], &[(20, 50000), (44, 443)])]);
-        assert_eq!(table_owner(&tcp6, true, true, 50000, 443), Some(400));
-        let udp4 = table(&[row(12, &[(8, 500)], &[(4, 50000)])]);
-        assert_eq!(table_owner(&udp4, false, false, 50000, 9), Some(500));
-        let udp6 = table(&[row(28, &[(24, 600)], &[(20, 50000)])]);
-        assert_eq!(table_owner(&udp6, false, true, 50000, 9), Some(600));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50000, 443), Some(200));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50000, 22), Some(100));
+        assert_eq!(tcp_table_owner(&tcp4, false, 50002, 443), None);
+        let tcp6 = owner_table(&[row(56, &[(52, 400)], &[(20, 50000), (44, 443)])]);
+        assert_eq!(tcp_table_owner(&tcp6, true, 50000, 443), Some(400));
         // A count larger than the buffer and a truncated buffer are both harmless.
         let mut short = tcp4.clone();
         short[0] = 200;
         short.truncate(4 + 24 + 10);
-        assert_eq!(table_owner(&short, true, false, 50000, 80), Some(100));
-        assert_eq!(table_owner(&[1, 0], true, false, 1, 1), None);
+        assert_eq!(tcp_table_owner(&short, false, 50000, 80), Some(100));
+        assert_eq!(tcp_table_owner(&[1, 0], false, 1, 1), None);
     }
 }

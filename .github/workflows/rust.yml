@@ -8,7 +8,41 @@ on:
 permissions:
   contents: read
 jobs:
+  relay:
+    # The server UDP relay: static Linux builds that the client embeds.
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+      # Retries: a mirror that briefly fails to resolve must not fail the build.
+      - run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends qemu-user
+      - run: cargo +stable test --locked -p krot-udp-proto -p krot-relay --target x86_64-unknown-linux-musl
+      - run: cargo +stable test --locked -p krot-udp-proto -p krot-relay --target aarch64-unknown-linux-musl
+        env:
+          KROT_RELAY_RUNNER: qemu-aarch64
+      - name: Build the relay for both architectures
+        run: |
+          mkdir relay-bin
+          for arch in x86_64 aarch64; do
+            cargo +stable build --locked -p krot-relay --profile relay --target "$arch-unknown-linux-musl"
+            cp "target/$arch-unknown-linux-musl/relay/krot-relay" "relay-bin/krot-relay-$arch"
+          done
+          sha256sum relay-bin/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: krot-relay
+          path: relay-bin/
+          if-no-files-found: error
   rust:
+    needs: relay
+    env:
+      KROT_RELAY_DIR: ${{ github.workspace }}/relay-bin
+      KROT_REQUIRE_RELAY: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -16,16 +50,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: krot-relay
+          path: relay-bin
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - run: cargo +stable fmt --check
+      - run: cargo +stable fmt --all --check
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - run: python -m pip install -r requirements-test.txt
       - run: python scripts/build_icons.py --check
       - run: python -m unittest discover -s tests -p 'test_*.py' -v
-      - run: cargo +stable clippy --all-targets --locked -- -D warnings
-      - run: cargo +stable test --locked
+      - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo +stable test --workspace --locked
       - if: runner.os == 'Linux'
         run: dbus-run-session -- cargo +stable test --locked --test tray_linux -- --ignored
       - if: runner.os == 'Linux'

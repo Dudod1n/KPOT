@@ -30,8 +30,8 @@ python3 -m venv .venv
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 cargo build --locked --bins
 python scripts/build_icons.py --check
 python -m unittest discover -s tests -p 'test_*.py' -v
@@ -41,6 +41,23 @@ python scripts/check_rust.py -v
 Выполняйте команды Python из виртуального окружения. `scripts/check_rust.py` запускает временные SSH-серверы AsyncSSH на loopback-адресах и проверяет собранный `target/debug/krot-cli`. Для другого бинарника задайте переменную `KROT_RUST_BIN`.
 
 Сценарии охватывают L/R/D, два jump-хоста, пароль, зашифрованный ключ, SSH-agent, смену ключа узла, переподключение, отмену, восстановление, локальный протокол и освобождение соединений. Пользовательские настройки и SSH-серверы для них не нужны. Проверка агента пропускается на Windows и при отсутствии OpenSSH.
+
+### Серверный помощник UDP
+
+`proto/` — формат кадров UDP-канала и общие метрики, `relay/` — серверный помощник `krot-relay` (только Linux, без tokio). Клиент встраивает статические сборки помощника для `x86_64` и `aarch64` из каталога `KROT_RELAY_DIR` (файлы `krot-relay-x86_64` и `krot-relay-aarch64`) и считает их SHA-256 при сборке. Без этой переменной клиент собирается без помощника; CI и выпуск задают `KROT_REQUIRE_RELAY=1`, и тогда сборка без обоих файлов завершается ошибкой.
+
+```sh
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+mkdir -p relay-bin
+cargo build --locked -p krot-relay --profile relay --target x86_64-unknown-linux-musl
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+  cargo build --locked -p krot-relay --profile relay --target aarch64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/relay/krot-relay relay-bin/krot-relay-x86_64
+cp target/aarch64-unknown-linux-musl/relay/krot-relay relay-bin/krot-relay-aarch64
+KROT_RELAY_DIR="$PWD/relay-bin" KROT_REQUIRE_RELAY=1 cargo build --locked --bins
+```
+
+Тесты помощника под `aarch64` запускаются через `qemu-user`: задайте `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64` и `KROT_RELAY_RUNNER=qemu-aarch64`.
 
 Linux-тест трея запускается отдельно на изолированной D-Bus шине:
 
@@ -58,6 +75,8 @@ dbus-run-session -- cargo test --locked --test tray_linux -- --ignored
 | `src/background.rs` | Фоновый процесс и аутентифицированный локальный протокол |
 | `src/config.rs` | Формат конфигурации, проверка и атомарное сохранение |
 | `src/tray.rs`, `src/icons.rs` | Системный трей и иконки |
+| `src/relay.rs`, `build.rs` | Встроенные сборки серверного помощника UDP и их SHA-256 |
+| `proto/`, `relay/` | Кадры UDP-канала, общие метрики и серверный помощник `krot-relay` |
 | `src/autostart.rs` | Регистрация автозапуска |
 | `src/update.rs` | Проверка, загрузка и установка обновлений |
 | `scripts/check_rust.py`, `tests/ssh_support.py` | Независимые интеграционные проверки SSH |

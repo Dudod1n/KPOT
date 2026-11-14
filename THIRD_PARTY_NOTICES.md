@@ -29,3 +29,8 @@ driver and library (`WinDivert64.sys`, `WinDivert.dll`), unmodified and loaded
 at run time. WinDivert is licensed under LGPL-3.0-or-later or GPL-2.0-or-later;
 its license text ships as `WinDivert-LICENSE.txt`. `scripts/fetch_windivert.py`
 downloads the files from the upstream release and checks pinned SHA-256 hashes.
+
+The client embeds `krot-relay`, KROT's own server-side UDP helper, as static Linux
+builds for x86_64 and aarch64. They statically link the musl C library (MIT,
+`licenses/musl/COPYRIGHT.txt`) and the `libc` crate. `THIRD_PARTY_NOTICES.txt`
+lists them in a separate section collected for the `*-unknown-linux-musl` targets.

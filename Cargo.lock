@@ -2270,7 +2270,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "krot"
-version = "0.5.8"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2281,6 +2281,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "krot-udp-proto",
  "rand 0.9.5",
  "raw-window-handle",
  "reqwest",
@@ -2303,6 +2304,18 @@ dependencies = [
  "zbus",
  "zeroize",
 ]
+
+[[package]]
+name = "krot-relay"
+version = "0.0.0"
+dependencies = [
+ "krot-udp-proto",
+ "libc",
+]
+
+[[package]]
+name = "krot-udp-proto"
+version = "0.0.0"
 
 [[package]]
 name = "ksni"
