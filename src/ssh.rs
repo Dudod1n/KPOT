@@ -70,6 +70,9 @@ const AUTH: Problem = Problem {
     message: "SSH-сервер отклонил авторизацию. Проверьте пользователя и способ входа.",
     retryable: false,
 };
+/// A connection that may not ask the user needed an answer: a password or a host key check.
+const NEEDS_USER: Problem =
+    Problem::terminal("Для этого подключения нужен ввод пароля или проверка ключа узла.");
 const KEY_FILE: Problem = Problem {
     message: "Не удалось открыть SSH-ключ: проверьте файл и пароль ключа.",
     retryable: false,
@@ -94,6 +97,33 @@ impl Default for Runtime {
         }
     }
 }
+/// State of a tunnel's UDP through the server relay.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UdpRuntime {
+    /// `off`, `waiting`, `starting`, `running` or `unavailable`.
+    pub state: String,
+    /// Why UDP is unavailable, or what it waits for.
+    pub message: String,
+    /// Transport level; 1 while only the separate SSH connection exists.
+    pub level: u8,
+    pub since: Option<f64>,
+    pub starts: u64,
+    pub uploads: u64,
+}
+
+/// Transports of running UDP relays, for the background process to route datagrams.
+pub enum UdpNotice {
+    Up {
+        tunnel: String,
+        transport: Arc<crate::udp::transport::Transport>,
+        events: mpsc::Receiver<crate::udp::transport::Event>,
+    },
+    Down {
+        tunnel: String,
+    },
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Prompt {
     pub kind: String,
@@ -129,12 +159,21 @@ struct State {
     runtimes: HashMap<String, Runtime>,
     prompts: HashMap<String, WaitingPrompt>,
     tasks: HashMap<String, Task>,
+    /// Tunnels whose user agreed to the UDP relay.
+    udp_enabled: HashSet<String>,
+    udp: HashMap<String, UdpRuntime>,
+    udp_links: HashMap<String, Arc<crate::udp::transport::Transport>>,
+    /// Secrets of running tunnels, for the relay's removal while the tunnel runs.
+    credentials: HashMap<String, Credentials>,
 }
 struct Inner {
     known_hosts: PathBuf,
     state: Mutex<State>,
     lifecycle: Mutex<()>,
     trust_write: Mutex<()>,
+    udp_sink: StdMutex<Option<mpsc::UnboundedSender<UdpNotice>>>,
+    udp_changed: watch::Sender<u64>,
+    retiring: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 #[derive(Clone)]
 pub struct Manager(Arc<Inner>);
@@ -145,7 +184,146 @@ impl Manager {
             state: Mutex::new(State::default()),
             lifecycle: Mutex::new(()),
             trust_write: Mutex::new(()),
+            udp_sink: StdMutex::new(None),
+            udp_changed: watch::channel(0).0,
+            retiring: StdMutex::new(HashMap::new()),
         }))
+    }
+    /// Where transports of running relays are announced.
+    pub fn set_udp_sink(&self, sink: mpsc::UnboundedSender<UdpNotice>) {
+        *self.0.udp_sink.lock().unwrap() = Some(sink);
+    }
+    /// Tunnels that may run the UDP relay; the others stop theirs.
+    pub async fn set_udp(&self, enabled: HashSet<String>) {
+        let mut state = self.0.state.lock().await;
+        if state.udp_enabled != enabled {
+            state.udp_enabled = enabled;
+            drop(state);
+            self.0
+                .udp_changed
+                .send_modify(|generation| *generation += 1);
+        }
+    }
+    /// Takes the relay off the tunnel's server, after its consent was revoked. Runs on its own,
+    /// one removal at a time per tunnel, over a connection of its own, so that it works for a
+    /// stopped tunnel too and never holds up other commands. The relay of a session that is
+    /// still starting or running is stopped first, so that nothing is uploaded afterwards.
+    pub async fn retire_udp(&self, tunnel: Tunnel) {
+        // Secrets the running tunnel holds are reused, taken now: the tunnel may stop next.
+        let credentials = self
+            .0
+            .state
+            .lock()
+            .await
+            .credentials
+            .get(&tunnel.id)
+            .cloned()
+            .unwrap_or_default();
+        let manager = self.clone();
+        tokio::spawn(async move { manager.retire(tunnel, credentials).await });
+    }
+    async fn retire(&self, tunnel: Tunnel, credentials: Credentials) {
+        let serial = self
+            .0
+            .retiring
+            .lock()
+            .unwrap()
+            .entry(tunnel.id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        let _ = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let busy = self
+                    .0
+                    .state
+                    .lock()
+                    .await
+                    .udp
+                    .get(&tunnel.id)
+                    .is_some_and(|runtime| {
+                        matches!(runtime.state.as_str(), "starting" | "running")
+                    });
+                if !busy {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        let mut attempt = Attempt::new(CancellationToken::new());
+        let removed = tokio::time::timeout(Duration::from_secs(40), async {
+            self.connect(&tunnel, &mut attempt, &credentials, Purpose::Udp)
+                .await
+                .ok()?;
+            let connection = attempt.sessions.last().cloned()?;
+            Some(crate::udp::deliver::remove(&connection).await)
+        })
+        .await
+        .ok()
+        .flatten()
+            == Some(true);
+        attempt.cleanup().await;
+        self.log(
+            &tunnel.id,
+            if removed {
+                "UDP: помощник удалён с сервера."
+            } else {
+                "UDP: помощник не удалён с сервера: сервер недоступен или для входа нужен пароль."
+            },
+        )
+        .await;
+    }
+    /// UDP state of every tunnel that has one, with the metrics of running transports.
+    pub async fn udp_snapshot(
+        &self,
+    ) -> HashMap<String, (UdpRuntime, Option<crate::udp::transport::TransportMetrics>)> {
+        let state = self.0.state.lock().await;
+        state
+            .udp
+            .iter()
+            .map(|(id, runtime)| {
+                (
+                    id.clone(),
+                    (
+                        runtime.clone(),
+                        state.udp_links.get(id).map(|transport| transport.metrics()),
+                    ),
+                )
+            })
+            .collect()
+    }
+    fn announce(&self, notice: UdpNotice) {
+        if let Some(sink) = self.0.udp_sink.lock().unwrap().as_ref() {
+            let _ = sink.send(notice);
+        }
+    }
+    async fn udp_state(&self, id: &str, status: &str, message: &str) {
+        let mut state = self.0.state.lock().await;
+        let runtime = state.udp.entry(id.into()).or_default();
+        if runtime.state == status && runtime.message == message {
+            return;
+        }
+        runtime.since = (status == "running").then(now);
+        if status == "running" {
+            runtime.starts += 1;
+            runtime.level = 1;
+        } else {
+            runtime.level = 0;
+        }
+        runtime.state = status.into();
+        runtime.message = message.into();
+        let line = match status {
+            "running" => Some("UDP: помощник на сервере работает, уровень 1.".to_owned()),
+            "unavailable" => Some(format!("UDP недоступен: {message}")),
+            "off" => Some("UDP выключен.".to_owned()),
+            _ => None,
+        };
+        if let Some(line) = line
+            && let Some(tunnel) = state.runtimes.get_mut(id)
+        {
+            push_log(tunnel, &line);
+        }
     }
     pub async fn start(&self, tunnel: Tunnel) -> Result<()> {
         validate_tunnel(&tunnel, &[])?;
@@ -317,6 +495,7 @@ impl Manager {
         hop: &str,
         key: &PublicKey,
         cancel: &CancellationToken,
+        interactive: bool,
     ) -> std::result::Result<(), Problem> {
         let identity = format!(
             "[{}]:{}",
@@ -333,6 +512,9 @@ impl Manager {
             };
             if old.as_deref().is_some_and(|s| same_key(s, key)) {
                 return Ok(());
+            }
+            if !interactive {
+                return Err(NEEDS_USER);
             }
             let mut request = prompt(
                 if old.is_some() {
@@ -390,12 +572,25 @@ impl Manager {
         update(runtime, status, message);
     }
     async fn run(&self, tunnel: Tunnel, cancel: CancellationToken) {
-        let mut credentials = HashMap::new();
+        let credentials = Credentials::default();
+        self.0
+            .state
+            .lock()
+            .await
+            .credentials
+            .insert(tunnel.id.clone(), credentials.clone());
+        let udp = (tunnel.kind == "D").then(|| {
+            let manager = self.clone();
+            let tunnel = tunnel.clone();
+            let cancel = cancel.child_token();
+            let credentials = credentials.clone();
+            tokio::spawn(async move { manager.udp_run(tunnel, cancel, credentials).await })
+        });
         let mut delay = 1;
         loop {
             let mut attempt = Attempt::new(cancel.child_token());
             let result = {
-                let forward = self.forward(&tunnel, &mut attempt, &mut credentials);
+                let forward = self.forward(&tunnel, &mut attempt, &credentials);
                 tokio::pin!(forward);
                 tokio::select! {
                     biased;
@@ -425,116 +620,186 @@ impl Manager {
             tokio::select! { _ = cancel.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(delay)) => {} }
             delay = (delay * 2).min(30);
         }
-        self.0
-            .state
-            .lock()
-            .await
+        if let Some(udp) = udp {
+            // The token is a child of `cancel`; a tunnel that stopped on an error cancels it here.
+            udp.abort();
+            let _ = udp.await;
+            self.udp_down(&tunnel.id).await;
+            self.udp_state(&tunnel.id, "off", "").await;
+        }
+        let mut state = self.0.state.lock().await;
+        state
             .prompts
             .retain(|_, p| p.prompt.request.tunnel_id != tunnel.id);
+        state.credentials.remove(&tunnel.id);
+    }
+    async fn udp_down(&self, id: &str) {
+        if self.0.state.lock().await.udp_links.remove(id).is_some() {
+            self.announce(UdpNotice::Down { tunnel: id.into() });
+        }
+    }
+    /// Keeps the tunnel's UDP relay running on its own SSH connection while UDP is enabled
+    /// and the tunnel runs. Its failures never touch the tunnel itself.
+    async fn udp_run(&self, tunnel: Tunnel, cancel: CancellationToken, credentials: Credentials) {
+        let mut changes = self.0.udp_changed.subscribe();
+        let mut delay = 1u64;
+        loop {
+            loop {
+                let (enabled, running) = {
+                    let state = self.0.state.lock().await;
+                    (
+                        state.udp_enabled.contains(&tunnel.id),
+                        state
+                            .runtimes
+                            .get(&tunnel.id)
+                            .is_some_and(|runtime| runtime.state == "running"),
+                    )
+                };
+                match (enabled, running) {
+                    (false, _) => self.udp_state(&tunnel.id, "off", "").await,
+                    (true, false) => {
+                        self.udp_state(&tunnel.id, "waiting", "Ждёт подключения туннеля.")
+                            .await
+                    }
+                    (true, true) => break,
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = changes.changed() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                }
+            }
+            self.udp_state(&tunnel.id, "starting", "Запуск помощника на сервере…")
+                .await;
+            let mut attempt = Attempt::new(cancel.child_token());
+            let result = self
+                .udp_session(&tunnel, &mut attempt, &credentials, &mut changes)
+                .await;
+            self.udp_down(&tunnel.id).await;
+            attempt.cleanup().await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            let wait = match result {
+                // Switched off: back to waiting for it, without delay.
+                Ok(()) => continue,
+                Err((message, retryable)) => {
+                    self.udp_state(&tunnel.id, "unavailable", message).await;
+                    if retryable {
+                        let wait = delay;
+                        delay = (delay * 2).min(60);
+                        wait
+                    } else {
+                        300
+                    }
+                }
+            };
+            // A changed setting is a reason to try at once.
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = changes.changed() => delay = 1,
+                _ = tokio::time::sleep(Duration::from_secs(wait)) => {},
+            }
+        }
+    }
+    /// One UDP connection with its relay, until it fails or UDP is switched off (`Ok`).
+    /// Returns once UDP is switched off for the tunnel, at once if it already is.
+    async fn udp_disabled(&self, id: &str, changes: &mut watch::Receiver<u64>) {
+        loop {
+            if !self.0.state.lock().await.udp_enabled.contains(id) {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    async fn udp_session(
+        &self,
+        tunnel: &Tunnel,
+        attempt: &mut Attempt,
+        credentials: &Credentials,
+        changes: &mut watch::Receiver<u64>,
+    ) -> std::result::Result<(), (&'static str, bool)> {
+        let cancel = attempt.cancel.clone();
+        let setup = async {
+            self.connect(tunnel, attempt, credentials, Purpose::Udp)
+                .await
+                .map_err(|problem| (problem.message, problem.retryable))?;
+            let connection = attempt
+                .sessions
+                .last()
+                .cloned()
+                .ok_or((NETWORK.message, true))?;
+            let launched =
+                crate::udp::deliver::launch(&connection, crate::udp::transport::default_settings())
+                    .await
+                    .map_err(|problem| (problem.message(), problem.retryable()))?;
+            Ok((connection, launched))
+        };
+        // Switching UDP off stops the probe, the upload and the start before their next step.
+        let (connection, launched) = tokio::select! {
+            biased;
+            _ = self.udp_disabled(&tunnel.id, changes) => return Ok(()),
+            _ = cancel.cancelled() => return Err((CANCELLED.message, false)),
+            result = setup => result?,
+        };
+        let transport = Arc::new(launched.transport);
+        {
+            let mut state = self.0.state.lock().await;
+            if launched.uploaded {
+                state.udp.entry(tunnel.id.clone()).or_default().uploads += 1;
+                if let Some(runtime) = state.runtimes.get_mut(&tunnel.id) {
+                    push_log(runtime, "UDP: помощник загружен на сервер.");
+                }
+            }
+            state.udp_links.insert(tunnel.id.clone(), transport.clone());
+        }
+        self.announce(UdpNotice::Up {
+            tunnel: tunnel.id.clone(),
+            transport: transport.clone(),
+            events: launched.events,
+        });
+        self.udp_state(&tunnel.id, "running", "").await;
+        let mut check = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = attempt.cancel.cancelled() => return Err((CANCELLED.message, false)),
+                failure = transport.failed() => {
+                    return Err((match failure {
+                        crate::udp::transport::Failure::Timeout => "Помощник UDP на сервере перестал отвечать.",
+                        crate::udp::transport::Failure::Protocol => "Помощник UDP на сервере ответил некорректно.",
+                        _ => crate::udp::deliver::Problem::Failed.message(),
+                    }, true));
+                },
+                // Switched off: the relay stops with this session; `retire_udp` removes it.
+                _ = self.udp_disabled(&tunnel.id, changes) => return Ok(()),
+                _ = check.tick() => {
+                    if connection.is_closed() {
+                        return Err((NETWORK.message, true));
+                    }
+                },
+            }
+        }
     }
     async fn forward(
         &self,
         tunnel: &Tunnel,
         attempt: &mut Attempt,
-        credentials: &mut HashMap<String, Credential>,
+        credentials: &Credentials,
     ) -> std::result::Result<(), Problem> {
-        if attempt.cancel.is_cancelled() {
-            return Err(CANCELLED);
-        }
-        let jumps = if tunnel.jumps_enabled {
-            tunnel.jumps.as_slice()
-        } else {
-            &[]
-        };
         let (remote_send, mut remote_receive) = mpsc::channel(64);
         let expected = Arc::new(StdMutex::new(None));
-        for (index, endpoint) in jumps
-            .iter()
-            .chain(std::iter::once(&tunnel.server))
-            .enumerate()
-        {
-            if attempt.cancel.is_cancelled() {
-                return Err(CANCELLED);
-            }
-            let hop = if index < jumps.len() {
-                format!("Jump host {}/{}", index + 1, jumps.len())
-            } else {
-                "Конечный SSH-сервер".into()
-            };
-            self.state(
-                &tunnel.id,
-                "connecting",
-                &format!("{hop}: {}", endpoint.address()),
-                Some(&hop),
-            )
-            .await;
-            let stream: Box<dyn Transport> = if let Some(previous) = attempt.sessions.last() {
-                let channel = interruptible(
-                    &attempt.cancel,
-                    previous.channel_open_direct_tcpip(
-                        unbracket(&endpoint.host),
-                        u32::from(endpoint.port),
-                        "127.0.0.1",
-                        0,
-                    ),
-                )
-                .await??;
-                Box::new(channel.into_stream())
-            } else {
-                // DNS and TCP connect do not see the transport token.
-                Box::new(
-                    interruptible(
-                        &attempt.cancel,
-                        TcpStream::connect((unbracket(&endpoint.host), endpoint.port)),
-                    )
-                    .await?
-                    .map_err(|_| NETWORK)?,
-                )
-            };
-            let (waiting_send, waiting_receive) = watch::channel(false);
-            let handler = Handler {
-                manager: self.clone(),
-                tunnel: tunnel.clone(),
-                endpoint: endpoint.clone(),
-                hop: hop.clone(),
-                cancel: attempt.cancel.clone(),
-                waiting: waiting_send,
-                pinned: None,
-                remote: if index == jumps.len() {
-                    Some(remote_send.clone())
-                } else {
-                    None
-                },
+        self.connect(
+            tunnel,
+            attempt,
+            credentials,
+            Purpose::Tunnel {
+                remote: remote_send,
                 expected: expected.clone(),
-                failure: attempt.failure.clone(),
-            };
-            let stream = CancelIo::new(stream, attempt.cancel.clone());
-            let config = Arc::new(client::Config {
-                nodelay: true,
-                keepalive_interval: Some(Duration::from_secs(15)),
-                keepalive_max: 3,
-                ..Default::default()
-            });
-            let session = connecting(
-                client::connect_stream(config, stream, handler),
-                waiting_receive,
-                &attempt.cancel,
-            )
-            .await?;
-            // Keep ownership before authentication, so a failed login closes its transport too.
-            attempt.sessions.push(Arc::new(session));
-            let session =
-                Arc::get_mut(attempt.sessions.last_mut().ok_or(NETWORK)?).ok_or(NETWORK)?;
-            self.authenticate(
-                session,
-                tunnel,
-                endpoint,
-                &hop,
-                credentials,
-                &attempt.cancel,
-            )
-            .await?;
-        }
+            },
+        )
+        .await?;
         let connection = attempt.sessions.last().cloned().ok_or(NETWORK)?;
         if tunnel.kind == "R" {
             *expected.lock().unwrap() = Some(RemoteRoute {
@@ -603,14 +868,131 @@ impl Manager {
             }
         }
     }
+    /// Opens the SSH session to the tunnel's server through its jump hosts and logs in.
+    /// The session ends up last in `attempt.sessions`.
+    async fn connect(
+        &self,
+        tunnel: &Tunnel,
+        attempt: &mut Attempt,
+        credentials: &Credentials,
+        purpose: Purpose,
+    ) -> std::result::Result<(), Problem> {
+        if attempt.cancel.is_cancelled() {
+            return Err(CANCELLED);
+        }
+        let interactive = matches!(purpose, Purpose::Tunnel { .. });
+        let (remote, expected) = match purpose {
+            Purpose::Tunnel { remote, expected } => (Some(remote), expected),
+            Purpose::Udp => (None, Arc::new(StdMutex::new(None))),
+        };
+        let jumps = if tunnel.jumps_enabled {
+            tunnel.jumps.as_slice()
+        } else {
+            &[]
+        };
+        for (index, endpoint) in jumps
+            .iter()
+            .chain(std::iter::once(&tunnel.server))
+            .enumerate()
+        {
+            if attempt.cancel.is_cancelled() {
+                return Err(CANCELLED);
+            }
+            let hop = if index < jumps.len() {
+                format!("Jump host {}/{}", index + 1, jumps.len())
+            } else {
+                "Конечный SSH-сервер".into()
+            };
+            if interactive {
+                self.state(
+                    &tunnel.id,
+                    "connecting",
+                    &format!("{hop}: {}", endpoint.address()),
+                    Some(&hop),
+                )
+                .await;
+            }
+            let stream: Box<dyn Transport> = if let Some(previous) = attempt.sessions.last() {
+                let channel = interruptible(
+                    &attempt.cancel,
+                    previous.channel_open_direct_tcpip(
+                        unbracket(&endpoint.host),
+                        u32::from(endpoint.port),
+                        "127.0.0.1",
+                        0,
+                    ),
+                )
+                .await??;
+                Box::new(channel.into_stream())
+            } else {
+                // DNS and TCP connect do not see the transport token.
+                Box::new(
+                    interruptible(
+                        &attempt.cancel,
+                        first_hop(unbracket(&endpoint.host), endpoint.port, interactive),
+                    )
+                    .await?
+                    .map_err(|_| NETWORK)?,
+                )
+            };
+            let (waiting_send, waiting_receive) = watch::channel(false);
+            let handler = Handler {
+                manager: self.clone(),
+                tunnel: tunnel.clone(),
+                endpoint: endpoint.clone(),
+                hop: hop.clone(),
+                cancel: attempt.cancel.clone(),
+                waiting: waiting_send,
+                pinned: None,
+                remote: if index == jumps.len() {
+                    remote.clone()
+                } else {
+                    None
+                },
+                expected: expected.clone(),
+                failure: attempt.failure.clone(),
+                interactive,
+            };
+            let stream = CancelIo::new(stream, attempt.cancel.clone());
+            let config = Arc::new(client::Config {
+                nodelay: true,
+                keepalive_interval: Some(Duration::from_secs(15)),
+                keepalive_max: 3,
+                ..Default::default()
+            });
+            let session = connecting(
+                client::connect_stream(config, stream, handler),
+                waiting_receive,
+                &attempt.cancel,
+            )
+            .await?;
+            // Keep ownership before authentication, so a failed login closes its transport too.
+            attempt.sessions.push(Arc::new(session));
+            let session =
+                Arc::get_mut(attempt.sessions.last_mut().ok_or(NETWORK)?).ok_or(NETWORK)?;
+            self.authenticate(
+                session,
+                tunnel,
+                endpoint,
+                &hop,
+                credentials,
+                &attempt.cancel,
+                interactive,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn authenticate(
         &self,
         session: &mut client::Handle<Handler>,
         tunnel: &Tunnel,
         endpoint: &Endpoint,
         hop: &str,
-        credentials: &mut HashMap<String, Credential>,
+        credentials: &Credentials,
         cancel: &CancellationToken,
+        interactive: bool,
     ) -> std::result::Result<(), Problem> {
         if timed(session.authenticate_none(&endpoint.user))
             .await??
@@ -619,52 +1001,66 @@ impl Manager {
             return Ok(());
         }
         let identity = serde_json::to_string(endpoint).map_err(|_| AUTH)?;
+        let known = credentials.lock().await.get(&identity).cloned();
         let success = if endpoint.auth == "password" {
-            if !credentials.contains_key(&identity) {
-                let secret = self
-                    .credential("password", tunnel, endpoint, hop, cancel)
-                    .await?;
-                credentials.insert(identity.clone(), Credential::Password(secret));
-            }
-            let Some(Credential::Password(secret)) = credentials.get(&identity) else {
-                return Err(AUTH);
+            let secret = match known {
+                Some(Credential::Password(secret)) => secret,
+                _ if !interactive => return Err(NEEDS_USER),
+                _ => {
+                    let secret = self
+                        .credential("password", tunnel, endpoint, hop, cancel)
+                        .await?;
+                    credentials
+                        .lock()
+                        .await
+                        .insert(identity.clone(), Credential::Password(secret.clone()));
+                    secret
+                }
             };
             timed(session.authenticate_password(&endpoint.user, secret.as_str()))
                 .await??
                 .success()
         } else if endpoint.auth == "key" {
-            if !credentials.contains_key(&identity) {
-                let path = expand_key_path(&endpoint.key);
-                let encoded = Zeroizing::new(
-                    tokio::fs::read_to_string(path)
+            let key = match known {
+                Some(Credential::Key(key)) => key,
+                _ => {
+                    let path = expand_key_path(&endpoint.key);
+                    let encoded = Zeroizing::new(
+                        tokio::fs::read_to_string(path)
+                            .await
+                            .map_err(|_| KEY_FILE)?,
+                    );
+                    let first = keys::decode_secret_key(&encoded, None);
+                    let key = match first {
+                        Ok(key) => key,
+                        Err(error) if encrypted_key(&error, &encoded) => {
+                            if !interactive {
+                                return Err(NEEDS_USER);
+                            }
+                            let passphrase = self
+                                .credential("passphrase", tunnel, endpoint, hop, cancel)
+                                .await?;
+                            tokio::task::spawn_blocking(move || {
+                                keys::decode_secret_key(&encoded, Some(&passphrase))
+                            })
+                            .await
+                            .map_err(|_| KEY_FILE)?
+                            .map_err(|_| KEY_FILE)?
+                        }
+                        Err(_) => return Err(KEY_FILE),
+                    };
+                    let key = Arc::new(key);
+                    credentials
+                        .lock()
                         .await
-                        .map_err(|_| KEY_FILE)?,
-                );
-                let first = keys::decode_secret_key(&encoded, None);
-                let key = match first {
-                    Ok(key) => key,
-                    Err(error) if encrypted_key(&error, &encoded) => {
-                        let passphrase = self
-                            .credential("passphrase", tunnel, endpoint, hop, cancel)
-                            .await?;
-                        tokio::task::spawn_blocking(move || {
-                            keys::decode_secret_key(&encoded, Some(&passphrase))
-                        })
-                        .await
-                        .map_err(|_| KEY_FILE)?
-                        .map_err(|_| KEY_FILE)?
-                    }
-                    Err(_) => return Err(KEY_FILE),
-                };
-                credentials.insert(identity.clone(), Credential::Key(Arc::new(key)));
-            }
-            let Some(Credential::Key(key)) = credentials.get(&identity) else {
-                return Err(KEY_FILE);
+                        .insert(identity.clone(), Credential::Key(key.clone()));
+                    key
+                }
             };
             let hash = timed(session.best_supported_rsa_hash()).await??.flatten();
             timed(session.authenticate_publickey(
                 &endpoint.user,
-                keys::key::PrivateKeyWithHashAlg::new(key.clone(), hash),
+                keys::key::PrivateKeyWithHashAlg::new(key, hash),
             ))
             .await??
             .success()
@@ -782,10 +1178,13 @@ fn bind_problem(_: io::Error) -> Problem {
         "Не удалось открыть локальный порт. Проверьте адрес, права и занятость порта.",
     )
 }
+#[derive(Clone)]
 enum Credential {
     Password(Zeroizing<String>),
     Key(Arc<PrivateKey>),
 }
+/// Secrets entered for one tunnel, shared by all of its connections and kept in memory only.
+type Credentials = Arc<Mutex<HashMap<String, Credential>>>;
 pub(crate) fn expand_key_path(path: &str) -> PathBuf {
     if (path == "~" || path.starts_with("~/") || path.starts_with("~\\"))
         && let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
@@ -921,6 +1320,42 @@ async fn connecting<T>(
         }
     }
 }
+/// What a connection is for.
+enum Purpose {
+    /// The tunnel itself: it reports progress and may ask the user.
+    Tunnel {
+        remote: mpsc::Sender<RemoteChannel>,
+        expected: Arc<StdMutex<Option<RemoteRoute>>>,
+    },
+    /// The separate UDP connection: silent, never asks, small send buffer.
+    Udp,
+}
+
+/// Send buffer of the UDP connection's TCP socket: bytes beyond the in-flight window would only
+/// add delay there. Tuned on the stand.
+const UDP_SEND_BUFFER: u32 = 256 * 1024;
+
+async fn first_hop(host: &str, port: u16, interactive: bool) -> io::Result<TcpStream> {
+    if interactive {
+        return TcpStream::connect((host, port)).await;
+    }
+    let mut last = io::Error::from(io::ErrorKind::NotFound);
+    for address in tokio::net::lookup_host((host, port)).await? {
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        let _ = socket.set_send_buffer_size(UDP_SEND_BUFFER);
+        socket.set_nodelay(true)?;
+        match socket.connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
 #[derive(Clone)]
 struct RemoteRoute {
     address: String,
@@ -938,6 +1373,8 @@ struct Handler {
     remote: Option<mpsc::Sender<RemoteChannel>>,
     expected: Arc<StdMutex<Option<RemoteRoute>>>,
     failure: Arc<StdMutex<Option<Problem>>>,
+    /// Whether the user may be asked; the UDP connection never asks.
+    interactive: bool,
 }
 impl client::Handler for Handler {
     type Error = Problem;
@@ -959,7 +1396,14 @@ impl client::Handler for Handler {
         self.waiting.send_replace(true);
         let trusted = self
             .manager
-            .trust(&self.tunnel, &self.endpoint, &self.hop, &key, &self.cancel)
+            .trust(
+                &self.tunnel,
+                &self.endpoint,
+                &self.hop,
+                &key,
+                &self.cancel,
+                self.interactive,
+            )
             .await;
         self.waiting.send_replace(false);
         trusted?;
@@ -1460,6 +1904,7 @@ mod tests {
                         "server",
                         &key,
                         &CancellationToken::new(),
+                        true,
                     )
                     .await
             }));
@@ -1485,6 +1930,39 @@ mod tests {
             task.await.unwrap().unwrap();
         }
         assert_eq!(read_trust(&path).unwrap().len(), 2);
+        // A connection that may not ask accepts only an already trusted key, without a prompt.
+        let mut silent = tunnel();
+        silent.server.host = "first.example".into();
+        let trusted = read_trust(&path).unwrap()["[first.example]:22"].clone();
+        let trusted = PublicKey::from_openssh(&trusted).unwrap();
+        assert!(
+            manager
+                .trust(
+                    &silent,
+                    &silent.server,
+                    "server",
+                    &trusted,
+                    &CancellationToken::new(),
+                    false
+                )
+                .await
+                .is_ok()
+        );
+        let refused = manager
+            .trust(
+                &silent,
+                &silent.server,
+                "server",
+                &other_key,
+                &CancellationToken::new(),
+                false,
+            )
+            .await;
+        assert_eq!(
+            refused.err().map(|problem| problem.message),
+            Some(NEEDS_USER.message)
+        );
+        assert!(manager.snapshot().await.1.is_empty());
         let changed_manager = manager.clone();
         let task = tokio::spawn(async move {
             let mut tunnel = tunnel();
@@ -1496,6 +1974,7 @@ mod tests {
                     "server",
                     &other_key,
                     &CancellationToken::new(),
+                    true,
                 )
                 .await
         });

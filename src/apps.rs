@@ -95,6 +95,10 @@ pub struct DivertRule {
     pub direct: bool,
     /// SOCKS5 port of the tunnel while it is running.
     pub proxy: Option<std::net::SocketAddr>,
+    /// The tunnel's UDP relay runs: datagrams go through it instead of being blocked.
+    pub udp: bool,
+    /// UDP 443 goes through the relay too instead of being blocked.
+    pub quic: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -117,6 +121,10 @@ pub struct DivertReport {
     pub logs: Vec<(String, String)>,
     /// Set when the helper could not start and is about to exit.
     pub error: String,
+    /// UDP per rule. Left out while empty, so that a report without UDP keeps the format
+    /// older background processes accept and answer with `stop`.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub udp: HashMap<String, crate::divert::link::HelperUdpStats>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +160,8 @@ pub fn divert_rules(
     rules: &[AppRule],
     tunnels: &[Tunnel],
     tunnel_states: &HashMap<String, String>,
+    udp_up: &HashSet<String>,
+    udp: &crate::udp::consent::UdpSettings,
 ) -> Vec<DivertRule> {
     rules
         .iter()
@@ -170,6 +180,8 @@ pub fn divert_rules(
                         .is_some_and(|state| state == "running")
                 })
                 .and_then(proxy_address),
+            udp: udp_up.contains(&rule.tunnel_id),
+            quic: udp.quic(&rule.id),
         })
         .collect()
 }
@@ -588,16 +600,28 @@ mod tests {
         let mut orphan = rule("orphan", "/bin/orphan", "local");
         orphan.enabled = true;
         let rules = [on, orphan, rule("off", "/bin/off", "socks")];
-        let sent = divert_rules(&rules, &tunnels, &running);
+        let none = HashSet::new();
+        let settings = crate::udp::consent::UdpSettings::default();
+        let sent = divert_rules(&rules, &tunnels, &running, &none, &settings);
         assert_eq!(sent.len(), 2, "disabled rules are not sent");
+        assert!(sent.iter().all(|rule| !rule.udp && !rule.quic));
         assert_eq!(sent[0].proxy, Some("127.0.0.1:1080".parse().unwrap()));
         assert!(sent[0].direct && sent[0].children);
         // An orphaned rule stays so that its application is cut off, not released.
         assert_eq!((sent[1].proxy, sent[1].direct), (None, false));
         assert_eq!(
-            divert_rules(&rules, &tunnels, &HashMap::new())[0].proxy,
+            divert_rules(&rules, &tunnels, &HashMap::new(), &none, &settings)[0].proxy,
             None
         );
+        // UDP follows the tunnel's relay, QUIC the rule's choice.
+        let up = HashSet::from(["socks".to_owned()]);
+        let mut settings = settings;
+        settings
+            .rules
+            .insert("on".into(), crate::udp::consent::RuleUdp { quic: true });
+        let sent = divert_rules(&rules, &tunnels, &running, &up, &settings);
+        assert_eq!((sent[0].udp, sent[0].quic), (true, true));
+        assert_eq!((sent[1].udp, sent[1].quic), (false, false));
         for (bind, expected) in [
             ("localhost", Some("127.0.0.1:1080")),
             ("[::]", Some("[::1]:1080")),
@@ -613,6 +637,27 @@ mod tests {
                 "{bind}"
             );
         }
+    }
+
+    #[test]
+    fn helper_reports_without_udp_keep_the_old_format() {
+        let report = DivertReport {
+            version: "0.6.0".into(),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(
+            encoded.get("udp").is_none(),
+            "older background processes reject the field"
+        );
+        let mut with_udp = report.clone();
+        with_udp.udp.insert("rule".into(), Default::default());
+        let encoded = serde_json::to_value(&with_udp).unwrap();
+        assert!(encoded["udp"]["rule"].is_object());
+        assert_eq!(
+            serde_json::from_value::<DivertReport>(encoded).unwrap(),
+            with_udp
+        );
     }
 
     #[test]

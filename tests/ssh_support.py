@@ -7,9 +7,11 @@ import contextlib
 from dataclasses import asdict, dataclass, field
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
 import time
 from uuid import uuid4
@@ -167,10 +169,73 @@ class Client:
         raise ValueError('Некорректный ответ фонового процесса.')
 
 
+def attach_udp(path: Path, version: int = 1) -> socket.socket:
+    """Open the helper's binary UDP channel like the elevated helper does."""
+    metadata = _metadata(endpoint_path(Path(path).expanduser().resolve()))
+    deadline = time.monotonic() + REQUEST_TIMEOUT
+    connection = socket.create_connection(('127.0.0.1', metadata['port']), timeout=AUTH_TIMEOUT)
+    try:
+        nonce = secrets.token_hex(32)
+        connection.sendall(json.dumps({'nonce': nonce}).encode('ascii') + b'\n')
+        proof = _json(_receive_line(connection, deadline, 4096))
+        expected = hmac.digest(metadata['token'].encode('ascii'), nonce.encode('ascii'), 'sha256').hex()
+        if not hmac.compare_digest(proof.get('proof', ''), expected):
+            raise ValueError('Не удалось подтвердить фоновый процесс КРОТ.')
+        connection.sendall(json.dumps({'token': metadata['token'], 'command': 'udp_attach',
+                                       'payload': {'version': version}}).encode('utf-8') + b'\n')
+        response = _json(_receive_line(connection, deadline, MAX_MESSAGE_BYTES))
+        if response != {'ok': True, 'value': {'version': version}}:
+            raise ValueError(f'UDP-канал не открыт: {response}')
+        connection.settimeout(5)
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+class Frames:
+    """The UDP channel's frames, as the elevated helper writes and reads them."""
+    OPEN, SEND, RECV, CLOSE = 0x40, 0x10, 0x11, 0x12
+
+    @staticmethod
+    def frame(kind: int, body: bytes) -> bytes:
+        return (len(body) + 1).to_bytes(4, 'big') + bytes([kind]) + body
+
+    @classmethod
+    def open(cls, flow: int, rule: str) -> bytes:
+        name = rule.encode('utf-8')
+        return cls.frame(cls.OPEN, flow.to_bytes(4, 'big') + bytes([len(name)]) + name)
+
+    @classmethod
+    def send(cls, flow: int, host: str, port: int, data: bytes) -> bytes:
+        address = bytes([4]) + socket.inet_aton(host) + port.to_bytes(2, 'big')
+        return cls.frame(cls.SEND, flow.to_bytes(4, 'big') + address + data)
+
+    @staticmethod
+    def read(connection: socket.socket) -> tuple[int, bytes]:
+        def exactly(count):
+            data = b''
+            while len(data) < count:
+                chunk = connection.recv(count - len(data))
+                if not chunk:
+                    raise ConnectionError('channel closed')
+                data += chunk
+            return data
+        length = int.from_bytes(exactly(4), 'big')
+        body = exactly(length)
+        return body[0], body[1:]
+
+
 def unused_port():
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         return sock.getsockname()[1]
+
+
+def kill_group(process):
+    """Stop a command started by `run_command` together with everything it started."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
 
 
 class Server(asyncssh.SSHServer):
@@ -219,11 +284,50 @@ class SSHFixtures:
             writer.close()
             await writer.wait_closed()
 
-    async def server(self, *, port=0, key=None, password=None, client_key=None):
+    async def run_command(self, process, home):
+        """Run an exec request with the local /bin/sh, as a server account with `home`.
+
+        `self.exec_delay` (seconds) holds every command back, like a slow server."""
+        await asyncio.sleep(getattr(self, 'exec_delay', 0))
+        env = {'HOME': str(home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
+        # A process group of its own: the shell may stay as a parent of the relay, and
+        # stopping the command must stop both, as sshd does when a session ends.
+        local = await asyncio.create_subprocess_shell(
+            process.command, env=env, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
+        self.commands.append((process.command, local))
+
+        async def forward(source, target):
+            while data := await source.read(65536):
+                target.write(data)
+                await target.drain()
+
+        try:
+            await process.redirect(stdin=local.stdin)
+            # All output reaches the client before the exit status, like sshd sends it: with
+            # `redirect` the status could overtake a short output and the client saw none.
+            await asyncio.gather(forward(local.stdout, process.stdout),
+                                 forward(local.stderr, process.stderr))
+            process.exit(await local.wait())
+        finally:
+            if local.returncode is None:
+                kill_group(local)
+                await local.wait()
+
+    async def server(self, *, port=0, key=None, password=None, client_key=None, shell_home=None):
+        """`shell_home` lets the server run commands; otherwise sessions are refused."""
+        extra = {}
+        if shell_home is not None:
+            if not hasattr(self, 'commands'):
+                self.commands = []
+            extra = {'encoding': None,
+                     'process_factory': lambda process: self.run_command(process, shell_home)}
         server = await asyncssh.listen(
             '127.0.0.1', port, config=None,
             server_factory=lambda: Server(self, password, client_key),
             server_host_keys=[key or asyncssh.generate_private_key('ssh-ed25519')],
+            **extra,
         )
         self.servers.append(server)
         return server

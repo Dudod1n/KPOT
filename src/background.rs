@@ -1,6 +1,6 @@
 //! One owner per configuration; the desktop talks to it over authenticated loopback JSON.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     path::PathBuf,
     process::Stdio,
@@ -29,7 +29,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     apps::{AppRule, AppRuntime, Apps, DivertReport, DivertStats, Interceptor},
-    config::{Config, Store, atomic_json},
+    config::{Config, Store, Tunnel, atomic_json},
     ssh::{Manager, PendingPrompt, Runtime},
 };
 
@@ -78,6 +78,25 @@ pub struct Snapshot {
     /// Why the helper last failed to start.
     #[serde(default)]
     pub divert_error: String,
+    /// The user's UDP choices: relay consent per tunnel, QUIC per rule.
+    #[serde(default)]
+    pub udp: crate::udp::consent::UdpSettings,
+    /// Why the UDP settings file could not be read; UDP stays off meanwhile.
+    #[serde(default)]
+    pub udp_error: String,
+    #[serde(default)]
+    pub udp_runtimes: HashMap<String, crate::ssh::UdpRuntime>,
+    #[serde(default)]
+    pub udp_metrics: HashMap<String, crate::udp::transport::TransportMetrics>,
+    /// Background-side routing metrics per tunnel.
+    #[serde(default)]
+    pub udp_routing: HashMap<String, crate::udp::router::TunnelRouting>,
+    /// UDP traffic per rule through the tunnel.
+    #[serde(default)]
+    pub udp_rules: HashMap<String, crate::udp::router::RuleMetrics>,
+    /// The helper's part of each rule's UDP path, while it is attached.
+    #[serde(default)]
+    pub udp_helper: HashMap<String, crate::divert::link::HelperUdpStats>,
 }
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -88,6 +107,7 @@ const MAX_APP_LOGS: usize = 200;
 struct Divert {
     seen: Option<Instant>,
     stats: HashMap<String, DivertStats>,
+    udp: HashMap<String, crate::divert::link::HelperUdpStats>,
     logs: HashMap<String, Vec<String>>,
     error: String,
 }
@@ -240,26 +260,50 @@ impl Client {
             .context("Фоновый КРОТ не ответил вовремя.")?
     }
 
+    /// Opens the helper's binary UDP channel: an authenticated request whose connection then
+    /// carries frames in both directions.
+    pub async fn attach_udp(&self) -> Result<BufReader<TcpStream>> {
+        let version = json!({"version": krot_udp_proto::VERSION});
+        let (value, stream) = timeout(
+            REQUEST_TIMEOUT,
+            self.exchange("udp_attach", version.clone(), None),
+        )
+        .await
+        .context("Фоновый КРОТ не ответил вовремя.")??;
+        ensure!(value == version, "Фоновый КРОТ другой версии.");
+        Ok(stream)
+    }
+
     async fn request_inner(
+        &self,
+        command: &str,
+        payload: Value,
+        owner: Option<&Owner>,
+    ) -> Result<Value> {
+        Ok(self.exchange(command, payload, owner).await?.0)
+    }
+
+    async fn exchange(
         &self,
         command: &str,
         mut payload: Value,
         owner: Option<&Owner>,
-    ) -> Result<Value> {
+    ) -> Result<(Value, BufReader<TcpStream>)> {
         let metadata =
             read_metadata(&Store::new(&self.path)?)?.context("Фоновый КРОТ не запущен.")?;
         ensure!(
             owner.is_none_or(|owner| owner.0 == metadata),
             "Предыдущий КРОТ уже сменился. Проверьте новый процесс и повторите выбор."
         );
-        let mut stream = timeout(
+        let stream = timeout(
             AUTH_TIMEOUT,
             TcpStream::connect(("127.0.0.1", metadata.port)),
         )
         .await??;
+        stream.set_nodelay(true)?;
         let nonce = hex::encode(rand::random::<[u8; 32]>());
         let challenge = serde_json::to_vec(&json!({"nonce":nonce}))?;
-        let mut reader = BufReader::new(&mut stream);
+        let mut reader = BufReader::new(stream);
         timeout(AUTH_TIMEOUT, async {
             reader.get_mut().write_all(&challenge).await?;
             reader.get_mut().write_all(b"\n").await?;
@@ -295,7 +339,7 @@ impl Client {
                 if response.as_object().is_some_and(|o| o.len() == 2)
                     && response.get("value").is_some() =>
             {
-                Ok(response["value"].clone())
+                Ok((response["value"].clone(), reader))
             }
             Some(false) if response.as_object().is_some_and(|o| o.len() == 2) => {
                 let message = response
@@ -424,11 +468,42 @@ struct Owned {
     apps: Apps,
     divert: Divert,
     manager: Manager,
+    udp: crate::udp::consent::UdpSettings,
+    udp_error: String,
+}
+
+const UDP_BROKEN: &str = "Файл настроек UDP повреждён. Исправьте или удалите его, затем повторите.";
+
+impl Owned {
+    /// SOCKS tunnels whose user agreed to the relay.
+    fn udp_tunnels(&self) -> HashSet<String> {
+        self.config
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.kind == "D" && self.udp.consented(tunnel))
+            .map(|tunnel| tunnel.id.clone())
+            .collect()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UdpTunnelChoice {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UdpRuleChoice {
+    id: String,
+    quic: bool,
 }
 
 struct Service {
     store: Store,
     token: String,
+    router: Arc<crate::udp::router::Router>,
     owned: Mutex<Owned>,
     shutdown: CancellationToken,
     closed: CancellationToken,
@@ -485,7 +560,26 @@ impl Service {
                         )
                     })
                     .collect();
+                let mut udp_runtimes = HashMap::new();
+                let mut udp_metrics = HashMap::new();
+                for (id, (runtime, metrics)) in owned.manager.udp_snapshot().await {
+                    if let Some(metrics) = metrics {
+                        udp_metrics.insert(id.clone(), metrics);
+                    }
+                    udp_runtimes.insert(id, runtime);
+                }
                 Ok(serde_json::to_value(Snapshot {
+                    udp_routing: self.router.tunnel_metrics(),
+                    udp_rules: self.router.rule_metrics(),
+                    udp_helper: if attached {
+                        owned.divert.udp.clone()
+                    } else {
+                        HashMap::new()
+                    },
+                    udp: owned.udp.clone(),
+                    udp_error: owned.udp_error.clone(),
+                    udp_runtimes,
+                    udp_metrics,
                     apps: owned.apps.rules.clone(),
                     app_runtimes,
                     apps_unavailable: unavailable.into(),
@@ -517,6 +611,37 @@ impl Service {
                 next.validate()?;
                 self.store.save(&next)?;
                 let next = self.store.load()?;
+                // Consent ends with the tunnel, its SOCKS mode or its server: the relay leaves
+                // the server it was given for, and the new server needs its own consent.
+                let retired: Vec<Tunnel> = owned
+                    .config
+                    .tunnels
+                    .iter()
+                    .filter(|old| owned.udp.consented(old))
+                    .filter(|old| {
+                        next.tunnels
+                            .iter()
+                            .find(|new| new.id == old.id)
+                            .is_none_or(|new| {
+                                new.kind != "D"
+                                    || crate::udp::consent::server(new)
+                                        != crate::udp::consent::server(old)
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                if !retired.is_empty() {
+                    let mut udp = owned.udp.clone();
+                    for old in &retired {
+                        udp.tunnels.remove(&old.id);
+                    }
+                    if owned.udp_error.is_empty() {
+                        crate::udp::consent::save(&self.store, &udp)?;
+                        owned.udp = udp;
+                    }
+                    let enabled = owned.udp_tunnels();
+                    owned.manager.set_udp(enabled).await;
+                }
                 let changed: Vec<_> = owned
                     .config
                     .tunnels
@@ -524,6 +649,11 @@ impl Service {
                     .filter(|old| !next.tunnels.iter().any(|new| *old == new))
                     .map(|t| t.id.clone())
                     .collect();
+                // Removal talks to the server: it runs apart from this command and its lock,
+                // with the secrets the tunnel holds before it stops.
+                for old in retired {
+                    owned.manager.retire_udp(old).await;
+                }
                 for id in &changed {
                     owned.manager.stop(id).await?;
                 }
@@ -533,6 +663,85 @@ impl Service {
                     }
                 }
                 owned.config = next;
+                if owned.udp_error.is_empty() {
+                    let mut udp = owned.udp.clone();
+                    udp.retain_known(
+                        owned.config.tunnels.iter().map(|tunnel| tunnel.id.as_str()),
+                        owned.apps.rules.iter().map(|rule| rule.id.as_str()),
+                    );
+                    if udp != owned.udp && crate::udp::consent::save(&self.store, &udp).is_ok() {
+                        owned.udp = udp;
+                    }
+                }
+                let udp = owned.udp_tunnels();
+                owned.manager.set_udp(udp).await;
+                Ok(Value::Null)
+            }
+            "udp_tunnel" => {
+                let choice: UdpTunnelChoice =
+                    serde_json::from_value(payload).context("Некорректный выбор UDP.")?;
+                ensure!(owned.udp_error.is_empty(), UDP_BROKEN);
+                ensure!(
+                    owned
+                        .config
+                        .tunnels
+                        .iter()
+                        .any(|tunnel| tunnel.id == choice.id && tunnel.kind == "D"),
+                    "UDP через сервер доступен только для сохранённого туннеля типа D."
+                );
+                let tunnel = owned
+                    .config
+                    .tunnels
+                    .iter()
+                    .find(|tunnel| tunnel.id == choice.id)
+                    .cloned()
+                    .context("Сохранённый туннель не найден.")?;
+                let mut next = owned.udp.clone();
+                if choice.enabled {
+                    next.tunnels.insert(
+                        choice.id,
+                        crate::udp::consent::TunnelUdp {
+                            enabled: true,
+                            server: crate::udp::consent::server(&tunnel),
+                        },
+                    );
+                } else {
+                    next.tunnels.remove(&choice.id);
+                }
+                next.retain_known(
+                    owned.config.tunnels.iter().map(|tunnel| tunnel.id.as_str()),
+                    owned.apps.rules.iter().map(|rule| rule.id.as_str()),
+                );
+                let was = owned.udp.consented(&tunnel);
+                crate::udp::consent::save(&self.store, &next)?;
+                owned.udp = next;
+                let udp = owned.udp_tunnels();
+                owned.manager.set_udp(udp).await;
+                // Consent is revoked at once; taking the relay off the server runs apart.
+                if was && !choice.enabled {
+                    owned.manager.retire_udp(tunnel).await;
+                }
+                Ok(Value::Null)
+            }
+            "udp_rule" => {
+                let choice: UdpRuleChoice =
+                    serde_json::from_value(payload).context("Некорректный выбор UDP.")?;
+                ensure!(owned.udp_error.is_empty(), UDP_BROKEN);
+                ensure!(
+                    owned.apps.rules.iter().any(|rule| rule.id == choice.id),
+                    "Сохранённое правило не найдено."
+                );
+                let mut next = owned.udp.clone();
+                next.rules.insert(
+                    choice.id,
+                    crate::udp::consent::RuleUdp { quic: choice.quic },
+                );
+                next.retain_known(
+                    owned.config.tunnels.iter().map(|tunnel| tunnel.id.as_str()),
+                    owned.apps.rules.iter().map(|rule| rule.id.as_str()),
+                );
+                crate::udp::consent::save(&self.store, &next)?;
+                owned.udp = next;
                 Ok(Value::Null)
             }
             "start" | "stop" => {
@@ -598,6 +807,7 @@ impl Service {
                 divert.error.clear();
                 divert.seen = Some(Instant::now());
                 divert.stats = report.stats;
+                divert.udp = report.udp;
                 for (rule, line) in report.logs {
                     if owned.apps.rules.iter().any(|saved| saved.id == rule) {
                         let lines = owned.divert.logs.entry(rule).or_default();
@@ -608,8 +818,27 @@ impl Service {
                     }
                 }
                 let (states, _) = owned.manager.states().await;
-                let rules =
-                    crate::apps::divert_rules(&owned.apps.rules, &owned.config.tunnels, &states);
+                let udp_tunnels = owned.udp_tunnels();
+                self.router.set_rules(
+                    owned
+                        .apps
+                        .rules
+                        .iter()
+                        .filter(|rule| rule.enabled && udp_tunnels.contains(&rule.tunnel_id))
+                        .map(|rule| (rule.id.clone(), rule.tunnel_id.clone()))
+                        .collect(),
+                );
+                let udp_up: HashSet<String> = udp_tunnels
+                    .into_iter()
+                    .filter(|tunnel| self.router.up(tunnel))
+                    .collect();
+                let rules = crate::apps::divert_rules(
+                    &owned.apps.rules,
+                    &owned.config.tunnels,
+                    &states,
+                    &udp_up,
+                    &owned.udp,
+                );
                 Ok(json!({"rules": rules}))
             }
             "app_start" | "app_stop" => {
@@ -665,6 +894,24 @@ impl Service {
             ensure!(hex_token(&request.token) && bool::from(request.token.as_bytes().ct_eq(self.token.as_bytes())), "Не удалось подтвердить доступ.");
             Ok::<_, anyhow::Error>(request)
         }).await;
+        if let Ok(Ok(request)) = &request
+            && request.command == "udp_attach"
+        {
+            ensure!(
+                request.payload == json!({"version": krot_udp_proto::VERSION})
+                    && reader.buffer().is_empty(),
+                "Некорректный запрос UDP-канала."
+            );
+            let answer = json!({"ok": true, "value": {"version": krot_udp_proto::VERSION}});
+            let mut encoded = serde_json::to_vec(&answer)?;
+            encoded.push(b'\n');
+            timeout(AUTH_TIMEOUT, reader.get_mut().write_all(&encoded)).await??;
+            let stream = reader.into_inner();
+            stream.set_nodelay(true)?;
+            let (read, write) = stream.into_split();
+            self.router.clone().serve(read, write).await;
+            return Ok(());
+        }
         let (response, shutdown) = match request {
             Ok(Ok(mut request)) => {
                 let shutdown = request.command == "shutdown" && request.payload.is_null();
@@ -708,15 +955,27 @@ pub async fn serve(store: Store) -> Result<()> {
     let config = store.load()?;
     // Broken application rules must not keep the tunnels from starting.
     let apps = crate::apps::load(&store).unwrap_or_default();
+    // Broken UDP settings keep UDP off and the file untouched; tunnels still start.
+    let (udp, udp_error) = match crate::udp::consent::load(&store) {
+        Ok(udp) => (udp, String::new()),
+        Err(error) => (Default::default(), format!("{error:#}")),
+    };
     let manager = Manager::new(store.known_hosts_path());
+    let router = Arc::new(crate::udp::router::Router::default());
+    let (notices, notices_receive) = tokio::sync::mpsc::unbounded_channel();
+    manager.set_udp_sink(notices);
+    tokio::spawn(router.clone().run(notices_receive));
     let service = Arc::new(Service {
         store: store.clone(),
         token: hex::encode(rand::random::<[u8; 32]>()),
+        router,
         owned: Mutex::new(Owned {
             config: config.clone(),
             apps,
             divert: Divert::default(),
             manager: manager.clone(),
+            udp,
+            udp_error,
         }),
         shutdown: CancellationToken::new(),
         closed: CancellationToken::new(),
@@ -733,6 +992,10 @@ pub async fn serve(store: Store) -> Result<()> {
     let endpoint = store.sidecar(".background.json");
     atomic_json(&endpoint, &metadata, Some(4096))?;
     drop(guard);
+    {
+        let owned = service.owned.lock().await;
+        manager.set_udp(owned.udp_tunnels()).await;
+    }
     for tunnel in config.tunnels {
         if tunnel.enabled {
             manager.start(tunnel).await?;
@@ -932,6 +1195,54 @@ mod startup_tests {
     }
 
     #[tokio::test]
+    async fn the_helper_udp_channel_is_authenticated_and_carries_frames() {
+        use krot_udp_proto::{self as proto, CloseReason, Frame};
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().join("config.json")).unwrap();
+        let daemon = tokio::spawn(serve(store.clone()));
+        let client = Client::new(&store);
+        wait_until_serving(&client).await;
+
+        let mut channel = client.attach_udp().await.unwrap();
+        // No tunnel carries UDP: a new flow is refused at once, in frames.
+        let mut open = Vec::new();
+        proto::encode(
+            &Frame::Open {
+                flow: 3,
+                rule: "r1",
+            },
+            &mut open,
+        );
+        channel.get_mut().write_all(&open).await.unwrap();
+        let mut answer = vec![0u8; 10];
+        timeout(Duration::from_secs(3), channel.read_exact(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proto::parse(&answer).unwrap().unwrap().0,
+            Frame::Close {
+                flow: 3,
+                reason: CloseReason::Socket,
+            }
+        );
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.udp_rules["r1"].flows_refused, 1);
+
+        // A wrong protocol version gets the usual refusal and no binary channel.
+        let refused = client
+            .request(
+                "udp_attach",
+                json!({"version": krot_udp_proto::VERSION + 1}),
+            )
+            .await;
+        assert!(refused.is_err());
+        drop(channel);
+        stop_and_wait(&store).await.unwrap();
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn an_old_replacement_choice_cannot_stop_a_new_owner() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::new(temp.path().join("config.json")).unwrap();
@@ -973,11 +1284,14 @@ mod startup_tests {
         let service = Service {
             store: store.clone(),
             token: String::new(),
+            router: Default::default(),
             owned: Mutex::new(Owned {
                 config: config.clone(),
                 apps: Apps::default(),
                 divert: Divert::default(),
                 manager: Manager::new(store.known_hosts_path()),
+                udp: Default::default(),
+                udp_error: String::new(),
             }),
             shutdown: CancellationToken::new(),
             closed: CancellationToken::new(),
@@ -1067,6 +1381,7 @@ mod startup_tests {
         let service = Service {
             store: store.clone(),
             token: String::new(),
+            router: Default::default(),
             owned: Mutex::new(Owned {
                 config: Config {
                     tunnels: vec![socks],
@@ -1078,6 +1393,8 @@ mod startup_tests {
                 },
                 divert: Divert::default(),
                 manager: Manager::new(store.known_hosts_path()),
+                udp: Default::default(),
+                udp_error: String::new(),
             }),
             shutdown: CancellationToken::new(),
             closed: CancellationToken::new(),
@@ -1107,10 +1424,12 @@ mod startup_tests {
         // The tunnel is not running, so the application is cut off rather than proxied.
         assert_eq!(
             reply["rules"],
-            json!([{"id": "rule", "path": "/usr/bin/curl", "children": true, "direct": false, "proxy": null}])
+            json!([{"id": "rule", "path": "/usr/bin/curl", "children": true, "direct": false,
+                     "proxy": null, "udp": false, "quic": false}])
         );
         let state = snapshot(&service).await;
         assert!(state.divert_attached && state.divert_error.is_empty());
+        assert!(state.udp_helper.is_empty());
         let runtime = &state.app_runtimes["rule"];
         assert_eq!(runtime.state, "blocked");
         assert_eq!((runtime.connections, runtime.total), (2, 9));

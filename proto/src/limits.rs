@@ -42,3 +42,7 @@ pub const ACK_INTERVAL: Duration = Duration::from_millis(20);
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// The relay gives up when no `HELLO` arrives within this time.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// A side that hears nothing for this long, `PONG` included, treats the channel as dead.
+pub const SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Answers waiting for the consumer on the client side.
+pub const DELIVERY_QUEUE_DATAGRAMS: usize = 4096;

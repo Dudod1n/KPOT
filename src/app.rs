@@ -44,6 +44,12 @@ enum Command {
     Background,
     /// Показать состояние фоновых туннелей
     Status,
+    /// Метрики UDP туннелей и правил в JSON
+    Metrics {
+        /// Только этот туннель и его правила
+        #[arg(long)]
+        tunnel: Option<String>,
+    },
     /// Остановить фон и все туннели, сохранив выбор для следующего запуска
     Stop,
     /// Автозапуск после входа в учётную запись
@@ -119,6 +125,12 @@ pub fn run() -> Result<()> {
                 println!("Автозапуск после входа: {}.",if autostart::is_enabled(&store.path)? {"включён"} else {"выключен"});
                 Ok(())
             }
+            Some(Command::Metrics { tunnel }) => runtime.block_on(async {
+                anyhow::ensure!(store.sidecar(".background.json").exists(), "Фоновый КРОТ не запущен.");
+                let snapshot = Client::new(&store).snapshot().await?;
+                println!("{}", serde_json::to_string_pretty(&crate::udp::report::metrics(&snapshot, tunnel.as_deref()))?);
+                Ok(())
+            }),
             Some(command @ (Command::Background | Command::Status | Command::Stop)) => runtime.block_on(async {
                 if !matches!(command,Command::Background) && !store.sidecar(".background.json").exists() { println!("Фоновый КРОТ не запущен."); return Ok(()); }
                 let client = if matches!(command,Command::Background) { background::ensure_running(&store).await? } else { Client::new(&store) };
@@ -138,6 +150,9 @@ pub fn run() -> Result<()> {
                             "running"=>"работает","connecting"=>"подключение","reconnecting"=>"восстановление","error"=>"ошибка","stopped"=>"остановлен",_=>"выключен",
                         }};
                         println!("{}\t{}",tunnel.name,status);
+                        if let Some(udp) = snapshot.udp_runtimes.get(&tunnel.id).filter(|udp| !udp.state.is_empty() && udp.state != "off") {
+                            println!("  UDP: {}", crate::udp::state_text(udp));
+                        }
                     }
                 } else {
                     println!("КРОТ остановлен. Все туннели закрыты; выбор для следующего запуска сохранён.");

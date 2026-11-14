@@ -1,14 +1,14 @@
 //! WinDivert glue: loads the official driver library, runs the packet loop and the relay.
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::c_void,
     net::SocketAddr,
     os::windows::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -17,8 +17,13 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
-    NetworkManagement::IpHelper::{GetExtendedTcpTable, GetExtendedUdpTable},
+    Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    },
+    NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+        MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
+    },
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -39,7 +44,11 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle, table_owner,
+    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
+    link::{INBOUND_QUEUE, Inbound, Link},
+    owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
+    tcp_table_owner,
+    udp::{self, Policy},
 };
 use crate::{
     apps::{DivertReport, DivertRule, DivertStats},
@@ -47,6 +56,7 @@ use crate::{
     config::Store,
     proxy::{Counters, Destination},
 };
+use krot_udp_proto::metrics::DropReason;
 
 const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp)\0";
 const FIREWALL_RULE: &str = "KROT-app-relay";
@@ -54,19 +64,42 @@ const OUTBOUND: u32 = 1 << 17;
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 23;
 const TCP_TABLE_OWNER_PID_ALL: i32 = 5;
-const UDP_TABLE_OWNER_PID: i32 = 1;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const PORT_TTL: Duration = Duration::from_secs(2);
+const PARENT_TTL: Duration = Duration::from_secs(2);
 const SYNC_TIME: Duration = Duration::from_secs(1);
 const MAX_PENDING_LOGS: usize = 500;
 
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    // The platform-neutral parser in `owners` relies on these layouts.
+    assert!(offset_of!(MIB_UDPTABLE_OWNER_PID, table) == UDP_TABLE_HEADER);
+    assert!(offset_of!(MIB_UDP6TABLE_OWNER_PID, table) == UDP_TABLE_HEADER);
+    assert!(size_of::<MIB_UDPROW_OWNER_PID>() == UDP4_ROW_SIZE);
+    assert!(size_of::<MIB_UDP6ROW_OWNER_PID>() == UDP6_ROW_SIZE);
+    assert!(offset_of!(MIB_UDPROW_OWNER_PID, dwLocalPort) == 4);
+    assert!(offset_of!(MIB_UDPROW_OWNER_PID, dwOwningPid) == 8);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwLocalScopeId) == 16);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwLocalPort) == 20);
+    assert!(offset_of!(MIB_UDP6ROW_OWNER_PID, dwOwningPid) == 24);
+};
+
 /// `WINDIVERT_ADDRESS`: timestamp, a bit field, a reserved word and 64 bytes of layer data.
+/// For the network layer the data starts with the interface and subinterface indexes, which
+/// an injected answer needs; the whole address of the flow's latest packet is kept for it.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct Address {
     timestamp: i64,
     flags: u32,
     reserved: u32,
     data: [u8; 64],
+}
+
+impl Address {
+    fn interface_index(&self) -> u32 {
+        // The NETWORK layer starts its address data with WINDIVERT_DATA_NETWORK.IfIdx.
+        u32::from_ne_bytes(*self.data.first_chunk::<4>().unwrap())
+    }
 }
 
 type Symbol = unsafe extern "system" fn() -> isize;
@@ -87,6 +120,8 @@ struct Api {
 struct Device(HANDLE);
 // SAFETY: the handle is an opaque kernel object used only through thread-safe driver calls.
 unsafe impl std::marker::Send for Device {}
+// SAFETY: as above; the packet thread receives while the answer task sends.
+unsafe impl std::marker::Sync for Device {}
 
 fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
     text.encode_wide().chain(std::iter::once(0)).collect()
@@ -212,7 +247,7 @@ impl Processes for System {
         let mut cached = self.parents.borrow_mut();
         if cached
             .as_ref()
-            .is_none_or(|(_, at)| at.elapsed() > PORT_TTL)
+            .is_none_or(|(_, at)| at.elapsed() > PARENT_TTL)
         {
             *cached = Some((parents(), Instant::now()));
         }
@@ -220,60 +255,55 @@ impl Processes for System {
     }
 }
 
-fn port_owner(tcp: bool, origin: &Origin) -> Option<u32> {
-    let read = |family: u32| {
-        let mut size = 0u32;
-        let mut table: Vec<u8> = Vec::new();
-        for _ in 0..4 {
-            // SAFETY: the buffer is at least `size` bytes; the call reports the size it needs.
-            let status = unsafe {
-                if tcp {
-                    GetExtendedTcpTable(
-                        table.as_mut_ptr().cast(),
-                        &mut size,
-                        0,
-                        family,
-                        TCP_TABLE_OWNER_PID_ALL,
-                        0,
-                    )
-                } else {
-                    GetExtendedUdpTable(
-                        table.as_mut_ptr().cast(),
-                        &mut size,
-                        0,
-                        family,
-                        UDP_TABLE_OWNER_PID,
-                        0,
-                    )
-                }
-            };
-            if status == 0 {
-                return table;
+fn read_port_table(tcp: bool, v6: bool, table: &mut Vec<u8>) -> Option<&[u8]> {
+    let family = if v6 { AF_INET6 } else { AF_INET };
+    for _ in 0..4 {
+        let mut size = table.len() as u32;
+        // SAFETY: the buffer is at least `size` bytes; the call reports the size it needs.
+        let status = unsafe {
+            if tcp {
+                GetExtendedTcpTable(
+                    table.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    family,
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                )
+            } else {
+                GetExtendedUdpTable(
+                    table.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    family,
+                    UDP_TABLE_OWNER_PID,
+                    0,
+                )
             }
-            table = vec![0u8; size as usize + 4096];
-            size = table.len() as u32;
+        };
+        match status {
+            0 => return table.get(..size as usize),
+            ERROR_INSUFFICIENT_BUFFER => table.resize(size.saturating_add(4096) as usize, 0),
+            _ => return None,
         }
-        Vec::new()
-    };
-    let families = if origin.v6 {
-        [(AF_INET6, true), (AF_INET, false)]
-    } else {
-        [(AF_INET, false), (AF_INET6, true)]
-    };
-    families.into_iter().find_map(|(family, v6)| {
-        table_owner(
-            &read(family),
-            tcp,
-            v6,
-            origin.local_port,
-            origin.remote_port,
-        )
+    }
+    None
+}
+
+fn tcp_port_owner(origin: &Origin, buffer: &mut Vec<u8>) -> Option<u32> {
+    let v6 = origin.local.is_ipv6();
+    [v6, !v6].into_iter().find_map(|v6| {
+        let table = read_port_table(true, v6, buffer)?;
+        tcp_table_owner(table, v6, origin.local.port(), origin.remote_port)
     })
 }
 
 struct Shared {
     nat: Mutex<Nat>,
     rules: Mutex<Vec<DivertRule>>,
+    /// UDP flows of covered sockets with the address their answers are injected with.
+    udp: Mutex<udp::Flows<Address>>,
+    link: Arc<Link>,
     generation: AtomicU64,
     counters: Mutex<HashMap<String, Arc<Counters>>>,
     logs: Mutex<Vec<(String, String)>>,
@@ -297,7 +327,27 @@ impl Shared {
     }
 }
 
-fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
+/// How a rule's UDP is handled while its relay channel works; without it, the fallback.
+fn policies(rules: &[DivertRule]) -> HashMap<String, (Policy, Policy)> {
+    rules
+        .iter()
+        .map(|rule| {
+            let fallback = if rule.direct && rule.proxy.is_none() {
+                Policy::Direct
+            } else {
+                Policy::Block
+            };
+            let tunnel = if rule.udp {
+                Policy::Tunnel { quic: rule.quic }
+            } else {
+                fallback
+            };
+            (rule.id.clone(), (tunnel, fallback))
+        })
+        .collect()
+}
+
+fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) {
     let own = std::env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
@@ -309,7 +359,14 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
         parents: RefCell::new(None),
     };
     let mut generation = u64::MAX;
-    let mut udp_ports: HashMap<(u16, bool), (Option<String>, Instant)> = HashMap::new();
+    let mut policy: HashMap<String, (Policy, Policy)> = HashMap::new();
+    let mut quic_logged: HashSet<String> = HashSet::new();
+    // Rules whose application goes around its tunnel right now, because the tunnel is down.
+    let mut bypassing: HashSet<String> = HashSet::new();
+    let mut udp_owners = UdpOwners::default();
+    let mut port_table = vec![0u8; 4096];
+    let mut udp_table = vec![0u8; 4096];
+    let mut udp_snapshot = Snapshot::default();
     let mut buffer = vec![0u8; 40 + 0xffff];
     let mut purged = Instant::now();
     let mut failures = 0u32;
@@ -340,38 +397,112 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
         let current = shared.generation.load(Ordering::Acquire);
         if current != generation {
             generation = current;
-            matcher.set_rules(&shared.rules.lock().unwrap());
-            udp_ports.clear();
+            let rules = shared.rules.lock().unwrap();
+            let before = matcher.rules.clone();
+            policy = policies(&rules);
+            bypassing = policy
+                .iter()
+                .filter(|(_, (_, fallback))| *fallback == Policy::Direct)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let all_bypass = rules.iter().all(|rule| bypassing.contains(&rule.id));
+            if matcher.set_rules(&rules) {
+                udp_owners.rules_changed(&|id| matcher.unchanged(&before, id), all_bypass);
+            } else {
+                udp_owners.set_all_bypass(all_bypass);
+            }
+            drop(rules);
         }
         let data = &mut buffer[..length as usize];
+        let linked = shared.link.up();
         let verdict = {
             let mut nat = shared.nat.lock().unwrap();
             if now.duration_since(purged) > Duration::from_secs(10) {
                 purged = now;
                 nat.purge(now);
-                udp_ports.retain(|_, (_, at)| now.duration_since(*at) < PORT_TTL);
+                udp_owners.purge(now);
+                for id in shared.udp.lock().unwrap().purge(now) {
+                    shared.link.close(id);
+                }
             }
-            handle(data, relay_port, &mut nat, now, &mut |protocol, origin| {
-                if protocol == TCP {
-                    return matcher.decide(port_owner(true, origin)?, now, &system);
-                }
-                // Datagrams arrive in bursts: one lookup per local port every few seconds.
-                let key = (origin.local_port, origin.v6);
-                if let Some((rule, at)) = udp_ports.get(&key)
-                    && now.duration_since(*at) < PORT_TTL
-                {
-                    return rule.clone();
-                }
-                let rule =
-                    port_owner(false, origin).and_then(|pid| matcher.decide(pid, now, &system));
-                udp_ports.insert(key, (rule.clone(), now));
-                rule
-            })
+            handle(
+                data,
+                relay_port,
+                &mut nat,
+                now,
+                &mut |protocol, origin| {
+                    if matcher.rules.is_empty() {
+                        return None;
+                    }
+                    if protocol == TCP {
+                        let pid = tcp_port_owner(origin, &mut port_table)?;
+                        return matcher.decide(pid, now, &system);
+                    }
+                    let mut local = origin.local;
+                    if let SocketAddr::V6(addr) = &mut local
+                        && addr.ip().is_unicast_link_local()
+                    {
+                        addr.set_scope_id(address.interface_index());
+                    }
+                    // The rule as it is; `handle` applies whether it bypasses its tunnel.
+                    udp_owners.decide(local, now, &|rule| bypassing.contains(rule), || {
+                        let pids = udp_snapshot.owners(now, local, |v6| {
+                            read_port_table(false, v6, &mut udp_table).map(<[u8]>::to_vec)
+                        })?;
+                        Some(
+                            pids.into_iter()
+                                .filter_map(|pid| matcher.decide(pid, now, &system))
+                                .collect(),
+                        )
+                    })
+                },
+                &|rule| match policy.get(rule) {
+                    Some((tunnel @ Policy::Tunnel { .. }, _)) if linked => *tunnel,
+                    Some((Policy::Tunnel { .. }, fallback)) => *fallback,
+                    Some((other, _)) => *other,
+                    None => Policy::Block,
+                },
+            )
         };
-        if verdict == Verdict::Drop {
-            continue;
+        match verdict {
+            Verdict::Drop => continue,
+            Verdict::Capture { rule } => {
+                if let Some((local, remote, payload)) = udp::outbound(data) {
+                    let flow = shared
+                        .udp
+                        .lock()
+                        .unwrap()
+                        .outbound(local, &rule, address, now);
+                    if let Some(old) = flow.replaced {
+                        shared.link.close(old);
+                    }
+                    if flow.opened {
+                        shared.log(&rule, format!("UDP {remote} через туннель"));
+                    }
+                    shared
+                        .link
+                        .send(&rule, flow.id, flow.opened, remote, payload);
+                }
+                continue;
+            }
+            Verdict::Quic { rule } => {
+                shared.link.dropped(&rule, DropReason::Quic);
+                if quic_logged.insert(rule.clone()) {
+                    shared.log(
+                        &rule,
+                        "QUIC (UDP 443) заблокирован: браузер перейдёт на TCP".into(),
+                    );
+                }
+                continue;
+            }
+            Verdict::Fragment { rule } => {
+                shared.link.dropped(&rule, DropReason::Size);
+                shared.log(&rule, "Фрагментированная UDP-датаграмма отброшена".into());
+                continue;
+            }
+            Verdict::Pass | Verdict::Reflect => {}
         }
-        if verdict == Verdict::Reflect {
+        if matches!(verdict, Verdict::Reflect) {
             address.flags &= !OUTBOUND;
             // SAFETY: the packet and its address are valid; the helper rewrites checksums in place.
             unsafe { (api.checksums)(data.as_mut_ptr().cast(), length, &mut address, 0) };
@@ -386,6 +517,75 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
                 &address,
             )
         };
+    }
+}
+
+/// Injects answers from the relay as inbound packets to the application's socket.
+async fn answers(
+    api: Api,
+    device: Arc<Device>,
+    shared: Arc<Shared>,
+    mut inbound: tokio::sync::mpsc::Receiver<Inbound>,
+) {
+    let ident = AtomicU16::new(rand::random());
+    let mut refused: HashSet<String> = HashSet::new();
+    while let Some(message) = inbound.recv().await {
+        let (id, peer, data) = match message {
+            Inbound::Datagram { id, peer, data } => (id, peer, data),
+            Inbound::Closed { id } => {
+                shared.udp.lock().unwrap().close(id);
+                continue;
+            }
+            Inbound::Lost => {
+                shared.udp.lock().unwrap().clear();
+                continue;
+            }
+        };
+        let Some((local, rule, mut address)) = shared
+            .udp
+            .lock()
+            .unwrap()
+            .inbound(id, Instant::now())
+            .map(|(local, flow)| (local, flow.rule.clone(), flow.meta))
+        else {
+            continue;
+        };
+        let Some(mut packet) =
+            udp::inbound(peer, local, &data, ident.fetch_add(1, Ordering::Relaxed))
+        else {
+            shared.link.dropped(&rule, DropReason::Size);
+            continue;
+        };
+        address.flags &= !OUTBOUND;
+        let length = packet.len() as u32;
+        // SAFETY: the packet and its address are valid for the duration of both calls.
+        let sent = unsafe {
+            (api.checksums)(packet.as_mut_ptr().cast(), length, &mut address, 0);
+            (api.send)(
+                device.0,
+                packet.as_ptr().cast(),
+                length,
+                std::ptr::null_mut(),
+                &address,
+            )
+        };
+        if sent == 0 {
+            shared.link.dropped(&rule, DropReason::Size);
+            // Once per rule: an answer the stack refused, most likely above the interface MTU.
+            if refused.insert(rule.clone()) {
+                // SAFETY: reads the calling thread's last error.
+                let error = unsafe { GetLastError() };
+                shared.log(
+                    &rule,
+                    format!(
+                        "Ответ UDP {} байт не доставлен приложению (код {error})",
+                        data.len()
+                    ),
+                );
+            }
+        } else {
+            shared.link.injected(&rule, data.len());
+        }
     }
 }
 
@@ -491,6 +691,8 @@ async fn serve(store: Store) -> Result<()> {
     let shared = Arc::new(Shared {
         nat: Mutex::new(Nat::default()),
         rules: Mutex::new(Vec::new()),
+        udp: Mutex::new(udp::Flows::default()),
+        link: Arc::new(Link::default()),
         generation: AtomicU64::new(0),
         counters: Mutex::new(HashMap::new()),
         logs: Mutex::new(Vec::new()),
@@ -500,8 +702,18 @@ async fn serve(store: Store) -> Result<()> {
         let relay = listener("0.0.0.0:0")
             .context("Не удалось открыть порт для перехваченных соединений.")?;
         let port = relay.local_addr()?.port();
-        let device = open(&api)?;
+        let device = Arc::new(open(&api)?);
         firewall(Some(port));
+        let (inbound_send, inbound) = tokio::sync::mpsc::channel(INBOUND_QUEUE);
+        let attach = client.clone();
+        tokio::spawn(shared.link.clone().run(
+            move || {
+                let client = attach.clone();
+                async move { Ok(tokio::io::split(client.attach_udp().await?)) }
+            },
+            inbound_send,
+        ));
+        tokio::spawn(answers(api, device.clone(), shared.clone(), inbound));
         tokio::spawn(accept(relay, shared.clone()));
         // Systems without IPv6 simply have no such traffic to reflect.
         if let Ok(relay) = listener(&format!("[::]:{port}")) {
@@ -549,6 +761,7 @@ async fn serve(store: Store) -> Result<()> {
             stats,
             logs: pending.clone(),
             error: String::new(),
+            udp: shared.link.stats(),
         };
         let reply = client.request("divert_sync", json!(report)).await.ok();
         // Another version of КРОТ took over: its own helper has to be started instead.
