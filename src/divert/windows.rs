@@ -47,7 +47,7 @@ use super::{
     DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
     link::{INBOUND_QUEUE, Inbound, Link},
     owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
-    tcp_table_owner,
+    reset, tcp_table_owner,
     udp::{self, Policy},
 };
 use crate::{
@@ -500,6 +500,25 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                 shared.log(&rule, "Фрагментированная UDP-датаграмма отброшена".into());
                 continue;
             }
+            Verdict::Refuse { .. } => {
+                if let Some(mut answer) = reset(data) {
+                    let mut inbound = address;
+                    inbound.flags &= !OUTBOUND;
+                    let size = answer.len() as u32;
+                    // SAFETY: the packet and its address are valid for the duration of the calls.
+                    unsafe {
+                        (api.checksums)(answer.as_mut_ptr().cast(), size, &mut inbound, 0);
+                        (api.send)(
+                            device.0,
+                            answer.as_ptr().cast(),
+                            size,
+                            std::ptr::null_mut(),
+                            &inbound,
+                        )
+                    };
+                }
+                continue;
+            }
             Verdict::Pass | Verdict::Reflect => {}
         }
         if matches!(verdict, Verdict::Reflect) {
@@ -662,6 +681,9 @@ async fn accept(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
                             &flow.rule,
                             format!("{destination}: туннель не открыл соединение"),
                         );
+                        if destination.is_ipv6() {
+                            refuse_ipv6(&shared, proxy, &flow.rule);
+                        }
                     }
                 }
                 Some(DivertRule { direct: true, .. }) => {
@@ -678,6 +700,33 @@ async fn accept(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
             }
         });
     }
+}
+
+/// The server behind `proxy` could not open an IPv6 connection: usually it has no IPv6 route.
+/// New IPv6 connections of every rule on that tunnel are refused for a while, so applications
+/// fall back to IPv4 instead of seeing a connection that opens and drops.
+fn refuse_ipv6(shared: &Shared, proxy: SocketAddr, rule: &str) {
+    let rules: Vec<String> = shared
+        .rules
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|rule| rule.proxy == Some(proxy))
+        .map(|rule| rule.id.clone())
+        .collect();
+    shared
+        .nat
+        .lock()
+        .unwrap()
+        .refuse_ipv6(rules.iter().map(String::as_str), Instant::now());
+    shared.log(
+        rule,
+        format!(
+            "Сервер туннеля не открывает IPv6-соединения: {} мин новые IPv6-соединения \
+             отклоняются сразу, приложения переходят на IPv4",
+            super::IPV6_REFUSAL.as_secs() / 60
+        ),
+    );
 }
 
 fn listener(address: &str) -> Result<tokio::net::TcpListener> {
