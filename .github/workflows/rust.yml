@@ -17,6 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+      # Dependencies come from the cache on dev, main and pull requests; only dev and main
+      # save it. A release built from a tag starts from nothing.
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: relay
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' }}
       # Retries: a mirror that briefly fails to resolve must not fail the build.
       - run: |
           sudo apt-get -o Acquire::Retries=5 update
@@ -55,6 +62,13 @@ jobs:
           name: krot-relay
           path: relay-bin
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      # Dependencies come from the cache on dev, main and pull requests; only dev and main
+      # save it. A release built from a tag starts from nothing.
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' }}
       - run: cargo +stable fmt --all --check
       - uses: actions/setup-python@v7
         with:
