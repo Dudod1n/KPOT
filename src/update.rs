@@ -1231,8 +1231,9 @@ mod readiness_tests {
         let (_dir, path, helper) = super::install_tests::fixture();
         let install = validate_install(&path, &helper).unwrap();
         for case in ["valid", "pid", "version", "config", "owner", "malformed"] {
+            // The child must outlive the check however slow the machine is; it is killed below.
             let mut child = Command::new("/bin/sh")
-                .args(["-c", "sleep 0.15"])
+                .args(["-c", "sleep 30"])
                 .spawn()
                 .unwrap();
             let ack = Readiness {
@@ -1267,6 +1268,7 @@ mod readiness_tests {
                     .is_ok(),
                 case == "valid"
             );
+            let _ = child.kill();
             child.wait().unwrap();
         }
     }
