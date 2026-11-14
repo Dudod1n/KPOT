@@ -2281,6 +2281,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "krot-udp-proto",
  "rand 0.9.5",
  "raw-window-handle",
  "reqwest",
@@ -2303,6 +2304,18 @@ dependencies = [
  "zbus",
  "zeroize",
 ]
+
+[[package]]
+name = "krot-relay"
+version = "0.0.0"
+dependencies = [
+ "krot-udp-proto",
+ "libc",
+]
+
+[[package]]
+name = "krot-udp-proto"
+version = "0.0.0"
 
 [[package]]
 name = "ksni"

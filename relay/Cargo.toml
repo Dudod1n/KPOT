@@ -1,0 +1,14 @@
+[package]
+name = "krot-relay"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+description = "КРОТ: серверный помощник UDP, работает через stdin/stdout SSH-канала"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+krot-udp-proto = { path = "../proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.190"

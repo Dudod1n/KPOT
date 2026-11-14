@@ -259,6 +259,8 @@ enum Operation {
     Delete,
     ToggleApp(String),
     SaveApp(String),
+    /// A UDP choice for a tunnel or a rule.
+    Udp,
     Settings,
     Answer,
     Shutdown,
@@ -387,6 +389,11 @@ enum Confirm {
         name: String,
     },
     DeleteApp {
+        id: String,
+        name: String,
+    },
+    /// Uploading the relay to a tunnel's server needs the user's consent.
+    UdpConsent {
         id: String,
         name: String,
     },
@@ -1691,6 +1698,83 @@ impl Desktop {
                 });
             }
         });
+        // After the tunnel's own actions, so that they stay in view in a small window.
+        if tunnel.kind == "D" {
+            self.tunnel_udp(ui, ctx, tunnel);
+        }
+    }
+    /// UDP through the server relay: its state, its numbers and the switch.
+    fn tunnel_udp(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tunnel: &Tunnel) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        ui.separator();
+        let consent = snapshot.udp.consented(tunnel);
+        let runtime = snapshot
+            .udp_runtimes
+            .get(&tunnel.id)
+            .cloned()
+            .unwrap_or_default();
+        let (text, color) = if !consent {
+            ("выключен".to_owned(), DIM)
+        } else {
+            let color = match runtime.state.as_str() {
+                "running" => GREEN,
+                "unavailable" => RED,
+                _ => AMBER,
+            };
+            (crate::udp::state_text(&runtime), color)
+        };
+        ui.colored_label(tone(ui, color), format!("UDP через сервер: {text}"));
+        if !snapshot.udp_error.is_empty() {
+            ui.colored_label(tone(ui, RED), &snapshot.udp_error);
+        }
+        if let Some(metrics) = snapshot.udp_metrics.get(&tunnel.id) {
+            let lost: u64 =
+                metrics.drops.values().sum::<u64>() + metrics.relay.drops.values().sum::<u64>();
+            ui.weak(format!(
+                "Датаграмм ↑ {} · ↓ {} · потоков {} · потеряно {}",
+                metrics.sent.datagrams, metrics.received.datagrams, metrics.flows_active, lost
+            ));
+            if let (Some(rtt), Some(queue)) = (metrics.rtt.p95_us, metrics.to_channel_delay.p95_us)
+            {
+                ui.weak(format!(
+                    "До сервера p95 {} мс · ожидание в очереди p95 {} мс",
+                    rtt / 1000,
+                    queue / 1000
+                ));
+            }
+        }
+        if !consent {
+            ui.weak("UDP приложений этого туннеля сейчас блокируется. Включение загрузит на сервер помощник КРОТа.");
+        }
+        let busy = self.pending_operations > 0;
+        let label = if consent {
+            "Выключить UDP"
+        } else {
+            "Включить UDP через сервер…"
+        };
+        if ui
+            .add_enabled(
+                !busy && snapshot.udp_error.is_empty(),
+                egui::Button::new(label),
+            )
+            .clicked()
+        {
+            if consent {
+                self.request(
+                    ctx,
+                    Operation::Udp,
+                    "udp_tunnel",
+                    json!({"id": tunnel.id, "enabled": false}),
+                );
+            } else {
+                self.confirm = Some(Confirm::UdpConsent {
+                    id: tunnel.id.clone(),
+                    name: tunnel.name.clone(),
+                });
+            }
+        }
     }
     fn dialog_view(&mut self, ctx: &egui::Context) -> Option<KeyTarget> {
         let mut dialog = self.dialog.take()?;
@@ -2154,6 +2238,17 @@ impl Desktop {
                         if ui.button(RichText::new("Удалить").color(tone(ui, RED))).clicked() { choice = 2; }
                     });
                 }
+                Confirm::UdpConsent { name, .. } => {
+                    ui.heading("Включить UDP через сервер?");
+                    ui.label(format!("Для туннеля «{name}» КРОТ загрузит на SSH-сервер свой помощник krot-relay (около 0,4 МиБ) в каталог ~/.cache/krot и будет запускать его, пока туннель работает. UDP приложений из правил этого туннеля пойдёт в сеть с адреса сервера."));
+                    ui.weak("Помощник работает с правами вашей учётной записи на сервере и ничего не записывает, кроме своего файла. Управление идёт через отдельное SSH-соединение, снаружи это по-прежнему SSH. Для каждого UDP-потока приложения помощник открывает на сервере временный UDP-порт и принимает на него ответы с любого адреса — так работают звонки и WebRTC.");
+                    ui.weak("Помощник даёт UDP-выход и там, где администратор сервера запретил переадресацию портов (AllowTcpForwarding no). Убедитесь, что это допустимо на этом сервере.");
+                    ui.weak("Согласие действует только для этого сервера и учётной записи. Выключение UDP, смена сервера или удаление туннеля удаляют помощник с сервера, если он доступен.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Отмена").clicked() { choice = 1; }
+                        if ui.button(RichText::new("Загрузить и включить").color(tone(ui, CYAN))).clicked() { choice = 2; }
+                    });
+                }
                 Confirm::Discard { .. } => {
                     ui.heading("Несохранённые изменения");
                     ui.label(if matches!(self.dialog, Some(Dialog::AppForm(_))) {
@@ -2233,6 +2328,14 @@ impl Desktop {
                             json!({"before": snapshot.apps, "rules": rules}),
                         );
                     }
+                }
+                Confirm::UdpConsent { id, .. } => {
+                    self.request(
+                        ctx,
+                        Operation::Udp,
+                        "udp_tunnel",
+                        json!({"id": id, "enabled": true}),
+                    );
                 }
                 Confirm::Discard { after } => match after {
                     AfterDiscard::CloseDialog => self.dialog = None,
@@ -2681,7 +2784,7 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
     action
 }
 
-const HELP: &str = "Диспетчерская\n1 / 2  Вкладки «Туннели» и «Приложения»\n↑ / ↓  Выбрать туннель или правило\nSpace  Запуск / остановка / отмена подключения\nEnter  Открыть запрос ожидающего туннеля\nN / E  Создать / изменить\nL      Журнал\nDelete Удалить\nS      Настройки\n? / F1 Справка\nQ      Меню выхода\n\nВ формах\nTab / Shift+Tab  Следующее / предыдущее поле\nCtrl+S / Ctrl+Enter  Сохранить\nEsc  Назад / отмена\n\nL: локальный порт → сервис со стороны SSH-сервера.\nR: порт на SSH-сервере → сервис со стороны вашего устройства.\nD: локальный SOCKS5-прокси → сеть SSH-сервера.\n\nПриложения: правило направляет TCP-трафик выбранного исполняемого файла через туннель типа D. Пока туннель работает, UDP и QUIC такого приложения блокируются. Если туннель не работает, сеть приложения закрыта, пока в правиле не выбрано «Пускать напрямую»: тогда напрямую идёт весь трафик, включая UDP.\n\nJump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.\n\nПароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.\n\nКрестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее или повторным запуском КРОТа. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.\n\nВ настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.\n\nНа заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.";
+const HELP: &str = "Диспетчерская\n1 / 2  Вкладки «Туннели» и «Приложения»\n↑ / ↓  Выбрать туннель или правило\nSpace  Запуск / остановка / отмена подключения\nEnter  Открыть запрос ожидающего туннеля\nN / E  Создать / изменить\nL      Журнал\nDelete Удалить\nS      Настройки\n? / F1 Справка\nQ      Меню выхода\n\nВ формах\nTab / Shift+Tab  Следующее / предыдущее поле\nCtrl+S / Ctrl+Enter  Сохранить\nEsc  Назад / отмена\n\nL: локальный порт → сервис со стороны SSH-сервера.\nR: порт на SSH-сервере → сервис со стороны вашего устройства.\nD: локальный SOCKS5-прокси → сеть SSH-сервера.\n\nПриложения: правило направляет трафик выбранного исполняемого файла через туннель типа D. UDP идёт через туннель, если в карточке туннеля включён «UDP через сервер» (на сервер загружается помощник КРОТа); иначе UDP блокируется. QUIC (UDP 443) блокируется, пока в карточке правила не включено его туннелирование. Если туннель не работает, сеть приложения закрыта, пока в правиле не выбрано «Пускать напрямую»: тогда напрямую идёт весь трафик, включая UDP.\n\nJump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.\n\nПароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.\n\nКрестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее или повторным запуском КРОТа. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.\n\nВ настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.\n\nНа заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.";
 
 #[cfg(test)]
 mod tests {
@@ -4539,6 +4642,119 @@ mod tests {
             name: "браузер".into(),
         });
         assert!(!render(&mut app, &ctx, [700.0, 500.0]).shapes.is_empty());
+    }
+    #[test]
+    fn udp_is_offered_only_with_consent_and_its_state_shows_on_tunnel_and_rule() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        app.snapshot = Some(app_snapshot("running"));
+        app.selected = Some("socks".into());
+        // A local tunnel has no UDP block at all.
+        app.selected = Some("native-tunnel".into());
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "UDP через сервер: выключен").is_none());
+        app.selected = Some("socks".into());
+        let output = render(&mut app, &ctx, [1000.0, 720.0]);
+        assert!(text_rect(&output, "UDP через сервер: выключен").is_some());
+        // In the smallest window the block lies below the tunnel's own actions: scroll to it.
+        let over_details = egui::pos2(520.0, 300.0);
+        for _ in 0..3 {
+            input_frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(over_details),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -400.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                false,
+            );
+        }
+        click_label(&mut app, &ctx, "Включить UDP через сервер…");
+        assert!(matches!(&app.confirm, Some(Confirm::UdpConsent { id, .. }) if id == "socks"));
+        render(&mut app, &ctx, [700.0, 500.0]);
+        let output = render(&mut app, &ctx, [700.0, 500.0]);
+        assert!(text_rect(&output, "Загрузить и включить").is_some());
+        app.confirm = None;
+
+        let mut snapshot = app_snapshot("running");
+        snapshot.udp.tunnels.insert(
+            "socks".into(),
+            crate::udp::consent::TunnelUdp {
+                enabled: true,
+                server: crate::udp::consent::server(&app_snapshot("running").config.tunnels[1]),
+            },
+        );
+        snapshot.udp_runtimes.insert(
+            "socks".into(),
+            crate::ssh::UdpRuntime {
+                state: "running".into(),
+                level: 1,
+                ..Default::default()
+            },
+        );
+        snapshot
+            .udp_metrics
+            .insert("socks".into(), Default::default());
+        snapshot
+            .udp_helper
+            .insert("rule".into(), Default::default());
+        app.snapshot = Some(snapshot.clone());
+        let output = render(&mut app, &ctx, [1000.0, 720.0]);
+        assert!(text_rect(&output, "UDP через сервер: работает, уровень 1").is_some());
+        assert!(text_rect(&output, "Выключить UDP").is_some());
+
+        app.view = View::Apps;
+        app.selected_app = Some("rule".into());
+        // A tall window shows the whole card; smaller ones scroll to it.
+        let output = render(&mut app, &ctx, [1000.0, 1200.0]);
+        assert!(text_rect(&output, "Туннелировать QUIC (UDP 443)").is_some());
+        assert!(
+            text_rect(
+                &output,
+                "Трафик: TCP и UDP через туннель; QUIC (UDP 443) блокируется, браузер переходит на TCP"
+            )
+            .is_some()
+        );
+        // The numbers line follows the helper's report.
+        assert!(text_rect(&output, "UDP: ↑ 0 · ↓ 0 датаграмм · потоков 0").is_some());
+        // A stopped rule or a missing helper does not claim tunnelling, relay or not.
+        for state in ["stopped", "elevation"] {
+            let mut stopped = snapshot.clone();
+            stopped.app_runtimes.get_mut("rule").unwrap().state = state.into();
+            app.snapshot = Some(stopped);
+            let output = render(&mut app, &ctx, [1000.0, 1200.0]);
+            assert!(
+                text_rect(
+                    &output,
+                    "Трафик: правило сейчас не перехватывает приложение"
+                )
+                .is_some(),
+                "{state}"
+            );
+            assert!(
+                text_rect(
+                    &output,
+                    "Трафик: TCP и UDP через туннель; QUIC (UDP 443) блокируется, браузер переходит на TCP"
+                )
+                .is_none()
+            );
+        }
+        snapshot.udp_runtimes.clear();
+        app.snapshot = Some(snapshot);
+        let output = render(&mut app, &ctx, [1000.0, 1200.0]);
+        assert!(
+            text_rect(
+                &output,
+                "Трафик: только TCP; UDP через сервер ещё не работает, поэтому UDP блокируется"
+            )
+            .is_some()
+        );
     }
     #[test]
     fn apps_tab_without_socks_tunnels_offers_one_and_keys_follow_the_active_tab() {

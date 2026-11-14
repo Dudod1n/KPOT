@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -45,8 +45,10 @@ use windows_sys::Win32::{
 
 use super::{
     DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
+    link::{INBOUND_QUEUE, Inbound, Link},
     owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
     tcp_table_owner,
+    udp::{self, Policy},
 };
 use crate::{
     apps::{DivertReport, DivertRule, DivertStats},
@@ -54,6 +56,7 @@ use crate::{
     config::Store,
     proxy::{Counters, Destination},
 };
+use krot_udp_proto::metrics::DropReason;
 
 const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp)\0";
 const FIREWALL_RULE: &str = "KROT-app-relay";
@@ -81,6 +84,9 @@ const _: () = {
 };
 
 /// `WINDIVERT_ADDRESS`: timestamp, a bit field, a reserved word and 64 bytes of layer data.
+/// For the network layer the data starts with the interface and subinterface indexes, which
+/// an injected answer needs; the whole address of the flow's latest packet is kept for it.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct Address {
     timestamp: i64,
@@ -114,6 +120,8 @@ struct Api {
 struct Device(HANDLE);
 // SAFETY: the handle is an opaque kernel object used only through thread-safe driver calls.
 unsafe impl std::marker::Send for Device {}
+// SAFETY: as above; the packet thread receives while the answer task sends.
+unsafe impl std::marker::Sync for Device {}
 
 fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
     text.encode_wide().chain(std::iter::once(0)).collect()
@@ -293,6 +301,9 @@ fn tcp_port_owner(origin: &Origin, buffer: &mut Vec<u8>) -> Option<u32> {
 struct Shared {
     nat: Mutex<Nat>,
     rules: Mutex<Vec<DivertRule>>,
+    /// UDP flows of covered sockets with the address their answers are injected with.
+    udp: Mutex<udp::Flows<Address>>,
+    link: Arc<Link>,
     generation: AtomicU64,
     counters: Mutex<HashMap<String, Arc<Counters>>>,
     logs: Mutex<Vec<(String, String)>>,
@@ -316,7 +327,27 @@ impl Shared {
     }
 }
 
-fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
+/// How a rule's UDP is handled while its relay channel works; without it, the fallback.
+fn policies(rules: &[DivertRule]) -> HashMap<String, (Policy, Policy)> {
+    rules
+        .iter()
+        .map(|rule| {
+            let fallback = if rule.direct && rule.proxy.is_none() {
+                Policy::Direct
+            } else {
+                Policy::Block
+            };
+            let tunnel = if rule.udp {
+                Policy::Tunnel { quic: rule.quic }
+            } else {
+                fallback
+            };
+            (rule.id.clone(), (tunnel, fallback))
+        })
+        .collect()
+}
+
+fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) {
     let own = std::env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
@@ -328,6 +359,8 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
         parents: RefCell::new(None),
     };
     let mut generation = u64::MAX;
+    let mut policy: HashMap<String, (Policy, Policy)> = HashMap::new();
+    let mut quic_logged: HashSet<String> = HashSet::new();
     // Rules whose application goes around its tunnel right now, because the tunnel is down.
     let mut bypassing: HashSet<String> = HashSet::new();
     let mut udp_owners = UdpOwners::default();
@@ -366,10 +399,11 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
             generation = current;
             let rules = shared.rules.lock().unwrap();
             let before = matcher.rules.clone();
-            bypassing = rules
+            policy = policies(&rules);
+            bypassing = policy
                 .iter()
-                .filter(|rule| rule.direct && rule.proxy.is_none())
-                .map(|rule| rule.id.clone())
+                .filter(|(_, (_, fallback))| *fallback == Policy::Direct)
+                .map(|(id, _)| id.clone())
                 .collect();
             let all_bypass = rules.iter().all(|rule| bypassing.contains(&rule.id));
             if matcher.set_rules(&rules) {
@@ -377,14 +411,19 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
             } else {
                 udp_owners.set_all_bypass(all_bypass);
             }
+            drop(rules);
         }
         let data = &mut buffer[..length as usize];
+        let linked = shared.link.up();
         let verdict = {
             let mut nat = shared.nat.lock().unwrap();
             if now.duration_since(purged) > Duration::from_secs(10) {
                 purged = now;
                 nat.purge(now);
                 udp_owners.purge(now);
+                for id in shared.udp.lock().unwrap().purge(now) {
+                    shared.link.close(id);
+                }
             }
             handle(
                 data,
@@ -417,13 +456,53 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
                         )
                     })
                 },
-                &|rule| bypassing.contains(rule),
+                &|rule| match policy.get(rule) {
+                    Some((tunnel @ Policy::Tunnel { .. }, _)) if linked => *tunnel,
+                    Some((Policy::Tunnel { .. }, fallback)) => *fallback,
+                    Some((other, _)) => *other,
+                    None => Policy::Block,
+                },
             )
         };
-        if verdict == Verdict::Drop {
-            continue;
+        match verdict {
+            Verdict::Drop => continue,
+            Verdict::Capture { rule } => {
+                if let Some((local, remote, payload)) = udp::outbound(data) {
+                    let flow = shared
+                        .udp
+                        .lock()
+                        .unwrap()
+                        .outbound(local, &rule, address, now);
+                    if let Some(old) = flow.replaced {
+                        shared.link.close(old);
+                    }
+                    if flow.opened {
+                        shared.log(&rule, format!("UDP {remote} через туннель"));
+                    }
+                    shared
+                        .link
+                        .send(&rule, flow.id, flow.opened, remote, payload);
+                }
+                continue;
+            }
+            Verdict::Quic { rule } => {
+                shared.link.dropped(&rule, DropReason::Quic);
+                if quic_logged.insert(rule.clone()) {
+                    shared.log(
+                        &rule,
+                        "QUIC (UDP 443) заблокирован: браузер перейдёт на TCP".into(),
+                    );
+                }
+                continue;
+            }
+            Verdict::Fragment { rule } => {
+                shared.link.dropped(&rule, DropReason::Size);
+                shared.log(&rule, "Фрагментированная UDP-датаграмма отброшена".into());
+                continue;
+            }
+            Verdict::Pass | Verdict::Reflect => {}
         }
-        if verdict == Verdict::Reflect {
+        if matches!(verdict, Verdict::Reflect) {
             address.flags &= !OUTBOUND;
             // SAFETY: the packet and its address are valid; the helper rewrites checksums in place.
             unsafe { (api.checksums)(data.as_mut_ptr().cast(), length, &mut address, 0) };
@@ -438,6 +517,75 @@ fn packets(api: Api, device: Device, relay_port: u16, shared: Arc<Shared>) {
                 &address,
             )
         };
+    }
+}
+
+/// Injects answers from the relay as inbound packets to the application's socket.
+async fn answers(
+    api: Api,
+    device: Arc<Device>,
+    shared: Arc<Shared>,
+    mut inbound: tokio::sync::mpsc::Receiver<Inbound>,
+) {
+    let ident = AtomicU16::new(rand::random());
+    let mut refused: HashSet<String> = HashSet::new();
+    while let Some(message) = inbound.recv().await {
+        let (id, peer, data) = match message {
+            Inbound::Datagram { id, peer, data } => (id, peer, data),
+            Inbound::Closed { id } => {
+                shared.udp.lock().unwrap().close(id);
+                continue;
+            }
+            Inbound::Lost => {
+                shared.udp.lock().unwrap().clear();
+                continue;
+            }
+        };
+        let Some((local, rule, mut address)) = shared
+            .udp
+            .lock()
+            .unwrap()
+            .inbound(id, Instant::now())
+            .map(|(local, flow)| (local, flow.rule.clone(), flow.meta))
+        else {
+            continue;
+        };
+        let Some(mut packet) =
+            udp::inbound(peer, local, &data, ident.fetch_add(1, Ordering::Relaxed))
+        else {
+            shared.link.dropped(&rule, DropReason::Size);
+            continue;
+        };
+        address.flags &= !OUTBOUND;
+        let length = packet.len() as u32;
+        // SAFETY: the packet and its address are valid for the duration of both calls.
+        let sent = unsafe {
+            (api.checksums)(packet.as_mut_ptr().cast(), length, &mut address, 0);
+            (api.send)(
+                device.0,
+                packet.as_ptr().cast(),
+                length,
+                std::ptr::null_mut(),
+                &address,
+            )
+        };
+        if sent == 0 {
+            shared.link.dropped(&rule, DropReason::Size);
+            // Once per rule: an answer the stack refused, most likely above the interface MTU.
+            if refused.insert(rule.clone()) {
+                // SAFETY: reads the calling thread's last error.
+                let error = unsafe { GetLastError() };
+                shared.log(
+                    &rule,
+                    format!(
+                        "Ответ UDP {} байт не доставлен приложению (код {error})",
+                        data.len()
+                    ),
+                );
+            }
+        } else {
+            shared.link.injected(&rule, data.len());
+        }
     }
 }
 
@@ -543,6 +691,8 @@ async fn serve(store: Store) -> Result<()> {
     let shared = Arc::new(Shared {
         nat: Mutex::new(Nat::default()),
         rules: Mutex::new(Vec::new()),
+        udp: Mutex::new(udp::Flows::default()),
+        link: Arc::new(Link::default()),
         generation: AtomicU64::new(0),
         counters: Mutex::new(HashMap::new()),
         logs: Mutex::new(Vec::new()),
@@ -552,8 +702,18 @@ async fn serve(store: Store) -> Result<()> {
         let relay = listener("0.0.0.0:0")
             .context("Не удалось открыть порт для перехваченных соединений.")?;
         let port = relay.local_addr()?.port();
-        let device = open(&api)?;
+        let device = Arc::new(open(&api)?);
         firewall(Some(port));
+        let (inbound_send, inbound) = tokio::sync::mpsc::channel(INBOUND_QUEUE);
+        let attach = client.clone();
+        tokio::spawn(shared.link.clone().run(
+            move || {
+                let client = attach.clone();
+                async move { Ok(tokio::io::split(client.attach_udp().await?)) }
+            },
+            inbound_send,
+        ));
+        tokio::spawn(answers(api, device.clone(), shared.clone(), inbound));
         tokio::spawn(accept(relay, shared.clone()));
         // Systems without IPv6 simply have no such traffic to reflect.
         if let Ok(relay) = listener(&format!("[::]:{port}")) {
@@ -601,6 +761,7 @@ async fn serve(store: Store) -> Result<()> {
             stats,
             logs: pending.clone(),
             error: String::new(),
+            udp: shared.link.stats(),
         };
         let reply = client.request("divert_sync", json!(report)).await.ok();
         // Another version of КРОТ took over: its own helper has to be started instead.

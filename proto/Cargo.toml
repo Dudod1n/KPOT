@@ -1,0 +1,10 @@
+[package]
+name = "krot-udp-proto"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+description = "КРОТ: кадры UDP-канала между клиентом и серверным помощником"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
