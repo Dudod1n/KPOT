@@ -105,8 +105,20 @@ pub async fn relay(
     destination: &Destination,
     counters: &Counters,
 ) -> io::Result<()> {
+    relay_reporting(inbound, proxy, destination, counters, || {}).await
+}
+
+/// [`relay`] that calls `opened` once the proxy has opened the destination.
+pub async fn relay_reporting(
+    inbound: impl AsyncRead + AsyncWrite + Unpin,
+    proxy: SocketAddr,
+    destination: &Destination,
+    counters: &Counters,
+    opened: impl FnOnce(),
+) -> io::Result<()> {
     counters.total.fetch_add(1, Ordering::Relaxed);
     let outbound = connect(proxy, destination).await?;
+    opened();
     pipe(inbound, outbound, counters).await
 }
 

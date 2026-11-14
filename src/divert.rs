@@ -156,6 +156,48 @@ fn parse(data: &[u8]) -> Option<Packet> {
     })
 }
 
+/// How long apart failures of different IPv6 hosts still count as one outage.
+const IPV6_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// What each tunnel's server has shown about IPv6, keyed by the tunnel's SOCKS address.
+///
+/// SSH reports every failed connection the same way, so a refused port on one host and a
+/// server without an IPv6 route look alike. A tunnel counts as IPv4-only only when two
+/// different IPv6 hosts failed and no IPv6 connection through it opened recently.
+#[derive(Default)]
+pub struct Ipv6Health {
+    tunnels: HashMap<SocketAddr, Ipv6Seen>,
+}
+
+#[derive(Default)]
+struct Ipv6Seen {
+    opened: Option<Instant>,
+    failed: HashMap<IpAddr, Instant>,
+}
+
+impl Ipv6Health {
+    pub fn opened(&mut self, proxy: SocketAddr, now: Instant) {
+        let seen = self.tunnels.entry(proxy).or_default();
+        seen.opened = Some(now);
+        seen.failed.clear();
+    }
+
+    /// Records a failed IPv6 connection; `true` when the tunnel has no IPv6.
+    pub fn failed(&mut self, proxy: SocketAddr, host: IpAddr, now: Instant) -> bool {
+        let seen = self.tunnels.entry(proxy).or_default();
+        if seen
+            .opened
+            .is_some_and(|opened| now.duration_since(opened) < IPV6_REFUSAL)
+        {
+            return false;
+        }
+        seen.failed
+            .retain(|_, at| now.duration_since(*at) < IPV6_FAILURE_WINDOW);
+        seen.failed.insert(host, now);
+        seen.failed.len() >= 2
+    }
+}
+
 /// The TCP RST+ACK that answers the outbound SYN in `data`, as an inbound packet. Checksums
 /// are left zero for the platform to fill in. `None` when `data` is not a TCP SYN.
 pub fn reset(data: &[u8]) -> Option<Vec<u8>> {
@@ -245,12 +287,28 @@ impl Nat {
             flow.closed = Some(now);
         }
     }
-    /// The server behind `rules`' tunnel cannot open IPv6 connections.
-    pub fn refuse_ipv6<'a>(&mut self, rules: impl IntoIterator<Item = &'a str>, now: Instant) {
+    /// The server behind `rules`' tunnel cannot open IPv6 connections. Rules already refused
+    /// keep their deadline, so stragglers of the same failure do not extend it. `true` when
+    /// some rule was not refused yet.
+    pub fn refuse_ipv6<'a>(
+        &mut self,
+        rules: impl IntoIterator<Item = &'a str>,
+        now: Instant,
+    ) -> bool {
+        let mut refused = false;
         for rule in rules {
-            self.ipv6_refused
-                .insert(rule.to_owned(), now + IPV6_REFUSAL);
+            if !self.ipv6_refused(rule, now) {
+                self.ipv6_refused
+                    .insert(rule.to_owned(), now + IPV6_REFUSAL);
+                refused = true;
+            }
         }
+        refused
+    }
+    /// Forgets the IPv6 refusal of every rule for which `keep` is false: its tunnel stopped,
+    /// restarted or changed, and what was learned about the old server no longer holds.
+    pub fn keep_ipv6_refusals(&mut self, keep: impl Fn(&str) -> bool) {
+        self.ipv6_refused.retain(|rule, _| keep(rule));
     }
     fn ipv6_refused(&self, rule: &str, now: Instant) -> bool {
         self.ipv6_refused
@@ -611,7 +669,9 @@ mod tests {
             handle(&mut syn, RELAY, &mut nat, now, &mut covered, &blocked),
             Verdict::Reflect
         );
-        nat.refuse_ipv6(["rule"], now);
+        assert!(nat.refuse_ipv6(["rule"], now));
+        // A second failure of the same outage neither reports nor extends the refusal.
+        assert!(!nat.refuse_ipv6(["rule"], now + Duration::from_secs(60)));
         let mut syn = tcp(ipv6, server, 0x02);
         assert_eq!(
             handle(&mut syn, RELAY, &mut nat, now, &mut covered, &blocked),
@@ -639,6 +699,42 @@ mod tests {
             handle(&mut syn, RELAY, &mut nat, later, &mut covered, &blocked),
             Verdict::Reflect
         );
+        // A restarted or stopped tunnel forgets the refusal at once.
+        assert!(nat.refuse_ipv6(["rule"], later));
+        nat.keep_ipv6_refusals(|_| false);
+        let mut syn = tcp("[2001:db8::2]:50004", server, 0x02);
+        assert_eq!(
+            handle(&mut syn, RELAY, &mut nat, later, &mut covered, &blocked),
+            Verdict::Reflect
+        );
+    }
+
+    #[test]
+    fn a_tunnel_is_ipv4_only_after_two_ipv6_hosts_fail_and_none_opened() {
+        let proxy: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:1081".parse().unwrap();
+        let a: IpAddr = "2a02:26f0:3400::5f64:9e08".parse().unwrap();
+        let b: IpAddr = "2600:9000:20b4:8600:a:f92d:7840:93a1".parse().unwrap();
+        let now = Instant::now();
+        // One host refusing its port says nothing about the route.
+        let mut health = Ipv6Health::default();
+        assert!(!health.failed(proxy, a, now));
+        assert!(!health.failed(proxy, a, now));
+        assert!(!health.failed(other, b, now));
+        // A second host failing within the window does.
+        assert!(health.failed(proxy, b, now + Duration::from_secs(1)));
+        // Failures too far apart are separate events.
+        let mut health = Ipv6Health::default();
+        assert!(!health.failed(proxy, a, now));
+        assert!(!health.failed(proxy, b, now + IPV6_FAILURE_WINDOW));
+        // A server that opened IPv6 recently has IPv6, whatever fails afterwards.
+        let mut health = Ipv6Health::default();
+        health.opened(proxy, now);
+        assert!(!health.failed(proxy, a, now));
+        assert!(!health.failed(proxy, b, now));
+        let later = now + IPV6_REFUSAL;
+        assert!(!health.failed(proxy, a, later));
+        assert!(health.failed(proxy, b, later));
     }
 
     #[test]

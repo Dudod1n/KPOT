@@ -307,6 +307,7 @@ struct Shared {
     generation: AtomicU64,
     counters: Mutex<HashMap<String, Arc<Counters>>>,
     logs: Mutex<Vec<(String, String)>>,
+    ipv6: Mutex<super::Ipv6Health>,
 }
 
 impl Shared {
@@ -674,14 +675,30 @@ async fn accept(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
                 }) => {
                     shared.log(&flow.rule, format!("{destination} через туннель"));
                     let target = Destination::Address(destination);
-                    if let Err(error) = crate::proxy::relay(stream, proxy, &target, &counters).await
+                    let opened = || {
+                        if destination.is_ipv6() {
+                            shared.ipv6.lock().unwrap().opened(proxy, Instant::now());
+                        }
+                    };
+                    if let Err(error) =
+                        crate::proxy::relay_reporting(stream, proxy, &target, &counters, opened)
+                            .await
                         && error.kind() == std::io::ErrorKind::ConnectionRefused
                     {
                         shared.log(
                             &flow.rule,
                             format!("{destination}: туннель не открыл соединение"),
                         );
-                        if destination.is_ipv6() {
+                        // Only the server's own refusal counts: an OS error means the local
+                        // SOCKS port itself is gone, as while the tunnel reconnects.
+                        if destination.is_ipv6()
+                            && error.raw_os_error().is_none()
+                            && shared.ipv6.lock().unwrap().failed(
+                                proxy,
+                                destination.ip(),
+                                Instant::now(),
+                            )
+                        {
                             refuse_ipv6(&shared, proxy, &flow.rule);
                         }
                     }
@@ -714,11 +731,14 @@ fn refuse_ipv6(shared: &Shared, proxy: SocketAddr, rule: &str) {
         .filter(|rule| rule.proxy == Some(proxy))
         .map(|rule| rule.id.clone())
         .collect();
-    shared
+    let refused = shared
         .nat
         .lock()
         .unwrap()
         .refuse_ipv6(rules.iter().map(String::as_str), Instant::now());
+    if !refused {
+        return;
+    }
     shared.log(
         rule,
         format!(
@@ -745,6 +765,7 @@ async fn serve(store: Store) -> Result<()> {
         generation: AtomicU64::new(0),
         counters: Mutex::new(HashMap::new()),
         logs: Mutex::new(Vec::new()),
+        ipv6: Mutex::new(super::Ipv6Health::default()),
     });
     let start = || -> Result<u16> {
         let api = load()?;
@@ -829,6 +850,17 @@ async fn serve(store: Store) -> Result<()> {
                 pending.clear();
                 let mut current = shared.rules.lock().unwrap();
                 if *current != rules {
+                    // A refusal holds only while the rule stays on the same running tunnel:
+                    // a stopped tunnel lets the application go direct, a new one may have IPv6.
+                    shared.nat.lock().unwrap().keep_ipv6_refusals(|id| {
+                        let proxy = |rules: &[DivertRule]| {
+                            rules
+                                .iter()
+                                .find(|rule| rule.id == id)
+                                .and_then(|rule| rule.proxy)
+                        };
+                        proxy(&rules).is_some_and(|next| proxy(&current) == Some(next))
+                    });
                     *current = rules;
                     shared.generation.fetch_add(1, Ordering::Release);
                 }
