@@ -47,7 +47,7 @@ use super::{
     DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
     link::{INBOUND_QUEUE, Inbound, Link},
     owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
-    tcp_table_owner,
+    reset, tcp_table_owner,
     udp::{self, Policy},
 };
 use crate::{
@@ -307,6 +307,7 @@ struct Shared {
     generation: AtomicU64,
     counters: Mutex<HashMap<String, Arc<Counters>>>,
     logs: Mutex<Vec<(String, String)>>,
+    ipv6: Mutex<super::Ipv6Health>,
 }
 
 impl Shared {
@@ -500,6 +501,25 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                 shared.log(&rule, "Фрагментированная UDP-датаграмма отброшена".into());
                 continue;
             }
+            Verdict::Refuse { .. } => {
+                if let Some(mut answer) = reset(data) {
+                    let mut inbound = address;
+                    inbound.flags &= !OUTBOUND;
+                    let size = answer.len() as u32;
+                    // SAFETY: the packet and its address are valid for the duration of the calls.
+                    unsafe {
+                        (api.checksums)(answer.as_mut_ptr().cast(), size, &mut inbound, 0);
+                        (api.send)(
+                            device.0,
+                            answer.as_ptr().cast(),
+                            size,
+                            std::ptr::null_mut(),
+                            &inbound,
+                        )
+                    };
+                }
+                continue;
+            }
             Verdict::Pass | Verdict::Reflect => {}
         }
         if matches!(verdict, Verdict::Reflect) {
@@ -655,13 +675,32 @@ async fn accept(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
                 }) => {
                     shared.log(&flow.rule, format!("{destination} через туннель"));
                     let target = Destination::Address(destination);
-                    if let Err(error) = crate::proxy::relay(stream, proxy, &target, &counters).await
+                    let opened = || {
+                        if destination.is_ipv6() {
+                            shared.ipv6.lock().unwrap().opened(proxy, Instant::now());
+                        }
+                    };
+                    if let Err(error) =
+                        crate::proxy::relay_reporting(stream, proxy, &target, &counters, opened)
+                            .await
                         && error.kind() == std::io::ErrorKind::ConnectionRefused
                     {
                         shared.log(
                             &flow.rule,
                             format!("{destination}: туннель не открыл соединение"),
                         );
+                        // Only the server's own refusal counts: an OS error means the local
+                        // SOCKS port itself is gone, as while the tunnel reconnects.
+                        if destination.is_ipv6()
+                            && error.raw_os_error().is_none()
+                            && shared.ipv6.lock().unwrap().failed(
+                                proxy,
+                                destination.ip(),
+                                Instant::now(),
+                            )
+                        {
+                            refuse_ipv6(&shared, proxy, &flow.rule);
+                        }
                     }
                 }
                 Some(DivertRule { direct: true, .. }) => {
@@ -680,6 +719,36 @@ async fn accept(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
     }
 }
 
+/// The server behind `proxy` could not open an IPv6 connection: usually it has no IPv6 route.
+/// New IPv6 connections of every rule on that tunnel are refused for a while, so applications
+/// fall back to IPv4 instead of seeing a connection that opens and drops.
+fn refuse_ipv6(shared: &Shared, proxy: SocketAddr, rule: &str) {
+    let rules: Vec<String> = shared
+        .rules
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|rule| rule.proxy == Some(proxy))
+        .map(|rule| rule.id.clone())
+        .collect();
+    let refused = shared
+        .nat
+        .lock()
+        .unwrap()
+        .refuse_ipv6(rules.iter().map(String::as_str), Instant::now());
+    if !refused {
+        return;
+    }
+    shared.log(
+        rule,
+        format!(
+            "Сервер туннеля не открывает IPv6-соединения: {} мин новые IPv6-соединения \
+             отклоняются сразу, приложения переходят на IPv4",
+            super::IPV6_REFUSAL.as_secs() / 60
+        ),
+    );
+}
+
 fn listener(address: &str) -> Result<tokio::net::TcpListener> {
     let listener = std::net::TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
@@ -696,6 +765,7 @@ async fn serve(store: Store) -> Result<()> {
         generation: AtomicU64::new(0),
         counters: Mutex::new(HashMap::new()),
         logs: Mutex::new(Vec::new()),
+        ipv6: Mutex::new(super::Ipv6Health::default()),
     });
     let start = || -> Result<u16> {
         let api = load()?;
@@ -780,6 +850,17 @@ async fn serve(store: Store) -> Result<()> {
                 pending.clear();
                 let mut current = shared.rules.lock().unwrap();
                 if *current != rules {
+                    // A refusal holds only while the rule stays on the same running tunnel:
+                    // a stopped tunnel lets the application go direct, a new one may have IPv6.
+                    shared.nat.lock().unwrap().keep_ipv6_refusals(|id| {
+                        let proxy = |rules: &[DivertRule]| {
+                            rules
+                                .iter()
+                                .find(|rule| rule.id == id)
+                                .and_then(|rule| rule.proxy)
+                        };
+                        proxy(&rules).is_some_and(|next| proxy(&current) == Some(next))
+                    });
                     *current = rules;
                     shared.generation.fetch_add(1, Ordering::Release);
                 }
