@@ -9,7 +9,8 @@ import time
 import unittest
 from unittest.mock import Mock
 
-from ssh_support import Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _metadata, _receive_line
+from ssh_support import (Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _metadata, _receive_line,
+                         endpoint_path)
 
 
 class FixtureTests(unittest.TestCase):
@@ -26,13 +27,16 @@ class FixtureTests(unittest.TestCase):
     def test_invalid_metadata_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'endpoint.json'
-            for data in ({'port': True, 'token': 'a' * 64},
-                         {'port': 1234, 'token': 'invalid'},
-                         {'port': 1234, 'token': 'a' * 64, 'extra': 1},
-                         'x' * 4097):
-                with self.subTest(data=data):
-                    path.write_text(json.dumps(data))
-                    with self.assertRaises(ValueError):
+            valid = json.dumps({'port': 1234, 'token': 'a' * 64})
+            path.write_text(valid.ljust(4096))
+            self.assertEqual(_metadata(path), {'port': 1234, 'token': 'a' * 64})
+            for data in (json.dumps({'port': True, 'token': 'a' * 64}),
+                         json.dumps({'port': 1234, 'token': 'invalid'}),
+                         json.dumps({'port': 1234, 'token': 'a' * 64, 'extra': 1}),
+                         valid.ljust(4097)):
+                with self.subTest(data=data[:80]):
+                    path.write_text(data)
+                    with self.assertRaisesRegex(ValueError, 'Некорректный адрес'):
                         _metadata(path)
 
     def test_response_frames_require_newline_and_respect_size_limit(self):
@@ -73,7 +77,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / 'config.json')
             async with await asyncio.start_server(serve, '127.0.0.1', 0) as server:
-                store.path.with_name('config.json.background.json').write_text(json.dumps({
+                endpoint_path(store.path).write_text(json.dumps({
                     'port': server.sockets[0].getsockname()[1], 'token': 'a' * 64}))
                 try:
                     result = await asyncio.to_thread(Client(store.path).request, 'snapshot')
@@ -89,14 +93,16 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(received[0]), {'nonce'})
 
     async def test_authenticated_response_and_errors(self):
+        invalid = ValueError('Некорректный ответ фонового процесса.')
         for response, expected in (({'ok': True, 'value': {'version': 1}}, {'version': 1}),
-                                   ({'ok': False, 'error': 'rejected'}, ValueError),
-                                   ({'ok': True, 'value': None, 'extra': 1}, ValueError)):
+                                   ({'ok': False, 'error': 'rejected'}, ValueError('rejected')),
+                                   ({'ok': True, 'value': None, 'extra': 1}, invalid)):
             with self.subTest(response=response):
                 result, received = await self.exchange(True, response)
                 self.assertEqual(received[1], {'token': 'a' * 64, 'command': 'snapshot', 'payload': None})
-                if expected is ValueError:
+                if isinstance(expected, ValueError):
                     self.assertIsInstance(result, ValueError)
+                    self.assertEqual(str(result), str(expected))
                 else:
                     self.assertEqual(result, expected)
 

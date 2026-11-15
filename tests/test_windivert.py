@@ -34,7 +34,9 @@ class WinDivertTests(unittest.TestCase):
     def test_published_names_match_what_the_application_downloads(self):
         source = (ROOT / 'src/divert.rs').read_text(encoding='utf-8')
         packager = (ROOT / 'scripts/package_release.py').read_text(encoding='utf-8')
-        for name in re.findall(r'name: "(WinDivert[^"]+)"', source):
+        names = re.findall(r'name: "(WinDivert[^"]+)"', source)
+        self.assertEqual(names, ['WinDivert.dll', 'WinDivert64.sys'])
+        for name in names:
             self.assertIn(name, [shipped for shipped, _ in fetcher.FILES.values()])
             self.assertIn(f"'{name}'", packager)
 

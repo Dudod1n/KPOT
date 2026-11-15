@@ -37,13 +37,17 @@ class PackageTests(unittest.TestCase):
             for name in ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt']:
                 (builds / 'krot-rust-Windows-X64' / name).write_bytes(name.encode())
             # Windows chmod does not set Unix executable permission bits.
-            with patch.object(packager, 'ROOT', root), patch.object(Path, 'chmod'):
+            with patch.object(packager, 'ROOT', root), patch.object(Path, 'chmod', autospec=True) as chmod:
                 packager.package('v1.2.3', builds, output, notes)
+            for name in ['krot-linux-x64', 'krot-cli-linux-x64']:
+                chmod.assert_any_call(output / name, 0o755)
             self.assertEqual(notes.read_text(), '### Fixed\n- Port cleanup.\n')
             self.assertEqual(len(list(output.iterdir())), 13)
             self.assertEqual((output / 'WinDivert64.sys').read_bytes(), b'WinDivert64.sys')
-            for line in (output / 'SHA256SUMS').read_text().splitlines():
-                digest, name = line.split('  ', 1)
+            sums = dict(reversed(line.split('  ', 1))
+                        for line in (output / 'SHA256SUMS').read_text().splitlines())
+            self.assertEqual(set(sums), {path.name for path in output.iterdir()} - {'SHA256SUMS'})
+            for name, digest in sums.items():
                 self.assertEqual(digest, hashlib.sha256((output / name).read_bytes()).hexdigest())
             with zipfile.ZipFile(output / 'krot-1.2.3-windows-x64.zip') as archive:
                 self.assertEqual(archive.read('krot.exe'), b'Windowskrot')
@@ -72,7 +76,8 @@ class PackageTests(unittest.TestCase):
                 source.mkdir(parents=True)
                 for name in ['krot' + suffix, 'krot-cli' + suffix, 'THIRD_PARTY_NOTICES.txt']:
                     (source / name).write_bytes(b'x')
-            with patch.object(packager, 'ROOT', root), self.assertRaises(ValueError):
+            with (patch.object(packager, 'ROOT', root),
+                  self.assertRaisesRegex(ValueError, r'Missing release input: .*WinDivert\.dll')):
                 packager.package('v1.2.3', root / 'builds', root / 'output', root / 'notes')
             self.assertFalse((root / 'output').exists())
 
