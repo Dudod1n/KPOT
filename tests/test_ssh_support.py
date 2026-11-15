@@ -9,8 +9,8 @@ import time
 import unittest
 from unittest.mock import Mock
 
-from ssh_support import (Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _metadata, _receive_line,
-                         endpoint_path)
+from ssh_support import (Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _handshake, _metadata,
+                         _receive_line, endpoint_path)
 
 
 class FixtureTests(unittest.TestCase):
@@ -50,6 +50,15 @@ class FixtureTests(unittest.TestCase):
                         _receive_line(connection, time.monotonic() + 1, 4)
                 else:
                     self.assertEqual(_receive_line(connection, time.monotonic() + 1, 4), expected)
+
+    def test_handshake_rejects_malformed_proof(self):
+        for reply in (b'[]\n', b'{"proof": 1}\n', '{"proof": "\u00e9"}\n'.encode(),
+                      b'{"proof": "' + b'0' * 64 + b'", "extra": 1}\n', b'{"proof": "' + b'0' * 64 + b'"}\n'):
+            with self.subTest(reply=reply):
+                connection = Mock()
+                connection.recv.side_effect = [reply]
+                with self.assertRaisesRegex(ValueError, 'Не удалось подтвердить'):
+                    _handshake(connection, 'a' * 64, time.monotonic() + 1)
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
