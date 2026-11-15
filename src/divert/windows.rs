@@ -44,7 +44,7 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
+    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, blocked_reason, handle,
     link::{INBOUND_QUEUE, Inbound, Link},
     owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
     reset, tcp_table_owner,
@@ -362,6 +362,10 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
     let mut generation = u64::MAX;
     let mut policy: HashMap<String, (Policy, Policy)> = HashMap::new();
     let mut quic_logged: HashSet<String> = HashSet::new();
+    // Per rule: whether its tunnel runs and carries UDP, and whether its block was logged
+    // since the rules last changed.
+    let mut carries: HashMap<String, (bool, bool)> = HashMap::new();
+    let mut blocked_logged: HashSet<String> = HashSet::new();
     // Rules whose application goes around its tunnel right now, because the tunnel is down.
     let mut bypassing: HashSet<String> = HashSet::new();
     let mut udp_owners = UdpOwners::default();
@@ -401,6 +405,11 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
             let rules = shared.rules.lock().unwrap();
             let before = matcher.rules.clone();
             policy = policies(&rules);
+            carries = rules
+                .iter()
+                .map(|rule| (rule.id.clone(), (rule.proxy.is_some(), rule.udp)))
+                .collect();
+            blocked_logged.clear();
             bypassing = policy
                 .iter()
                 .filter(|(_, (_, fallback))| *fallback == Policy::Direct)
@@ -483,6 +492,13 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                     shared
                         .link
                         .send(&rule, flow.id, flow.opened, remote, payload);
+                }
+                continue;
+            }
+            Verdict::Blocked { rule } => {
+                if blocked_logged.insert(rule.clone()) {
+                    let (tunnel_runs, udp) = carries.get(&rule).copied().unwrap_or_default();
+                    shared.log(&rule, blocked_reason(tunnel_runs, udp).into());
                 }
                 continue;
             }

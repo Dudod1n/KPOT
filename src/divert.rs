@@ -78,6 +78,10 @@ pub enum Verdict {
     Capture {
         rule: String,
     },
+    /// A datagram of `rule` that is dropped: its tunnel carries no UDP right now.
+    Blocked {
+        rule: String,
+    },
     /// UDP 443 of `rule`, blocked so that the browser falls back to TCP.
     Quic {
         rule: String,
@@ -368,7 +372,7 @@ pub fn handle(
             // Without the relay names are resolved by this computer; everything else would
             // bypass the tunnel.
             udp::Policy::Block if packet.destination_port == DNS_PORT => Verdict::Pass,
-            udp::Policy::Block => Verdict::Drop,
+            udp::Policy::Block => Verdict::Blocked { rule },
             udp::Policy::Tunnel { quic: false } if packet.destination_port == QUIC_PORT => {
                 Verdict::Quic { rule }
             }
@@ -436,6 +440,20 @@ pub fn handle(
         (packet.source, relay_port),
     );
     Verdict::Reflect
+}
+
+/// Why a rule's UDP is dropped, for its log: blocking is otherwise silent, and the application
+/// only reports that it cannot connect.
+#[cfg(any(windows, test))]
+fn blocked_reason(tunnel_runs: bool, udp: bool) -> &'static str {
+    match (tunnel_runs, udp) {
+        (false, _) => "UDP заблокирован: туннель не работает",
+        (true, false) => {
+            "UDP заблокирован: у туннеля не работает «UDP через сервер». \
+             Включите его в карточке туннеля или проверьте его состояние"
+        }
+        (true, true) => "UDP заблокирован: нет связи с фоновым КРОТом",
+    }
 }
 
 /// What the owner lookup needs to know about a packet.
@@ -854,6 +872,14 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_rule_is_told_what_to_turn_on() {
+        assert!(blocked_reason(false, false).contains("туннель не работает"));
+        assert!(blocked_reason(false, true).contains("туннель не работает"));
+        assert!(blocked_reason(true, false).contains("«UDP через сервер»"));
+        assert!(blocked_reason(true, true).contains("нет связи"));
+    }
+
+    #[test]
     fn covered_udp_is_dropped_except_name_resolution() {
         let (mut nat, now) = (Nat::default(), Instant::now());
         let udp = |port: u16| {
@@ -863,7 +889,9 @@ mod tests {
         };
         assert_eq!(
             handle(&mut udp(443), RELAY, &mut nat, now, &mut covered, &blocked),
-            Verdict::Drop
+            Verdict::Blocked {
+                rule: "rule".into()
+            }
         );
         assert_eq!(
             handle(&mut udp(53), RELAY, &mut nat, now, &mut covered, &blocked),
@@ -892,7 +920,9 @@ mod tests {
             assert_eq!(packet, original);
             assert_eq!(
                 handle(&mut packet, RELAY, &mut nat, now, &mut covered, &blocked),
-                Verdict::Drop
+                Verdict::Blocked {
+                    rule: "rule".into()
+                }
             );
         }
         assert!(nat.is_empty());
