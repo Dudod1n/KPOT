@@ -312,6 +312,47 @@ fn one_snapshot_serves_every_endpoint_for_its_hold() {
 }
 
 #[test]
+fn a_socket_bound_after_the_snapshot_is_found_by_a_fresh_reading() {
+    let mut snapshot = Snapshot::default();
+    let reads = Cell::new(0);
+    let rows = std::cell::RefCell::new(vec![row("192.0.2.1:5", 1)]);
+    let read = |v6: bool| {
+        reads.set(reads.get() + 1);
+        Some(if v6 {
+            table(&[])
+        } else {
+            table(&rows.borrow())
+        })
+    };
+    let start = Instant::now();
+    assert_eq!(
+        snapshot.owners(start, "192.0.2.1:5".parse().unwrap(), read),
+        Some(vec![1])
+    );
+    // The application opens its voice socket and sends from it right away.
+    rows.borrow_mut().push(row("0.0.0.0:50000", 7));
+    let soon = start + Duration::from_millis(1);
+    assert_eq!(
+        snapshot.owners(soon, "192.0.2.1:50000".parse().unwrap(), read),
+        Some(vec![7])
+    );
+    assert_eq!(reads.get(), 4, "the held snapshot was read again");
+    // The fresh reading serves known endpoints for its own hold.
+    let later = soon + SNAPSHOT_HOLD - Duration::from_millis(1);
+    assert_eq!(
+        snapshot.owners(later, "192.0.2.1:5".parse().unwrap(), read),
+        Some(vec![1])
+    );
+    assert_eq!(reads.get(), 4);
+    // An endpoint nobody owns costs one more reading, not two.
+    assert_eq!(
+        snapshot.owners(later, "192.0.2.1:6".parse().unwrap(), read),
+        Some(vec![])
+    );
+    assert_eq!(reads.get(), 6);
+}
+
+#[test]
 fn unknown_owners_are_asked_again_only_after_a_short_hold() {
     let (mut owners, start, lookups) = (UdpOwners::default(), Instant::now(), Cell::new(0));
     for offset in [0, 50, 99] {
