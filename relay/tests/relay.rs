@@ -404,6 +404,59 @@ fn idle_flows_are_closed() {
 }
 
 #[test]
+fn a_datagram_that_crosses_an_idle_close_does_not_open_the_flow_again() {
+    let mut relay = Relay::started(Settings {
+        idle_ms: 1_000,
+        idle_bidirectional_ms: 1_000,
+        ..settings()
+    });
+    let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+    relay.write(&Frame::Send {
+        flow: 9,
+        peer: silent.local_addr().unwrap(),
+        data: b"anyone?",
+    });
+    relay.expect(|frame| {
+        matches!(
+            frame,
+            Frame::Close {
+                flow: 9,
+                reason: CloseReason::Idle
+            }
+        )
+    });
+    let (server, _) = echo_server("127.0.0.1:0");
+    relay.write(&Frame::Send {
+        flow: 9,
+        peer: server,
+        data: b"late",
+    });
+    let stats = relay.expect(|frame| {
+        assert!(
+            !matches!(frame, Frame::Recv { .. } | Frame::Close { .. }),
+            "the closed flow answered: {frame:?}"
+        );
+        matches!(frame, Frame::Stats(stats) if stats.drops.get(DropReason::Channel) == 1)
+    });
+    let Frame::Stats(stats) = proto::parse(&stats).unwrap().unwrap().0 else {
+        unreachable!()
+    };
+    assert_eq!((stats.flows_opened, stats.flows_active), (1, 0));
+
+    // The client's own `CLOSE` frees the id.
+    relay.write(&Frame::Close {
+        flow: 9,
+        reason: CloseReason::Client,
+    });
+    relay.write(&Frame::Send {
+        flow: 9,
+        peer: server,
+        data: b"again",
+    });
+    assert_eq!(received(&relay.expect(is_recv)).2, b"echo:again");
+}
+
+#[test]
 fn closed_stdin_ends_the_relay_at_once() {
     let mut relay = Relay::started(settings());
     let (server, _) = echo_server("127.0.0.1:0");
