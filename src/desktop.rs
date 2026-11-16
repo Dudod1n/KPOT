@@ -1221,6 +1221,10 @@ impl Desktop {
         }
     }
     /// Milliseconds since start for animations, or `None` when «Анимация кротов» is off.
+    /// Whether blinking lights are lit now; always lit when motion is off.
+    fn blink_on(&self) -> bool {
+        self.anim_ms().is_none_or(|ms| ms / 600 % 2 == 0)
+    }
     fn anim_ms(&self) -> Option<u128> {
         self.snapshot
             .as_ref()
@@ -1493,7 +1497,6 @@ impl Desktop {
             .show(ctx, |ui| {
                 let mut narrow = true;
                 ui.horizontal(|ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing.x = 6.0;
                     style::mole(ui, 2.0, style::Pose::default(), &pal);
@@ -1514,7 +1517,7 @@ impl Desktop {
                             self.view = view;
                         }
                     }
-                    let actions_id = egui::Id::new("header_actions_width");
+                    let actions_id = header_actions_id();
                     let need = ctx
                         .data(|data| data.get_temp::<f32>(actions_id))
                         .unwrap_or(0.0);
@@ -1603,7 +1606,6 @@ impl Desktop {
     }
     /// Header actions from the right edge: version, then Q, ?, S and N.
     fn header_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Pal) {
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
         ui.spacing_mut().item_spacing.x = 6.0;
         let version_response = ui
@@ -1663,7 +1665,7 @@ impl Desktop {
         }
         // The first pass only measures; layout settles before anything is shown or clicked.
         let width = ui.min_rect().width() + 12.0;
-        let id = egui::Id::new("header_actions_width");
+        let id = header_actions_id();
         let known = ctx.data(|data| data.get_temp::<f32>(id));
         if known.is_none_or(|known| (known - width).abs() > 0.5) {
             ctx.data_mut(|data| data.insert_temp(id, width));
@@ -1679,7 +1681,7 @@ impl Desktop {
             self.tunnel_lamps(pal)
         };
         let total = lamps.len();
-        let blink_on = self.anim_ms().is_none_or(|ms| ms / 600 % 2 == 0);
+        let blink_on = self.blink_on();
         egui::TopBottomPanel::top("summary")
             .frame(
                 egui::Frame::new()
@@ -1718,7 +1720,7 @@ impl Desktop {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    if total > 8 {
+                    if total > style::LONG_LIST {
                         let filter = if apps {
                             &mut self.app_filter
                         } else {
@@ -1731,8 +1733,8 @@ impl Desktop {
                         } else {
                             ["Работают", "Ждут"]
                         };
-                        for (group, label) in [
-                            (Group::All, "Все".to_owned()),
+                        for (group, text) in [
+                            (Group::All, format!("Все · {total}")),
                             (
                                 Group::Live,
                                 format!("{} · {}", names[0], counts(Group::Live)),
@@ -1743,11 +1745,6 @@ impl Desktop {
                             ),
                             (Group::Off, format!("Выключены · {}", counts(Group::Off))),
                         ] {
-                            let text = if group == Group::All {
-                                format!("{label} · {total}")
-                            } else {
-                                label
-                            };
                             if ui
                                 .add(style::choice(&text, *filter == group, pal))
                                 .clicked()
@@ -1828,7 +1825,7 @@ impl Desktop {
                         .color(pal.dim),
                     );
                 }
-                let filter = if tunnels.len() > 8 {
+                let filter = if tunnels.len() > style::LONG_LIST {
                     self.filter
                 } else {
                     Group::All
@@ -2131,25 +2128,19 @@ impl Desktop {
             };
             (crate::udp::state_text(&runtime), color)
         };
-        let udp_error = snapshot.udp_error.clone();
-        let metrics = snapshot.udp_metrics.get(&tunnel.id).cloned();
+        let udp_error = &snapshot.udp_error;
+        let metrics = snapshot.udp_metrics.get(&tunnel.id);
         let busy = self.pending_operations > 0;
-        let mut clicked = false;
-        egui::Frame::new()
-            .stroke(Stroke::new(1.0_f32, pal.line))
-            .corner_radius(4)
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(format!("UDP через сервер: {text}"))
-                        .family(style::bold())
-                        .color(color),
-                );
+        let clicked = style::group(
+            ui,
+            &format!("UDP через сервер: {text}"),
+            color,
+            pal,
+            |ui| {
                 if !udp_error.is_empty() {
-                    ui.colored_label(pal.error, &udp_error);
+                    ui.colored_label(pal.error, udp_error);
                 }
-                if let Some(metrics) = &metrics {
+                if let Some(metrics) = metrics {
                     let lost: u64 = metrics.drops.values().sum::<u64>()
                         + metrics.relay.drops.values().sum::<u64>();
                     ui.label(
@@ -2186,20 +2177,12 @@ impl Desktop {
                 let button = if consent {
                     style::secondary("Выключить UDP", pal)
                 } else {
-                    egui::Button::new(
-                        RichText::new("Включить UDP через сервер…")
-                            .family(style::bold())
-                            .color(pal.accent),
-                    )
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::new(1.0_f32, pal.accent))
-                    .corner_radius(4)
-                    .min_size(egui::vec2(0.0, 40.0))
+                    style::tinted("Включить UDP через сервер…", pal.accent)
                 };
-                clicked = ui
-                    .add_enabled(!busy && udp_error.is_empty(), button)
-                    .clicked();
-            });
+                ui.add_enabled(!busy && udp_error.is_empty(), button)
+                    .clicked()
+            },
+        );
         if clicked {
             if consent {
                 self.request(
@@ -2267,10 +2250,7 @@ impl Desktop {
                         );
                     });
                     ui.add_space(6.0);
-                    egui::Frame::new()
-                        .fill(pal.bg)
-                        .stroke(Stroke::new(1.0_f32, pal.line))
-                        .corner_radius(4)
+                    style::well(&pal)
                         .inner_margin(egui::Margin {
                             left: 22,
                             right: 12,
@@ -2527,10 +2507,7 @@ impl Desktop {
                 });
                 ui.add_space(10.0);
                 let quote = self.about_quote.unwrap_or(0);
-                let frame = egui::Frame::new()
-                    .fill(pal.bg)
-                    .stroke(Stroke::new(1.0_f32, pal.line))
-                    .corner_radius(4)
+                let frame = style::well(&pal)
                     .inner_margin(egui::Margin {
                         left: 20,
                         right: 14,
@@ -2647,7 +2624,7 @@ impl Desktop {
             );
         });
         ui.add_space(8.0);
-        let blink_on = self.anim_ms().is_none_or(|ms| ms / 600 % 2 == 0);
+        let blink_on = self.blink_on();
         egui::ScrollArea::vertical()
             .max_height((max_height - if small { 200.0 } else { 300.0 }).max(70.0))
             .show(ui, |ui| {
@@ -2713,18 +2690,14 @@ impl Desktop {
                                         if matches!(state.as_str(), "waiting" | "error")
                                             && ui
                                                 .add(
-                                                    egui::Button::new(
-                                                        RichText::new(if state == "waiting" {
+                                                    style::tinted(
+                                                        if state == "waiting" {
                                                             "Разобраться"
                                                         } else {
                                                             "Повторить"
-                                                        })
-                                                        .family(style::bold())
-                                                        .color(color),
+                                                        },
+                                                        color,
                                                     )
-                                                    .fill(Color32::TRANSPARENT)
-                                                    .stroke(Stroke::new(1.0_f32, color))
-                                                    .corner_radius(4)
                                                     .min_size(egui::vec2(0.0, 36.0)),
                                                 )
                                                 .clicked()
@@ -2810,26 +2783,21 @@ impl Desktop {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| add(ui));
             };
+            let tunnel = matches!(confirm, Confirm::Delete { .. });
             match &mut confirm {
-                Confirm::Delete { name, .. } => {
-                    ui.heading("Удалить туннель?");
-                    ui.label(format!(
-                        "«{name}» будет удалён из настроек. Его соединение и порт закроются."
-                    ));
-                    row(ui, &mut |ui| {
-                        if ui.add(style::secondary("Отмена", &pal)).clicked() {
-                            choice = 1;
-                        }
-                        if ui.add(style::filled("Удалить", pal.error, &pal)).clicked() {
-                            choice = 2;
-                        }
+                Confirm::Delete { name, .. } | Confirm::DeleteApp { name, .. } => {
+                    ui.heading(if tunnel {
+                        "Удалить туннель?"
+                    } else {
+                        "Удалить правило?"
                     });
-                }
-                Confirm::DeleteApp { name, .. } => {
-                    ui.heading("Удалить правило?");
-                    ui.label(format!(
-                        "«{name}» будет удалено. Приложение снова пойдёт в сеть напрямую."
-                    ));
+                    ui.label(if tunnel {
+                        format!(
+                            "«{name}» будет удалён из настроек. Его соединение и порт закроются."
+                        )
+                    } else {
+                        format!("«{name}» будет удалено. Приложение снова пойдёт в сеть напрямую.")
+                    });
                     row(ui, &mut |ui| {
                         if ui.add(style::secondary("Отмена", &pal)).clicked() {
                             choice = 1;
@@ -3327,6 +3295,11 @@ struct Row {
     lever: bool,
 }
 
+/// Temp-data key for the measured width of the header actions.
+fn header_actions_id() -> egui::Id {
+    egui::Id::new("header_actions_width")
+}
+
 /// A list card: side strip, mode badge, name, route, state and the lever on the right.
 #[allow(clippy::too_many_arguments)]
 fn list_row(
@@ -3607,36 +3580,31 @@ fn prompt_view(
             }
             ui.add_space(6.0);
             if key {
-                egui::Frame::new()
-                    .fill(pal.bg)
-                    .stroke(Stroke::new(1.0_f32, pal.line))
-                    .corner_radius(4)
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        if changed {
-                            ui.label(RichText::new("Сохранённый ключ").size(13.0).color(pal.dim));
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&request.old_fingerprint)
-                                        .monospace()
-                                        .strikethrough()
-                                        .color(pal.dim),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(4.0);
-                        }
-                        ui.label(RichText::new("Полученный ключ").size(13.0).color(pal.dim));
+                style::well(pal).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if changed {
+                        ui.label(RichText::new("Сохранённый ключ").size(13.0).color(pal.dim));
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&request.new_fingerprint)
+                                RichText::new(&request.old_fingerprint)
                                     .monospace()
-                                    .color(pal.warn),
+                                    .strikethrough()
+                                    .color(pal.dim),
                             )
                             .wrap(),
                         );
-                    });
+                        ui.add_space(4.0);
+                    }
+                    ui.label(RichText::new("Полученный ключ").size(13.0).color(pal.dim));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&request.new_fingerprint)
+                                .monospace()
+                                .color(pal.warn),
+                        )
+                        .wrap(),
+                    );
+                });
                 ui.label(
                     RichText::new("Сверьте отпечаток с администратором по независимому каналу.")
                         .color(pal.dim),

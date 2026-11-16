@@ -178,18 +178,12 @@ pub(super) fn pal(ctx: &egui::Context) -> Pal {
 }
 
 const BUTTON_HEIGHT: f32 = 40.0;
+/// Above this many items lights become a bar and the list gets filters.
+pub(super) const LONG_LIST: usize = 8;
 
 /// Main action: accent fill, capital letters.
 pub(super) fn primary(text: &str, pal: &Pal) -> egui::Button<'static> {
-    egui::Button::new(
-        RichText::new(text.to_uppercase())
-            .family(bold())
-            .color(pal.on_accent),
-    )
-    .fill(pal.accent)
-    .stroke(Stroke::NONE)
-    .corner_radius(4)
-    .min_size(Vec2::new(0.0, BUTTON_HEIGHT))
+    filled(&text.to_uppercase(), pal.accent, pal)
 }
 
 /// Secondary action: outline only.
@@ -210,14 +204,19 @@ fn outline(text: &str, color: Color32, border: Color32) -> egui::Button<'static>
         .min_size(Vec2::new(0.0, BUTTON_HEIGHT))
 }
 
+/// A bold outline in one colour, for an action that belongs to a coloured block.
+pub(super) fn tinted(text: &str, color: Color32) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).family(bold()).color(color))
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::new(1.0_f32, color))
+        .corner_radius(4)
+        .min_size(Vec2::new(0.0, BUTTON_HEIGHT))
+}
+
 /// A tab or a choice: filled with the accent when selected.
 pub(super) fn choice(text: &str, selected: bool, pal: &Pal) -> egui::Button<'static> {
     if selected {
-        egui::Button::new(RichText::new(text).family(bold()).color(pal.on_accent))
-            .fill(pal.accent)
-            .stroke(Stroke::new(1.0_f32, pal.accent))
-            .corner_radius(4)
-            .min_size(Vec2::new(0.0, BUTTON_HEIGHT))
+        filled(text, pal.accent, pal)
     } else {
         outline(text, pal.ink, pal.line)
     }
@@ -237,6 +236,15 @@ pub(super) fn caps(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Respo
         },
     );
     ui.label(job)
+}
+
+/// A sunken block inside a card: page colour, thin border.
+pub(super) fn well(pal: &Pal) -> egui::Frame {
+    egui::Frame::new()
+        .fill(pal.bg)
+        .stroke(Stroke::new(1.0_f32, pal.line))
+        .corner_radius(4)
+        .inner_margin(Margin::same(14))
 }
 
 pub(super) fn card(pal: &Pal) -> egui::Frame {
@@ -346,7 +354,7 @@ pub(super) struct Lamp {
 /// Up to eight round lights; beyond that one bar of equal sectors in list order.
 pub(super) fn lamps(ui: &mut egui::Ui, lamps: &[Lamp], blink_on: bool, pal: &Pal) {
     let visible = |lamp: &Lamp| !lamp.blink || blink_on;
-    if lamps.len() <= 8 {
+    if lamps.len() <= LONG_LIST {
         let size = Vec2::new(lamps.len() as f32 * 26.0, 22.0);
         let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
         for (index, lamp) in lamps.iter().enumerate() {

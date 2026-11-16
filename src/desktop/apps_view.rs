@@ -241,7 +241,7 @@ impl Desktop {
                         .color(pal.dim),
                     );
                 }
-                let filter = if rules.len() > 8 {
+                let filter = if rules.len() > style::LONG_LIST {
                     self.app_filter
                 } else {
                     Group::All
@@ -454,41 +454,36 @@ impl Desktop {
             _ => {}
         }
         ui.add_space(8.0);
-        egui::Frame::new()
-            .fill(pal.bg)
-            .stroke(Stroke::new(1.0_f32, pal.line))
-            .corner_radius(4)
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                match &tunnel {
-                    Some(tunnel) => {
-                        let (tunnel_label, _) = state_label(self.state(tunnel));
-                        ui.label(
-                            RichText::new(format!(
-                                "Туннель: {} · {} · {}:{} · {}",
-                                tunnel.name, tunnel.kind, tunnel.bind, tunnel.port, tunnel_label
-                            ))
-                            .monospace(),
-                        );
-                    }
-                    None => {
-                        ui.colored_label(pal.error, "Туннель: удалён");
-                    }
+        style::well(pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match &tunnel {
+                Some(tunnel) => {
+                    let (tunnel_label, _) = state_label(self.state(tunnel));
+                    ui.label(
+                        RichText::new(format!(
+                            "Туннель: {} · {} · {}:{} · {}",
+                            tunnel.name, tunnel.kind, tunnel.bind, tunnel.port, tunnel_label
+                        ))
+                        .monospace(),
+                    );
                 }
-                self.rule_udp(ui, ctx, rule, tunnel.as_ref());
-                ui.label(
-                    RichText::new(format!(
-                        "Соединений {} · всего {} · ↑ {} · ↓ {}",
-                        runtime.connections,
-                        runtime.total,
-                        bytes(runtime.sent),
-                        bytes(runtime.received)
-                    ))
-                    .monospace()
-                    .color(pal.dim),
-                );
-            });
+                None => {
+                    ui.colored_label(pal.error, "Туннель: удалён");
+                }
+            }
+            self.rule_udp(ui, ctx, rule, tunnel.as_ref());
+            ui.label(
+                RichText::new(format!(
+                    "Соединений {} · всего {} · ↑ {} · ↓ {}",
+                    runtime.connections,
+                    runtime.total,
+                    bytes(runtime.sent),
+                    bytes(runtime.received)
+                ))
+                .monospace()
+                .color(pal.dim),
+            );
+        });
         ui.add_space(8.0);
         for text in [
             if rule.on_tunnel_down == "direct" {
@@ -689,10 +684,7 @@ pub(super) fn app_form_view(
                     });
                     let filter = form.filter.trim().to_lowercase();
                     let mut picked = None;
-                    egui::Frame::new()
-                        .fill(pal.bg)
-                        .stroke(Stroke::new(1.0_f32, pal.line))
-                        .corner_radius(4)
+                    style::well(&pal)
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
