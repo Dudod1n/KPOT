@@ -116,12 +116,142 @@ pub(crate) fn native_options() -> eframe::NativeOptions {
     }
 }
 
+/// Палитра цветной темы. Смысловые цвета заменяют CYAN, GREEN, AMBER и RED в `tone`.
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: Color32,
+    panel: Color32,
+    extreme: Color32,
+    line: Color32,
+    raised: Color32,
+    selected: Color32,
+    ink: Color32,
+    dim: Color32,
+    accent: Color32,
+    ok: Color32,
+    warn: Color32,
+    error: Color32,
+}
+
+impl Palette {
+    fn tone(&self, color: Color32) -> Color32 {
+        match color {
+            CYAN => self.accent,
+            GREEN => self.ok,
+            AMBER => self.warn,
+            RED => self.error,
+            DIM => self.dim,
+            INK => self.ink,
+            other => other,
+        }
+    }
+}
+
+fn palette_id() -> egui::Id {
+    egui::Id::new("krot-palette")
+}
+
+fn palette(theme: &str) -> Option<Palette> {
+    let rgb = Color32::from_rgb;
+    Some(match theme {
+        "build" => Palette {
+            bg: rgb(23, 24, 26),
+            panel: rgb(32, 34, 37),
+            extreme: rgb(16, 17, 19),
+            line: rgb(58, 61, 66),
+            raised: rgb(44, 47, 51),
+            selected: rgb(74, 63, 18),
+            ink: rgb(241, 239, 233),
+            dim: rgb(166, 168, 171),
+            accent: rgb(255, 196, 0),
+            ok: rgb(255, 196, 0),
+            warn: rgb(255, 159, 69),
+            error: rgb(255, 90, 54),
+        },
+        "night" => Palette {
+            bg: rgb(10, 13, 20),
+            panel: rgb(18, 23, 35),
+            extreme: rgb(6, 8, 13),
+            line: rgb(42, 51, 72),
+            raised: rgb(26, 33, 50),
+            selected: rgb(37, 52, 90),
+            ink: rgb(230, 234, 242),
+            dim: rgb(154, 166, 189),
+            accent: rgb(169, 196, 255),
+            ok: rgb(169, 196, 255),
+            warn: rgb(255, 180, 84),
+            error: rgb(255, 122, 107),
+        },
+        "danger" => Palette {
+            bg: rgb(20, 10, 10),
+            panel: rgb(31, 16, 16),
+            extreme: rgb(12, 6, 6),
+            line: rgb(74, 38, 38),
+            raised: rgb(43, 22, 22),
+            selected: rgb(90, 31, 23),
+            ink: rgb(245, 236, 232),
+            dim: rgb(196, 168, 162),
+            accent: rgb(255, 75, 43),
+            ok: rgb(255, 177, 153),
+            warn: rgb(255, 210, 63),
+            error: rgb(255, 75, 43),
+        },
+        "stealth" => Palette {
+            bg: rgb(16, 18, 13),
+            panel: rgb(24, 27, 19),
+            extreme: rgb(10, 11, 8),
+            line: rgb(52, 58, 40),
+            raised: rgb(33, 37, 26),
+            selected: rgb(61, 59, 32),
+            ink: rgb(228, 230, 216),
+            dim: rgb(163, 168, 142),
+            accent: rgb(194, 184, 106),
+            ok: rgb(194, 184, 106),
+            warn: rgb(232, 135, 90),
+            error: rgb(255, 95, 109),
+        },
+        _ => return None,
+    })
+}
+
+fn apply_palette(visuals: &mut egui::Visuals, colors: &Palette) {
+    visuals.panel_fill = colors.bg;
+    visuals.window_fill = colors.panel;
+    visuals.faint_bg_color = colors.panel;
+    visuals.extreme_bg_color = colors.extreme;
+    visuals.override_text_color = Some(colors.ink);
+    visuals.window_stroke = Stroke::new(1.0_f32, colors.line);
+    visuals.widgets.noninteractive.bg_fill = colors.panel;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, colors.line);
+    for widget in [&mut visuals.widgets.inactive, &mut visuals.widgets.open] {
+        widget.bg_fill = colors.raised;
+        widget.weak_bg_fill = colors.raised;
+    }
+    for widget in [&mut visuals.widgets.hovered, &mut visuals.widgets.active] {
+        widget.bg_fill = colors.selected;
+        widget.weak_bg_fill = colors.selected;
+        widget.bg_stroke = Stroke::new(1.0_f32, colors.accent);
+    }
+    visuals.selection.bg_fill = colors.selected;
+    visuals.selection.stroke = Stroke::new(1.0_f32, colors.accent);
+    visuals.hyperlink_color = colors.accent;
+    visuals.warn_fg_color = colors.warn;
+    visuals.error_fg_color = colors.error;
+}
+
 pub(crate) fn configure(ctx: &egui::Context, theme: &str) {
+    let colors = palette(theme);
+    ctx.data_mut(|data| match colors {
+        Some(colors) => data.insert_temp(palette_id(), colors),
+        None => data.remove::<Palette>(palette_id()),
+    });
     for (mode, mut visuals) in [
         (egui::Theme::Dark, egui::Visuals::dark()),
         (egui::Theme::Light, egui::Visuals::light()),
     ] {
-        if mode == egui::Theme::Dark {
+        if let (egui::Theme::Dark, Some(colors)) = (mode, &colors) {
+            apply_palette(&mut visuals, colors);
+        } else if mode == egui::Theme::Dark {
             visuals.panel_fill = Color32::from_rgb(21, 27, 30);
             visuals.window_fill = Color32::from_rgb(28, 38, 43);
             visuals.extreme_bg_color = Color32::from_rgb(16, 23, 26);
@@ -166,7 +296,8 @@ pub(crate) fn configure(ctx: &egui::Context, theme: &str) {
 
 fn tone(ui: &egui::Ui, color: Color32) -> Color32 {
     if ui.visuals().dark_mode {
-        color
+        ui.data(|data| data.get_temp::<Palette>(palette_id()))
+            .map_or(color, |colors| colors.tone(color))
     } else if color == GREEN {
         Color32::from_rgb(51, 101, 66)
     } else if color == AMBER {
@@ -793,7 +924,7 @@ impl Desktop {
             initialized: false,
             allow_close: false,
             shutdown_busy: false,
-            applied_theme: "dark".into(),
+            applied_theme: crate::config::THEMES[0].into(),
             pending_update: None,
             update_check: UpdateCheck::Idle,
             update: None,
@@ -1793,8 +1924,8 @@ impl Desktop {
                     ui.heading("Настройки");
                     if settings.busy { ui.disable(); }
                     egui::ComboBox::from_id_salt("theme").selected_text(theme_label(&settings.theme)).show_ui(ui, |ui| {
-                        for (value, label) in [("dark", "Тёмное"), ("light", "Светлое"), ("system", "Системное")] {
-                            ui.selectable_value(&mut settings.theme, value.into(), label);
+                        for value in crate::config::THEMES {
+                            ui.selectable_value(&mut settings.theme, value.into(), theme_label(value));
                         }
                     });
                     ui.checkbox(&mut settings.motion, "Анимация кротов");
@@ -2641,6 +2772,10 @@ fn auth_label(auth: &str) -> &str {
 }
 fn theme_label(theme: &str) -> &str {
     match theme {
+        "build" => "Стройка",
+        "night" => "Тьма, ночь",
+        "danger" => "Опасность",
+        "stealth" => "Скрытность",
         "light" => "Светлое",
         "system" => "Системное",
         _ => "Тёмное",
@@ -4569,6 +4704,38 @@ mod tests {
             ctx.style_of(egui::Theme::Dark).visuals.panel_fill,
             Color32::from_rgb(21, 27, 30)
         );
+    }
+    #[test]
+    fn colour_themes_replace_palette_and_classic_restores_it() {
+        let ctx = egui::Context::default();
+        let toned = |ctx: &egui::Context| {
+            let mut colors = Vec::new();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    colors = [CYAN, GREEN, AMBER, RED]
+                        .map(|color| tone(ui, color))
+                        .to_vec();
+                });
+            });
+            colors
+        };
+        assert_eq!(crate::config::Settings::default().theme, "build");
+        let mut seen = Vec::new();
+        for theme in ["build", "night", "danger", "stealth"] {
+            assert!(crate::config::THEMES.contains(&theme));
+            assert_ne!(theme_label(theme), "Тёмное");
+            configure(&ctx, theme);
+            let visuals = ctx.style_of(egui::Theme::Dark).visuals.clone();
+            assert!(visuals.dark_mode);
+            assert_eq!(visuals.panel_fill, palette(theme).unwrap().bg);
+            let colors = toned(&ctx);
+            assert_ne!(colors[2], colors[3], "{theme}: ожидание и ошибка совпали");
+            assert_ne!(colors[0], CYAN);
+            assert!(!seen.contains(&colors), "{theme}: палитра повторяется");
+            seen.push(colors);
+        }
+        configure(&ctx, "dark");
+        assert_eq!(toned(&ctx), [CYAN, GREEN, AMBER, RED]);
     }
     fn app_snapshot(state: &str) -> Snapshot {
         let mut snapshot = snapshot();

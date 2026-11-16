@@ -100,10 +100,15 @@ pub struct Settings {
     pub splash: bool,
 }
 
+/// Темы оформления в порядке показа в настройках; первая — по умолчанию.
+pub const THEMES: [&str; 7] = [
+    "build", "night", "danger", "stealth", "dark", "light", "system",
+];
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: "dark".into(),
+            theme: THEMES[0].into(),
             motion: true,
             splash: true,
         }
@@ -136,7 +141,7 @@ impl Config {
             "Поддерживается только версия конфигурации 1."
         );
         ensure!(
-            matches!(self.settings.theme.as_str(), "dark" | "light" | "system"),
+            THEMES.contains(&self.settings.theme.as_str()),
             "Неизвестная тема."
         );
         let mut ids = HashSet::new();
