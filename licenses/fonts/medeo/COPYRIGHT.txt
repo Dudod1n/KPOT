@@ -1,0 +1,12 @@
+Medeo fonts embedded in KROT
+
+Source: https://github.com/DNFDEVS/medeo-font, release v1.1.0
+(commit 99100fec4a63928150584de918ba2953c2cff4e8), unmodified static TTF files:
+MedeoSans-Regular.ttf, MedeoSans-Bold.ttf, MedeoMono-Regular.ttf.
+
+Copyright 2026 The Medeo Project Authors (https://github.com/DNFDEVS/medeo-font)
+Copyright 2024-2026 The Geist Project Authors (https://github.com/vercel/geist-font)
+Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
+
+The full list of copyright holders is at the top of OFL.txt.
+License: SIL Open Font License 1.1; see OFL.txt. Authors are listed in AUTHORS.txt.

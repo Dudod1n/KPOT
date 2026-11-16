@@ -200,7 +200,7 @@ pub(crate) fn unbracket(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-fn display_host(host: &str) -> String {
+pub(crate) fn display_host(host: &str) -> String {
     let host = unbracket(host);
     if host.contains(':') {
         format!("[{host}]")
