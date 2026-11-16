@@ -64,15 +64,18 @@ impl AppForm {
     }
 }
 
-pub(super) fn app_state_label(state: &str) -> (&'static str, Color32) {
+pub(super) fn app_state_label(state: &str) -> (&'static str, Tone) {
     match state {
-        "running" => ("↟ Работает", GREEN),
-        "blocked" => ("! Туннель не работает, сеть приложения закрыта", AMBER),
-        "direct" => ("! Туннель не работает, трафик идёт напрямую", AMBER),
-        "orphan" => ("! Туннель удалён", RED),
-        "elevation" => ("! Нужны права администратора, трафик идёт напрямую", AMBER),
-        "unavailable" => ("◌ Перехват недоступен", DIM),
-        _ => ("○ Остановлено", DIM),
+        "running" => ("↟ Работает", Tone::Ok),
+        "blocked" => ("! Туннель не работает, сеть приложения закрыта", Tone::Warn),
+        "direct" => ("! Туннель не работает, трафик идёт напрямую", Tone::Warn),
+        "orphan" => ("! Туннель удалён", Tone::Error),
+        "elevation" => (
+            "! Нужны права администратора, трафик идёт напрямую",
+            Tone::Warn,
+        ),
+        "unavailable" => ("◌ Перехват недоступен", Tone::Dim),
+        _ => ("○ Остановлено", Tone::Dim),
     }
 }
 
@@ -242,16 +245,16 @@ impl Desktop {
         let detached = unavailable.is_empty() && !snapshot.divert_attached;
         let failure = snapshot.divert_error.clone();
         if !unavailable.is_empty() {
-            ui.colored_label(tone(ui, AMBER), &unavailable);
+            ui.colored_label(tone(ui, Tone::Warn), &unavailable);
             ui.add_space(8.0);
         }
         if detached {
             ui.colored_label(
-                tone(ui, AMBER),
+                tone(ui, Tone::Warn),
                 "Перехват не запущен: приложения ходят в сеть напрямую. Для перехвата нужны права администратора.",
             );
             if !failure.is_empty() {
-                ui.colored_label(tone(ui, RED), &failure);
+                ui.colored_label(tone(ui, Tone::Error), &failure);
             }
             if self.fetching_components {
                 ui.horizontal_wrapped(|ui| {
@@ -270,7 +273,7 @@ impl Desktop {
         }
         ui.heading("На участке");
         ui.add_space(24.0);
-        ui.label(RichText::new(mascot("idle", 0)).color(tone(ui, DIM)));
+        ui.label(RichText::new(mascot("idle", 0)).color(tone(ui, Tone::Dim)));
         ui.add_space(16.0);
         if has_socks {
             ui.label("Добавьте приложение, чтобы направить его трафик через туннель.");
@@ -342,7 +345,7 @@ impl Desktop {
             }
             _ => {}
         }
-        ui.colored_label(tone(ui, CYAN), &rule.path);
+        ui.colored_label(tone(ui, Tone::Accent), &rule.path);
         ui.separator();
         match &tunnel {
             Some(tunnel) => {
@@ -353,7 +356,7 @@ impl Desktop {
                 ));
             }
             None => {
-                ui.colored_label(tone(ui, RED), "Туннель: удалён");
+                ui.colored_label(tone(ui, Tone::Error), "Туннель: удалён");
             }
         }
         ui.weak("Способ: перехват по пути файла, включая уже запущенные процессы");
@@ -385,7 +388,7 @@ impl Desktop {
             if ui
                 .add_enabled(
                     !self.busy_apps.contains(&rule.id),
-                    egui::Button::new(RichText::new(action).color(tone(ui, CYAN))),
+                    egui::Button::new(RichText::new(action).color(tone(ui, Tone::Accent))),
                 )
                 .clicked()
             {
@@ -395,7 +398,7 @@ impl Desktop {
                 self.dialog = Some(Dialog::AppForm(Box::new(AppForm::new(Some(rule.clone())))));
             }
             if ui
-                .button(RichText::new("Удалить").color(tone(ui, RED)))
+                .button(RichText::new("Удалить").color(tone(ui, Tone::Error)))
                 .clicked()
             {
                 self.confirm = Some(Confirm::DeleteApp {
@@ -515,7 +518,7 @@ pub(super) fn app_form_view(
         "Новое правило"
     });
     if !form.error.is_empty() {
-        ui.colored_label(tone(ui, RED), &form.error);
+        ui.colored_label(tone(ui, Tone::Error), &form.error);
     }
     let content_height = max_height - if form.error.is_empty() { 0.0 } else { 45.0 };
     ui.add_enabled_ui(!form.busy, |ui| {
@@ -596,7 +599,7 @@ pub(super) fn app_form_view(
                 let socks: Vec<&Tunnel> = tunnels.iter().filter(|t| t.kind == "D").collect();
                 if socks.is_empty() {
                     ui.colored_label(
-                        tone(ui, AMBER),
+                        tone(ui, Tone::Warn),
                         "Нет туннелей типа D. Сначала создайте SOCKS5-туннель.",
                     );
                 } else {
