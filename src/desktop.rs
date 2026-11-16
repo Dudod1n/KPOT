@@ -65,7 +65,7 @@ pub(crate) fn build(
     check_updates: bool,
     ctx: &egui::Context,
 ) -> Box<Desktop> {
-    configure(ctx, "dark");
+    configure(ctx, crate::config::THEMES[0]);
     let mut desktop = Desktop::new(
         Some(Backend {
             store,
@@ -191,7 +191,7 @@ fn palette(theme: &str) -> Option<Palette> {
             selected: rgb(90, 31, 23),
             ink: rgb(245, 236, 232),
             dim: rgb(196, 168, 162),
-            accent: rgb(255, 75, 43),
+            accent: rgb(255, 177, 153),
             ok: rgb(255, 177, 153),
             warn: rgb(255, 210, 63),
             error: rgb(255, 75, 43),
@@ -226,6 +226,7 @@ fn apply_palette(visuals: &mut egui::Visuals, colors: &Palette) {
     for widget in [&mut visuals.widgets.inactive, &mut visuals.widgets.open] {
         widget.bg_fill = colors.raised;
         widget.weak_bg_fill = colors.raised;
+        widget.bg_stroke = Stroke::new(1.0_f32, colors.line);
     }
     for widget in [&mut visuals.widgets.hovered, &mut visuals.widgets.active] {
         widget.bg_fill = colors.selected;
@@ -924,7 +925,8 @@ impl Desktop {
             initialized: false,
             allow_close: false,
             shutdown_busy: false,
-            applied_theme: crate::config::THEMES[0].into(),
+            // Пусто: первый снимок всегда применяет сохранённую тему.
+            applied_theme: String::new(),
             pending_update: None,
             update_check: UpdateCheck::Idle,
             update: None,
@@ -4730,12 +4732,34 @@ mod tests {
             assert_eq!(visuals.panel_fill, palette(theme).unwrap().bg);
             let colors = toned(&ctx);
             assert_ne!(colors[2], colors[3], "{theme}: ожидание и ошибка совпали");
+            assert_ne!(colors[0], colors[3], "{theme}: акцент и ошибка совпали");
+            assert_eq!(
+                visuals.widgets.inactive.bg_stroke.color,
+                palette(theme).unwrap().line
+            );
             assert_ne!(colors[0], CYAN);
             assert!(!seen.contains(&colors), "{theme}: палитра повторяется");
             seen.push(colors);
         }
         configure(&ctx, "dark");
         assert_eq!(toned(&ctx), [CYAN, GREEN, AMBER, RED]);
+    }
+    #[test]
+    fn first_snapshot_applies_default_theme_on_startup() {
+        let build = palette(crate::config::THEMES[0]).unwrap().bg;
+        let panel = |ctx: &egui::Context| ctx.style_of(egui::Theme::Dark).visuals.panel_fill;
+        for startup in [crate::config::THEMES[0], "dark"] {
+            let ctx = egui::Context::default();
+            configure(&ctx, startup);
+            let mut app = Desktop::new(None, true);
+            let mut snapshot = snapshot();
+            snapshot.config.settings = Settings::default();
+            app.tx
+                .send(Event::Snapshot(Ok(Box::new(snapshot))))
+                .unwrap();
+            app.drain(&ctx);
+            assert_eq!(panel(&ctx), build, "запуск в теме {startup}");
+        }
     }
     fn app_snapshot(state: &str) -> Snapshot {
         let mut snapshot = snapshot();

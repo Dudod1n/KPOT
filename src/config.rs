@@ -93,8 +93,9 @@ impl Tunnel {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default = "Settings::legacy", deny_unknown_fields)]
 pub struct Settings {
+    #[serde(deserialize_with = "known_theme")]
     pub theme: String,
     pub motion: bool,
     pub splash: bool,
@@ -104,6 +105,30 @@ pub struct Settings {
 pub const THEMES: [&str; 7] = [
     "build", "night", "danger", "stealth", "dark", "light", "system",
 ];
+
+impl Settings {
+    /// Настройки конфигурации, сохранённой до появления цветных тем: без поля
+    /// `theme` или без секции `settings` тема остаётся прежней «Тёмной».
+    fn legacy() -> Self {
+        Self {
+            theme: "dark".into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Незнакомая тема (например, из более новой версии) заменяется темой по
+/// умолчанию, чтобы конфигурация оставалась читаемой.
+fn known_theme<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let theme = String::deserialize(deserializer)?;
+    Ok(if THEMES.contains(&theme.as_str()) {
+        theme
+    } else {
+        THEMES[0].into()
+    })
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -119,7 +144,7 @@ impl Default for Settings {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
-    #[serde(default)]
+    #[serde(default = "Settings::legacy")]
     pub settings: Settings,
     pub tunnels: Vec<Tunnel>,
 }
@@ -661,12 +686,34 @@ mod tests {
             "tunnels": [{"name":"web", "server":{"host":"example.org", "user":"alice"}, "target":"localhost"}]
         })).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.settings, Settings::default());
+        assert_eq!(config.settings, Settings::legacy());
         assert_eq!(config.tunnels[0].server.port, 22);
         assert_eq!(config.tunnels[0].server.key, "~/.ssh/id_ed25519");
         assert_eq!(config.tunnels[0].id.len(), 32);
         assert!(config.tunnels[0].reconnect);
         assert!(!config.tunnels[0].enabled);
+    }
+
+    #[test]
+    fn theme_defaults_keep_old_configs_and_tolerate_unknown_themes() {
+        let read = |settings: serde_json::Value| {
+            let mut data = json!({"version": 1, "tunnels": []});
+            if !settings.is_null() {
+                data["settings"] = settings;
+            }
+            serde_json::from_value::<Config>(data)
+                .unwrap()
+                .settings
+                .theme
+        };
+        assert_eq!(read(serde_json::Value::Null), "dark");
+        assert_eq!(read(json!({"motion": false})), "dark");
+        assert_eq!(read(json!({"theme": "night"})), "night");
+        assert_eq!(read(json!({"theme": "future"})), THEMES[0]);
+        assert_eq!(Config::default().settings.theme, THEMES[0]);
+        let mut unknown = Config::default();
+        unknown.settings.theme = "future".into();
+        assert!(unknown.validate().is_err());
     }
 
     #[test]
