@@ -5,8 +5,10 @@
 //! several sockets may share a port on different addresses.
 //!
 //! Reading the tables costs too much to do for every datagram: one snapshot serves every
-//! endpoint for `SNAPSHOT_HOLD`, and decisions are kept per local endpoint, measured with the
-//! monotonic clock only:
+//! endpoint with an owner under a rule for `SNAPSHOT_HOLD`. Any other endpoint may belong to a
+//! socket bound since, possibly on a port another process has just left, so the tables are read
+//! again for it: at most once per `PASS_HOLD` and endpoint, since the decision is kept that long.
+//! Decisions are kept per local endpoint, measured with the monotonic clock only:
 //! - a datagram that is let through (no rule, a rule that bypasses its stopped tunnel, or owners
 //!   that could not be read) is decided again after `PASS_HOLD`, so that a blocked application
 //!   reusing the endpoint is noticed quickly;
@@ -148,22 +150,45 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The owners of `local`, reading the tables with `read(v6)` only when the snapshot is old.
-    pub fn owners(
+    /// The rules of the owners of `local`, as `covering(owners)` gives them, reading the tables
+    /// with `read(v6)` when the snapshot is old or covers no owner of `local` with a rule.
+    pub fn rules(
         &mut self,
         now: Instant,
         local: SocketAddr,
         mut read: impl FnMut(bool) -> Option<Vec<u8>>,
-    ) -> Option<Vec<u32>> {
-        if self
+        mut covering: impl FnMut(&[u32]) -> Vec<String>,
+    ) -> Option<Vec<String>> {
+        let held = self
             .at
-            .is_none_or(|at| now.saturating_duration_since(at) >= SNAPSHOT_HOLD)
-        {
-            self.ipv4 = read(false);
-            self.ipv6 = read(true);
-            self.at = Some(now);
+            .is_some_and(|at| now.saturating_duration_since(at) < SNAPSHOT_HOLD);
+        if !held {
+            self.refresh(now, &mut read);
         }
-        endpoint_owners(self.ipv4.as_deref(), self.ipv6.as_deref(), local)
+        let rules = covering(&endpoint_owners(
+            self.ipv4.as_deref(),
+            self.ipv6.as_deref(),
+            local,
+        )?);
+        // A socket bound after the held snapshot was read is not in it: the endpoint has no
+        // owner there, or still the previous owner of its port. Without a fresh reading its
+        // first datagrams would pass around the tunnel: for a voice call that is the address
+        // discovery request, and the call never connects.
+        if held && rules.is_empty() {
+            self.refresh(now, &mut read);
+            return Some(covering(&endpoint_owners(
+                self.ipv4.as_deref(),
+                self.ipv6.as_deref(),
+                local,
+            )?));
+        }
+        Some(rules)
+    }
+
+    fn refresh(&mut self, now: Instant, read: &mut impl FnMut(bool) -> Option<Vec<u8>>) {
+        self.ipv4 = read(false);
+        self.ipv6 = read(true);
+        self.at = Some(now);
     }
 }
 

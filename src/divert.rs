@@ -78,6 +78,10 @@ pub enum Verdict {
     Capture {
         rule: String,
     },
+    /// A datagram of `rule` that is dropped: its tunnel carries no UDP right now.
+    Blocked {
+        rule: String,
+    },
     /// UDP 443 of `rule`, blocked so that the browser falls back to TCP.
     Quic {
         rule: String,
@@ -368,7 +372,7 @@ pub fn handle(
             // Without the relay names are resolved by this computer; everything else would
             // bypass the tunnel.
             udp::Policy::Block if packet.destination_port == DNS_PORT => Verdict::Pass,
-            udp::Policy::Block => Verdict::Drop,
+            udp::Policy::Block => Verdict::Blocked { rule },
             udp::Policy::Tunnel { quic: false } if packet.destination_port == QUIC_PORT => {
                 Verdict::Quic { rule }
             }
@@ -436,6 +440,52 @@ pub fn handle(
         (packet.source, relay_port),
     );
     Verdict::Reflect
+}
+
+/// Why a rule's UDP is dropped, for its log: blocking is otherwise silent, and the application
+/// only reports that it cannot connect.
+/// `linked` tells whether the helper reaches the background process.
+#[cfg(any(windows, test))]
+fn blocked_reason(rule: Option<&DivertRule>, linked: bool) -> &'static str {
+    match rule {
+        // The helper gets no SOCKS port both for a stopped tunnel and for a running one whose
+        // listening address it cannot connect to.
+        Some(rule) if rule.proxy.is_none() => {
+            "UDP заблокирован: туннель не работает или его адрес прослушивания — \
+             не IP-адрес и не localhost"
+        }
+        Some(rule) if !rule.udp => {
+            "UDP заблокирован: у туннеля не работает «UDP через сервер». \
+             Включите его в карточке туннеля или проверьте его состояние"
+        }
+        Some(_) if !linked => "UDP заблокирован: нет связи с фоновым КРОТом",
+        _ => "UDP заблокирован",
+    }
+}
+
+/// Tells each rule's UDP block once per state of the rules and of the link to the background
+/// process, not for every datagram: after either changes the block is told again.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct BlockedLog {
+    state: Option<(u64, bool)>,
+    told: std::collections::HashSet<String>,
+}
+
+#[cfg(any(windows, test))]
+impl BlockedLog {
+    /// Notes the rules' `generation` and the link for every packet, blocked or not: a link
+    /// that comes back and goes down again between two blocks is still a new state.
+    fn update(&mut self, generation: u64, linked: bool) {
+        if self.state != Some((generation, linked)) {
+            self.state = Some((generation, linked));
+            self.told.clear();
+        }
+    }
+    /// Whether a block of `rule` is to be told now.
+    fn first(&mut self, rule: &str) -> bool {
+        self.told.insert(rule.to_owned())
+    }
 }
 
 /// What the owner lookup needs to know about a packet.
@@ -854,6 +904,42 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_rule_is_told_what_to_turn_on() {
+        let stopped = rule("rule", "app.exe", false);
+        let running = DivertRule {
+            proxy: Some("127.0.0.1:1080".parse().unwrap()),
+            ..stopped.clone()
+        };
+        let relayed = DivertRule {
+            udp: true,
+            ..running.clone()
+        };
+        assert!(blocked_reason(Some(&stopped), true).contains("туннель не работает"));
+        assert!(blocked_reason(Some(&running), true).contains("«UDP через сервер»"));
+        assert!(blocked_reason(Some(&relayed), false).contains("нет связи"));
+        assert_eq!(blocked_reason(None, false), "UDP заблокирован");
+    }
+
+    #[test]
+    fn a_block_is_told_once_per_state_of_the_rules_and_the_link() {
+        let mut log = BlockedLog::default();
+        log.update(1, true);
+        assert!(log.first("a"));
+        assert!(!log.first("a"));
+        assert!(log.first("b"), "every rule is told");
+        log.update(1, true);
+        assert!(!log.first("a"), "nothing changed");
+        log.update(1, false);
+        assert!(log.first("a"), "the link went down");
+        // The link comes back and goes down again with no block in between.
+        log.update(1, true);
+        log.update(1, false);
+        assert!(log.first("a"));
+        log.update(2, false);
+        assert!(log.first("a"), "the rules changed");
+    }
+
+    #[test]
     fn covered_udp_is_dropped_except_name_resolution() {
         let (mut nat, now) = (Nat::default(), Instant::now());
         let udp = |port: u16| {
@@ -863,7 +949,9 @@ mod tests {
         };
         assert_eq!(
             handle(&mut udp(443), RELAY, &mut nat, now, &mut covered, &blocked),
-            Verdict::Drop
+            Verdict::Blocked {
+                rule: "rule".into()
+            }
         );
         assert_eq!(
             handle(&mut udp(53), RELAY, &mut nat, now, &mut covered, &blocked),
@@ -892,7 +980,9 @@ mod tests {
             assert_eq!(packet, original);
             assert_eq!(
                 handle(&mut packet, RELAY, &mut nat, now, &mut covered, &blocked),
-                Verdict::Drop
+                Verdict::Blocked {
+                    rule: "rule".into()
+                }
             );
         }
         assert!(nat.is_empty());

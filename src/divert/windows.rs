@@ -44,7 +44,8 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
+    BlockedLog, DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict,
+    blocked_reason, handle,
     link::{INBOUND_QUEUE, Inbound, Link},
     owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
     reset, tcp_table_owner,
@@ -362,6 +363,7 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
     let mut generation = u64::MAX;
     let mut policy: HashMap<String, (Policy, Policy)> = HashMap::new();
     let mut quic_logged: HashSet<String> = HashSet::new();
+    let mut blocked_log = BlockedLog::default();
     // Rules whose application goes around its tunnel right now, because the tunnel is down.
     let mut bypassing: HashSet<String> = HashSet::new();
     let mut udp_owners = UdpOwners::default();
@@ -416,6 +418,7 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
         }
         let data = &mut buffer[..length as usize];
         let linked = shared.link.up();
+        blocked_log.update(generation, linked);
         let verdict = {
             let mut nat = shared.nat.lock().unwrap();
             if now.duration_since(purged) > Duration::from_secs(10) {
@@ -447,13 +450,15 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                     }
                     // The rule as it is; `handle` applies whether it bypasses its tunnel.
                     udp_owners.decide(local, now, &|rule| bypassing.contains(rule), || {
-                        let pids = udp_snapshot.owners(now, local, |v6| {
-                            read_port_table(false, v6, &mut udp_table).map(<[u8]>::to_vec)
-                        })?;
-                        Some(
-                            pids.into_iter()
-                                .filter_map(|pid| matcher.decide(pid, now, &system))
-                                .collect(),
+                        udp_snapshot.rules(
+                            now,
+                            local,
+                            |v6| read_port_table(false, v6, &mut udp_table).map(<[u8]>::to_vec),
+                            |pids| {
+                                pids.iter()
+                                    .filter_map(|&pid| matcher.decide(pid, now, &system))
+                                    .collect()
+                            },
                         )
                     })
                 },
@@ -483,6 +488,15 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                     shared
                         .link
                         .send(&rule, flow.id, flow.opened, remote, payload);
+                }
+                continue;
+            }
+            Verdict::Blocked { rule } => {
+                if blocked_log.first(&rule) {
+                    let rules = shared.rules.lock().unwrap();
+                    let reason = blocked_reason(rules.iter().find(|r| r.id == rule), linked);
+                    drop(rules);
+                    shared.log(&rule, reason.into());
                 }
                 continue;
             }
