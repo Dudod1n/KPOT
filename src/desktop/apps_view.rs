@@ -227,6 +227,7 @@ impl Desktop {
         egui::ScrollArea::vertical()
             .id_salt("app_scroll")
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
                 if rules.is_empty() {
                     ui.add_space(16.0);
                     style::mole(ui, 3.0, style::Pose::default(), pal);
@@ -309,7 +310,6 @@ impl Desktop {
                     if row.response.clicked() {
                         self.selected_app = Some(rule.id.clone());
                     }
-                    ui.add_space(2.0);
                 }
             });
     }

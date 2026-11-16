@@ -1491,8 +1491,8 @@ impl Desktop {
                     .inner_margin(egui::Margin::symmetric(20, 10)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    // Whole items wrap; a label never starts mid-row with a leading gap.
+                let mut narrow = true;
+                ui.horizontal(|ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -1514,66 +1514,22 @@ impl Desktop {
                             self.view = view;
                         }
                     }
-                    ui.add_space(8.0);
-                    let apps = self.view == View::Apps;
-                    if ui
-                        .add_enabled(
-                            self.snapshot.is_some(),
-                            style::secondary(
-                                if apps {
-                                    "N Новое правило"
-                                } else {
-                                    "N Новый туннель"
-                                },
-                                &pal,
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.dialog = Some(if apps {
-                            Dialog::AppForm(Box::new(AppForm::new(None)))
-                        } else {
-                            Dialog::Form(Box::new(TunnelForm::new(None)))
+                    let actions_id = egui::Id::new("header_actions_width");
+                    let need = ctx
+                        .data(|data| data.get_temp::<f32>(actions_id))
+                        .unwrap_or(0.0);
+                    if ui.available_width() >= need {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.header_actions(ui, ctx, &pal);
                         });
-                    }
-                    if ui
-                        .add_enabled(
-                            self.snapshot.is_some(),
-                            style::secondary("S Настройки", &pal),
-                        )
-                        .clicked()
-                    {
-                        self.open_settings(ctx);
-                    }
-                    if ui.add(style::secondary("? Справка", &pal)).clicked() {
-                        self.dialog = Some(Dialog::Help);
-                    }
-                    if ui.add(style::secondary("Q Выход", &pal)).clicked() {
-                        self.request_exit();
-                    }
-                    let version_response = ui
-                        .add_enabled(
-                            self.dialog.is_none()
-                                && self.confirm.is_none()
-                                && self.update.is_none(),
-                            egui::Link::new(
-                                RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
-                                    .monospace()
-                                    .color(pal.dim),
-                            ),
-                        )
-                        .on_hover_text("О программе");
-                    if version_response.clicked() {
-                        self.about_quote = Some(match self.about_quote {
-                            Some(previous) => {
-                                (previous + rand::random_range(1..ABOUT_QUOTES.len()))
-                                    % ABOUT_QUOTES.len()
-                            }
-                            None => rand::random_range(0..ABOUT_QUOTES.len()),
-                        });
-                        self.dialog = Some(Dialog::About);
+                        narrow = false;
                     }
                 });
+                if narrow {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.header_actions(ui, ctx, &pal);
+                    });
+                }
             });
         self.summary(ctx, &pal);
         if !self.error.is_empty() {
@@ -1645,6 +1601,75 @@ impl Desktop {
                     });
             });
     }
+    /// Header actions from the right edge: version, then Q, ?, S and N.
+    fn header_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Pal) {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let version_response = ui
+            .add_enabled(
+                self.dialog.is_none() && self.confirm.is_none() && self.update.is_none(),
+                egui::Link::new(
+                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                        .monospace()
+                        .color(pal.dim),
+                ),
+            )
+            .on_hover_text("О программе");
+        if version_response.clicked() {
+            self.about_quote = Some(match self.about_quote {
+                Some(previous) => {
+                    (previous + rand::random_range(1..ABOUT_QUOTES.len())) % ABOUT_QUOTES.len()
+                }
+                None => rand::random_range(0..ABOUT_QUOTES.len()),
+            });
+            self.dialog = Some(Dialog::About);
+        }
+        if ui.add(style::secondary("Q Выход", pal)).clicked() {
+            self.request_exit();
+        }
+        if ui.add(style::secondary("? Справка", pal)).clicked() {
+            self.dialog = Some(Dialog::Help);
+        }
+        if ui
+            .add_enabled(
+                self.snapshot.is_some(),
+                style::secondary("S Настройки", pal),
+            )
+            .clicked()
+        {
+            self.open_settings(ctx);
+        }
+        let apps = self.view == View::Apps;
+        if ui
+            .add_enabled(
+                self.snapshot.is_some(),
+                style::secondary(
+                    if apps {
+                        "N Новое правило"
+                    } else {
+                        "N Новый туннель"
+                    },
+                    pal,
+                ),
+            )
+            .clicked()
+        {
+            self.dialog = Some(if apps {
+                Dialog::AppForm(Box::new(AppForm::new(None)))
+            } else {
+                Dialog::Form(Box::new(TunnelForm::new(None)))
+            });
+        }
+        // The first pass only measures; layout settles before anything is shown or clicked.
+        let width = ui.min_rect().width() + 12.0;
+        let id = egui::Id::new("header_actions_width");
+        let known = ctx.data(|data| data.get_temp::<f32>(id));
+        if known.is_none_or(|known| (known - width).abs() > 0.5) {
+            ctx.data_mut(|data| data.insert_temp(id, width));
+            ctx.request_discard("header actions measured");
+        }
+    }
     /// The line under the header: state lights, «РАБОТАЮТ N ИЗ M» and, for long lists, filters.
     fn summary(&mut self, ctx: &egui::Context, pal: &Pal) {
         let apps = self.view == View::Apps;
@@ -1662,11 +1687,13 @@ impl Desktop {
                     .inner_margin(egui::Margin::symmetric(20, 8)),
             )
             .show(ctx, |ui| {
+                // Two floors: the lights on top, the count and buttons below, both from the left.
+                ui.spacing_mut().item_spacing.y = 6.0;
+                if total > 0 {
+                    ui.horizontal(|ui| style::lamps(ui, &lamps, blink_on, pal));
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    if total > 0 {
-                        style::lamps(ui, &lamps, blink_on, pal);
-                    }
                     ui.label(
                         RichText::new(if apps {
                             format!("ЧЕРЕЗ ТУННЕЛЬ {running} ИЗ {total}")
@@ -1785,6 +1812,7 @@ impl Desktop {
         egui::ScrollArea::vertical()
             .id_salt("tunnel_scroll")
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
                 if tunnels.is_empty() {
                     ui.add_space(16.0);
                     style::mole(ui, 3.0, style::Pose::default(), pal);
@@ -1853,7 +1881,6 @@ impl Desktop {
                         self.selected = Some(tunnel.id.clone());
                         self.resolve(tunnel);
                     }
-                    ui.add_space(2.0);
                 }
             });
     }
@@ -3319,14 +3346,14 @@ fn list_row(
         .stroke(Stroke::new(1.0_f32, pal.line))
         .corner_radius(6)
         .inner_margin(egui::Margin {
-            left: 18,
+            left: 14,
             right: 6,
-            top: 10,
-            bottom: 10,
+            top: 6,
+            bottom: 6,
         });
     let inner = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
             ui.painter().rect(
                 rect,
@@ -3366,12 +3393,23 @@ fn list_row(
                     ui.add(egui::Label::new(RichText::new(status).size(14.0).color(color)).wrap());
                 },
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        });
+        // Text starts at the top next to the badge; the lever stays centred on the right.
+        let content = ui.min_rect();
+        let lever_rect = egui::Rect::from_min_max(
+            egui::pos2(content.right() - 84.0, content.top()),
+            content.max,
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(lever_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
                 let scope = ui.scope(lever);
                 lever_clicked = scope.inner;
                 lever_left = scope.response.rect.left();
-            });
-        });
+            },
+        );
     });
     let rect = inner.response.rect;
     ui.painter().rect_filled(
