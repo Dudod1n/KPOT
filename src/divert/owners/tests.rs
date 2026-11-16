@@ -287,6 +287,11 @@ fn nothing_is_looked_up_while_every_rule_bypasses() {
     );
 }
 
+/// Every owner under a rule named after it.
+fn every_owner(pids: &[u32]) -> Vec<String> {
+    pids.iter().map(u32::to_string).collect()
+}
+
 #[test]
 fn one_snapshot_serves_every_endpoint_for_its_hold() {
     let mut snapshot = Snapshot::default();
@@ -297,17 +302,23 @@ fn one_snapshot_serves_every_endpoint_for_its_hold() {
         Some(if v6 { table(&[]) } else { ipv4.clone() })
     };
     let start = Instant::now();
+    let local = |text: &str| text.parse::<SocketAddr>().unwrap();
     assert_eq!(
-        snapshot.owners(start, "192.0.2.1:5".parse().unwrap(), read),
-        Some(vec![1])
+        snapshot.rules(start, local("192.0.2.1:5"), read, every_owner),
+        Some(vec!["1".into()])
     );
     let soon = start + SNAPSHOT_HOLD - Duration::from_millis(1);
     assert_eq!(
-        snapshot.owners(soon, "192.0.2.2:5".parse().unwrap(), read),
-        Some(vec![2])
+        snapshot.rules(soon, local("192.0.2.2:5"), read, every_owner),
+        Some(vec!["2".into()])
     );
     assert_eq!(reads.get(), 2, "both tables read once for both endpoints");
-    snapshot.owners(start + SNAPSHOT_HOLD, "192.0.2.1:5".parse().unwrap(), read);
+    snapshot.rules(
+        start + SNAPSHOT_HOLD,
+        local("192.0.2.1:5"),
+        read,
+        every_owner,
+    );
     assert_eq!(reads.get(), 4);
 }
 
@@ -325,31 +336,69 @@ fn a_socket_bound_after_the_snapshot_is_found_by_a_fresh_reading() {
         })
     };
     let start = Instant::now();
+    let local = |text: &str| text.parse::<SocketAddr>().unwrap();
     assert_eq!(
-        snapshot.owners(start, "192.0.2.1:5".parse().unwrap(), read),
-        Some(vec![1])
+        snapshot.rules(start, local("192.0.2.1:5"), read, every_owner),
+        Some(vec!["1".into()])
     );
     // The application opens its voice socket and sends from it right away.
     rows.borrow_mut().push(row("0.0.0.0:50000", 7));
     let soon = start + Duration::from_millis(1);
     assert_eq!(
-        snapshot.owners(soon, "192.0.2.1:50000".parse().unwrap(), read),
-        Some(vec![7])
+        snapshot.rules(soon, local("192.0.2.1:50000"), read, every_owner),
+        Some(vec!["7".into()])
     );
     assert_eq!(reads.get(), 4, "the held snapshot was read again");
     // The fresh reading serves known endpoints for its own hold.
     let later = soon + SNAPSHOT_HOLD - Duration::from_millis(1);
     assert_eq!(
-        snapshot.owners(later, "192.0.2.1:5".parse().unwrap(), read),
-        Some(vec![1])
+        snapshot.rules(later, local("192.0.2.1:5"), read, every_owner),
+        Some(vec!["1".into()])
     );
     assert_eq!(reads.get(), 4);
     // An endpoint nobody owns costs one more reading, not two.
     assert_eq!(
-        snapshot.owners(later, "192.0.2.1:6".parse().unwrap(), read),
+        snapshot.rules(later, local("192.0.2.1:6"), read, every_owner),
         Some(vec![])
     );
     assert_eq!(reads.get(), 6);
+}
+
+#[test]
+fn a_port_left_by_another_process_is_read_again_for_its_new_owner() {
+    let mut snapshot = Snapshot::default();
+    let reads = Cell::new(0);
+    let rows = std::cell::RefCell::new(vec![row("0.0.0.0:50000", 3)]);
+    let read = |v6: bool| {
+        reads.set(reads.get() + 1);
+        Some(if v6 {
+            table(&[])
+        } else {
+            table(&rows.borrow())
+        })
+    };
+    // Only the voice application is under a rule.
+    let voice = |pids: &[u32]| -> Vec<String> {
+        pids.iter()
+            .filter(|&&pid| pid == 7)
+            .map(|_| "voice".to_owned())
+            .collect()
+    };
+    let start = Instant::now();
+    let local: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+    assert_eq!(snapshot.rules(start, local, read, voice), Some(vec![]));
+    // Another process leaves the port and the voice application binds it right away.
+    *rows.borrow_mut() = vec![row("0.0.0.0:50000", 7)];
+    let soon = start + Duration::from_millis(1);
+    assert_eq!(
+        snapshot.rules(soon, local, read, voice),
+        Some(vec!["voice".into()])
+    );
+    assert_eq!(
+        reads.get(),
+        4,
+        "the previous owner in the held snapshot is not trusted"
+    );
 }
 
 #[test]
