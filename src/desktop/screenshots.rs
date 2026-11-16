@@ -530,7 +530,7 @@ fn rasterize(
         };
         let texture = &textures[&mesh.texture_id];
         let clip = primitive.clip_rect;
-        for triangle in mesh.indices.chunks_exact(3) {
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let [a, b, c] = [0, 1, 2].map(|index| &mesh.vertices[triangle[index] as usize]);
             let area =
                 (b.pos - a.pos).x * (c.pos - a.pos).y - (b.pos - a.pos).y * (c.pos - a.pos).x;

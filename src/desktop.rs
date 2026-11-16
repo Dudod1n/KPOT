@@ -2107,7 +2107,7 @@ impl Desktop {
         let busy = self.pending_operations > 0;
         let mut clicked = false;
         egui::Frame::new()
-            .stroke(Stroke::new(1.0, pal.line))
+            .stroke(Stroke::new(1.0_f32, pal.line))
             .corner_radius(4)
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
@@ -2163,7 +2163,7 @@ impl Desktop {
                             .color(pal.accent),
                     )
                     .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::new(1.0, pal.accent))
+                    .stroke(Stroke::new(1.0_f32, pal.accent))
                     .corner_radius(4)
                     .min_size(egui::vec2(0.0, 40.0))
                 };
@@ -2240,7 +2240,7 @@ impl Desktop {
                     ui.add_space(6.0);
                     egui::Frame::new()
                         .fill(pal.bg)
-                        .stroke(Stroke::new(1.0, pal.line))
+                        .stroke(Stroke::new(1.0_f32, pal.line))
                         .corner_radius(4)
                         .inner_margin(egui::Margin {
                             left: 22,
@@ -2500,7 +2500,7 @@ impl Desktop {
                 let quote = self.about_quote.unwrap_or(0);
                 let frame = egui::Frame::new()
                     .fill(pal.bg)
-                    .stroke(Stroke::new(1.0, pal.line))
+                    .stroke(Stroke::new(1.0_f32, pal.line))
                     .corner_radius(4)
                     .inner_margin(egui::Margin {
                         left: 20,
@@ -2633,7 +2633,7 @@ impl Desktop {
                     let selected = self.selected.as_ref() == Some(&tunnel.id);
                     let frame = egui::Frame::new()
                         .fill(if selected { pal.raised } else { pal.bg })
-                        .stroke(Stroke::new(1.0, pal.line))
+                        .stroke(Stroke::new(1.0_f32, pal.line))
                         .corner_radius(6)
                         .inner_margin(egui::Margin {
                             left: 18,
@@ -2663,7 +2663,7 @@ impl Desktop {
                                 ui.painter().circle_stroke(
                                     dot.center(),
                                     7.0,
-                                    Stroke::new(2.0, shown),
+                                    Stroke::new(2.0_f32, shown),
                                 );
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -2694,7 +2694,7 @@ impl Desktop {
                                                         .color(color),
                                                     )
                                                     .fill(Color32::TRANSPARENT)
-                                                    .stroke(Stroke::new(1.0, color))
+                                                    .stroke(Stroke::new(1.0_f32, color))
                                                     .corner_radius(4)
                                                     .min_size(egui::vec2(0.0, 36.0)),
                                                 )
@@ -2829,7 +2829,7 @@ impl Desktop {
                     ] {
                         egui::Frame::new()
                             .fill(pal.bg)
-                            .stroke(Stroke::new(1.0, border))
+                            .stroke(Stroke::new(1.0_f32, border))
                             .corner_radius(4)
                             .inner_margin(egui::Margin::same(12))
                             .show(ui, |ui| {
@@ -3316,7 +3316,7 @@ fn list_row(
     let mut lever_left = f32::INFINITY;
     let frame = egui::Frame::new()
         .fill(if selected { pal.raised } else { pal.panel })
-        .stroke(Stroke::new(1.0, pal.line))
+        .stroke(Stroke::new(1.0_f32, pal.line))
         .corner_radius(6)
         .inner_margin(egui::Margin {
             left: 18,
@@ -3332,7 +3332,7 @@ fn list_row(
                 rect,
                 4,
                 pal.bg,
-                Stroke::new(1.0, pal.line),
+                Stroke::new(1.0_f32, pal.line),
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
@@ -3415,7 +3415,7 @@ fn log_line(ui: &mut egui::Ui, line: &str, pal: &Pal) {
         egui::Label::new(
             RichText::new(line)
                 .monospace()
-                .color(mark.map_or(pal.ink, |color| color)),
+                .color(mark.unwrap_or(pal.ink)),
         )
         .wrap(),
     );
@@ -3569,7 +3569,7 @@ fn prompt_view(
             if key {
                 egui::Frame::new()
                     .fill(pal.bg)
-                    .stroke(Stroke::new(1.0, pal.line))
+                    .stroke(Stroke::new(1.0_f32, pal.line))
                     .corner_radius(4)
                     .inner_margin(egui::Margin::same(14))
                     .show(ui, |ui| {

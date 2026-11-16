@@ -323,7 +323,7 @@ impl Desktop {
         let failure = snapshot.divert_error.clone();
         if !unavailable.is_empty() || detached {
             egui::Frame::new()
-                .stroke(Stroke::new(1.0, pal.warn))
+                .stroke(Stroke::new(1.0_f32, pal.warn))
                 .corner_radius(4)
                 .inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
@@ -455,7 +455,7 @@ impl Desktop {
         ui.add_space(8.0);
         egui::Frame::new()
             .fill(pal.bg)
-            .stroke(Stroke::new(1.0, pal.line))
+            .stroke(Stroke::new(1.0_f32, pal.line))
             .corner_radius(4)
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
@@ -690,7 +690,7 @@ pub(super) fn app_form_view(
                     let mut picked = None;
                     egui::Frame::new()
                         .fill(pal.bg)
-                        .stroke(Stroke::new(1.0, pal.line))
+                        .stroke(Stroke::new(1.0_f32, pal.line))
                         .corner_radius(4)
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {

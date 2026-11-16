@@ -205,7 +205,7 @@ pub(super) fn danger(text: &str, pal: &Pal) -> egui::Button<'static> {
 fn outline(text: &str, color: Color32, border: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text).color(color))
         .fill(Color32::TRANSPARENT)
-        .stroke(Stroke::new(1.0, border))
+        .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(4)
         .min_size(Vec2::new(0.0, BUTTON_HEIGHT))
 }
@@ -215,7 +215,7 @@ pub(super) fn choice(text: &str, selected: bool, pal: &Pal) -> egui::Button<'sta
     if selected {
         egui::Button::new(RichText::new(text).family(bold()).color(pal.on_accent))
             .fill(pal.accent)
-            .stroke(Stroke::new(1.0, pal.accent))
+            .stroke(Stroke::new(1.0_f32, pal.accent))
             .corner_radius(4)
             .min_size(Vec2::new(0.0, BUTTON_HEIGHT))
     } else {
@@ -242,7 +242,7 @@ pub(super) fn caps(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Respo
 pub(super) fn card(pal: &Pal) -> egui::Frame {
     egui::Frame::new()
         .fill(pal.panel)
-        .stroke(Stroke::new(1.0, pal.line))
+        .stroke(Stroke::new(1.0_f32, pal.line))
         .corner_radius(6)
         .inner_margin(Margin::same(18))
 }
@@ -256,7 +256,7 @@ pub(super) fn group<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     egui::Frame::new()
-        .stroke(Stroke::new(1.0, pal.line))
+        .stroke(Stroke::new(1.0_f32, pal.line))
         .corner_radius(4)
         .inner_margin(Margin::same(14))
         .show(ui, |ui| {
@@ -311,7 +311,7 @@ pub(super) fn lever(
         track,
         6,
         if filled { color } else { pal.bg },
-        Stroke::new(2.0, if on || busy { color } else { pal.strong }),
+        Stroke::new(2.0_f32, if on || busy { color } else { pal.strong }),
         StrokeKind::Inside,
     );
     let travel = track.width() - 6.0 - 22.0;
@@ -325,7 +325,7 @@ pub(super) fn lever(
         ui.painter().rect_stroke(
             rect.shrink(1.0),
             4,
-            Stroke::new(2.0, pal.ink),
+            Stroke::new(2.0_f32, pal.ink),
             StrokeKind::Inside,
         );
     }
@@ -360,7 +360,7 @@ pub(super) fn lamps(ui: &mut egui::Ui, lamps: &[Lamp], blink_on: bool, pal: &Pal
                 ui.painter().circle_filled(center, 8.0, color);
             }
             ui.painter()
-                .circle_stroke(center, 8.0, Stroke::new(2.0, color));
+                .circle_stroke(center, 8.0, Stroke::new(2.0_f32, color));
         }
         hover_lamp(&response, lamps, |pos| {
             ((pos.x - rect.left()) / 26.0).floor() as usize
@@ -372,7 +372,7 @@ pub(super) fn lamps(ui: &mut egui::Ui, lamps: &[Lamp], blink_on: bool, pal: &Pal
         rect,
         4,
         pal.bg,
-        Stroke::new(1.0, pal.strong),
+        Stroke::new(1.0_f32, pal.strong),
         StrokeKind::Inside,
     );
     let inner = rect.shrink(3.0);
@@ -396,7 +396,7 @@ pub(super) fn lamps(ui: &mut egui::Ui, lamps: &[Lamp], blink_on: bool, pal: &Pal
             ui.painter().rect_stroke(
                 sector.expand(1.5),
                 2,
-                Stroke::new(2.0, pal.ink),
+                Stroke::new(2.0_f32, pal.ink),
                 StrokeKind::Outside,
             );
         }
@@ -439,7 +439,7 @@ pub(super) fn route(
 ) {
     egui::Frame::new()
         .fill(pal.bg)
-        .stroke(Stroke::new(1.0, pal.line))
+        .stroke(Stroke::new(1.0_f32, pal.line))
         .corner_radius(4)
         .inner_margin(Margin::same(14))
         .show(ui, |ui| {
@@ -492,7 +492,10 @@ pub(super) fn route(
 
 fn route_node(ui: &mut egui::Ui, node: &Node, width: f32, color: Color32, pal: &Pal) {
     egui::Frame::new()
-        .stroke(Stroke::new(2.0, if node.lit { color } else { pal.line }))
+        .stroke(Stroke::new(
+            2.0_f32,
+            if node.lit { color } else { pal.line },
+        ))
         .corner_radius(4)
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -535,7 +538,7 @@ fn dashes(
         if b > a {
             ui.painter().line_segment(
                 [from + direction * a, from + direction * b],
-                Stroke::new(3.0, stroke_color),
+                Stroke::new(3.0_f32, stroke_color),
             );
         }
         start += period;
@@ -661,7 +664,7 @@ pub(super) fn modal<R>(
         .frame(
             egui::Frame::new()
                 .fill(pal.panel)
-                .stroke(Stroke::new(1.0, pal.line))
+                .stroke(Stroke::new(1.0_f32, pal.line))
                 .corner_radius(6)
                 .inner_margin(margin),
         )
@@ -734,7 +737,7 @@ pub(super) fn theme_card(
         rect,
         6,
         colors.bg,
-        Stroke::new(3.0, border),
+        Stroke::new(3.0_f32, border),
         StrokeKind::Inside,
     );
     for (index, (fill, stroke)) in [
@@ -753,7 +756,7 @@ pub(super) fn theme_card(
             swatch,
             3,
             fill,
-            Stroke::new(1.0, stroke),
+            Stroke::new(1.0_f32, stroke),
             StrokeKind::Inside,
         );
     }
@@ -777,7 +780,7 @@ pub(super) fn theme_card(
         ui.painter().rect_stroke(
             rect.expand(2.0),
             8,
-            Stroke::new(2.0, colors.ink),
+            Stroke::new(2.0_f32, colors.ink),
             StrokeKind::Outside,
         );
     }
@@ -797,11 +800,11 @@ pub(super) fn sign(ui: &mut egui::Ui, symbol: char, color: Color32) {
         ui.painter().add(egui::Shape::convex_polygon(
             points,
             Color32::TRANSPARENT,
-            Stroke::new(2.0, color),
+            Stroke::new(2.0_f32, color),
         ));
     } else {
         ui.painter()
-            .circle_stroke(center, 13.0, Stroke::new(2.0, color));
+            .circle_stroke(center, 13.0, Stroke::new(2.0_f32, color));
     }
     ui.painter().text(
         center + Vec2::new(0.0, if symbol == '!' { 3.0 } else { 0.0 }),
@@ -816,7 +819,7 @@ pub(super) fn sign(ui: &mut egui::Ui, symbol: char, color: Color32) {
 pub(super) fn kbd(ui: &mut egui::Ui, text: &str, pal: &Pal) {
     egui::Frame::new()
         .fill(pal.bg)
-        .stroke(Stroke::new(1.0, pal.strong))
+        .stroke(Stroke::new(1.0_f32, pal.strong))
         .corner_radius(4)
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
