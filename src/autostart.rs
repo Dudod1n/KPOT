@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", test))]
 use std::{collections::HashMap, fs, io::Write};
 
-fn registration(path: &Path) -> Result<(PathBuf, String)> {
+pub(crate) fn registration(path: &Path) -> Result<(PathBuf, String)> {
     let path = Store::new(path)?.path;
     let text = path
         .to_str()
@@ -172,7 +172,7 @@ fn set_desktop(path: &Path, name: &str, command: &[String], enabled: bool) -> Re
 }
 
 #[cfg(any(windows, test))]
-fn windows_command(command: &[String]) -> String {
+pub(crate) fn windows_command(command: &[String]) -> String {
     command
         .iter()
         .map(|argument| {
@@ -478,7 +478,10 @@ pub fn is_enabled(path: &Path) -> Result<bool> {
     let (path, name) = registration(path)?;
     #[cfg(windows)]
     {
-        Ok(registry::value(&name)?.is_some_and(|value| windows_owned(&value, &path)))
+        Ok(
+            registry::value(&name)?.is_some_and(|value| windows_owned(&value, &path))
+                || crate::tasks::registered(&path, crate::tasks::Kind::Logon, true)?,
+        )
     }
     #[cfg(target_os = "linux")]
     {
@@ -507,14 +510,24 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
             "Запись автозапуска принадлежит другой программе; она не изменена."
         );
         if enabled {
+            // A logon task starts without Explorer's startup delay; the Run key stays a fallback.
+            if crate::tasks::register(&path, crate::tasks::Kind::Logon).is_ok() {
+                if existing.is_some() {
+                    registry::set(&name, None)?;
+                }
+                return Ok(());
+            }
             let command = windows_command(&launch_command(&path)?);
             ensure!(
                 command.encode_utf16().count() <= 260,
                 "Автозапуск Windows: команда длиннее 260 символов. Переместите программу или конфигурацию в более короткий путь."
             );
             registry::set(&name, Some(&command))?;
-        } else if existing.is_some() {
-            registry::set(&name, None)?;
+        } else {
+            if existing.is_some() {
+                registry::set(&name, None)?;
+            }
+            crate::tasks::unregister(&path, crate::tasks::Kind::Logon)?;
         }
         Ok(())
     }
@@ -532,6 +545,24 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
         let _ = (path, name, enabled);
         anyhow::bail!("Автозапуск поддерживается только в Windows и Linux.")
     }
+}
+
+/// Moves an older Run-key registration to a logon task; errors leave the old entry working.
+pub fn migrate(path: &Path) {
+    #[cfg(windows)]
+    {
+        let owned = registration(path).is_ok_and(|(path, name)| {
+            registry::value(&name)
+                .ok()
+                .flatten()
+                .is_some_and(|value| windows_owned(&value, &path))
+        });
+        if owned {
+            let _ = set_enabled(path, true);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
 }
 
 #[cfg(test)]

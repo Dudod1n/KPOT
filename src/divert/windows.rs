@@ -899,16 +899,40 @@ pub(super) fn run(store: Store) -> Result<()> {
     std::process::exit(if result.is_ok() { 0 } else { 1 })
 }
 
-pub(super) fn launch(config: &Path) -> Result<()> {
+pub(super) fn launch(config: &Path, ask: bool) -> Result<()> {
+    use crate::tasks::{self, Kind};
     let executable = std::env::current_exe()?;
     let config = config
         .to_str()
         .filter(|path| !path.contains('"'))
         .context("Путь к конфигурации нельзя передать помощнику.")?;
+    let sid = tasks::user_sid()?;
+    if tasks::elevated() {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new(&executable)
+            .args(["--config", config, "divert", "--remember", sid.as_str()])
+            .creation_flags(0x0800_0000 | 0x0000_0200)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Не удалось запустить помощник перехвата.")?;
+        return Ok(());
+    }
+    let path = Path::new(config);
+    if tasks::registered(path, Kind::Divert, false).unwrap_or(false)
+        && tasks::run(path, Kind::Divert).is_ok()
+    {
+        return Ok(());
+    }
+    ensure!(
+        ask,
+        "Права администратора для перехвата не сохранены: нажмите «Предоставить права…»."
+    );
     let (verb, file, parameters) = (
         wide("runas".as_ref()),
         wide(executable.as_os_str()),
-        wide(format!("--config \"{config}\" divert").as_ref()),
+        wide(format!("--config \"{config}\" divert --remember {sid}").as_ref()),
     );
     // SAFETY: an all-zero structure is the documented starting point; every string is
     // NUL-terminated and outlives the call.

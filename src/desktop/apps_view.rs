@@ -180,7 +180,7 @@ impl Desktop {
     }
     pub(super) fn launch_divert(&mut self) {
         if let Some(backend) = &self.backend
-            && let Err(error) = crate::divert::launch(&backend.store.path)
+            && let Err(error) = crate::divert::launch(&backend.store.path, true)
         {
             self.error = error.to_string();
         }

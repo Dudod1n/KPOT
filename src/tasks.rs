@@ -1,0 +1,454 @@
+//! Windows Task Scheduler entries of one configuration.
+//!
+//! `Logon` starts the background КРОТ right after sign-in: unlike the Run key it is not held
+//! back by Explorer's startup delay. `Divert` starts the interception helper with administrator
+//! rights on demand: Windows asks for consent once, when the task is registered.
+use std::path::Path;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Logon,
+    Divert,
+}
+
+#[cfg(any(windows, test))]
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Logon => "logon",
+            Kind::Divert => "divert",
+        }
+    }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn command(self) -> &'static str {
+        match self {
+            Kind::Logon => "serve",
+            Kind::Divert => "divert",
+        }
+    }
+}
+
+/// Every task of this configuration and kind, whichever copy of КРОТ registered it.
+#[cfg(any(windows, test))]
+fn prefix(registration: &str, kind: Kind) -> String {
+    format!("\\{registration}-{}-", kind.label())
+}
+
+/// The program part changes when КРОТ moves, so a stale task is never taken for the current one.
+#[cfg(any(windows, test))]
+fn task_name(registration: &str, kind: Kind, executable: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let program = executable.replace('/', "\\").to_lowercase();
+    let digest = hex::encode(Sha256::digest(program.as_bytes()));
+    format!("{}{}", prefix(registration, kind), &digest[..8])
+}
+
+#[cfg(any(windows, test))]
+fn escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Task Scheduler 1.2 definition: no battery or time limits, normal priority, one instance.
+#[cfg(any(windows, test))]
+fn task_xml(kind: Kind, user: &str, command: &str, arguments: &str) -> String {
+    let user = escape(user);
+    let (triggers, level, description) = match kind {
+        Kind::Logon => (
+            format!(
+                "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>"
+            ),
+            "LeastPrivilege",
+            "КРОТ: фоновые туннели после входа в систему",
+        ),
+        Kind::Divert => (
+            String::new(),
+            "HighestAvailable",
+            "КРОТ: перехват трафика приложений с правами администратора",
+        ),
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
+<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\
+<RegistrationInfo><Description>{description}</Description></RegistrationInfo>\
+{triggers}\
+<Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>{level}</RunLevel></Principal></Principals>\
+<Settings>\
+<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\
+<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\
+<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\
+<AllowHardTerminate>true</AllowHardTerminate>\
+<StartWhenAvailable>false</StartWhenAvailable>\
+<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\
+<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>\
+<AllowStartOnDemand>true</AllowStartOnDemand>\
+<Enabled>true</Enabled>\
+<Hidden>false</Hidden>\
+<RunOnlyIfIdle>false</RunOnlyIfIdle>\
+<WakeToRun>false</WakeToRun>\
+<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\
+<Priority>5</Priority>\
+</Settings>\
+<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>\
+</Task>\r\n",
+        escape(command),
+        escape(arguments),
+    )
+}
+
+/// Task names from `schtasks /query /fo csv /nh`: the first quoted field of every row.
+#[cfg(any(windows, test))]
+fn listed_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix('"')?.split('"').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(windows)]
+pub use system::{elevated, register, registered, run, unregister, user_sid};
+
+/// Administrator rights exist only on Windows.
+#[cfg(not(windows))]
+pub fn elevated() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn registered(_config: &Path, _kind: Kind, _any_copy: bool) -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+mod system {
+    use super::*;
+    use anyhow::{Context, Result, bail, ensure};
+    use std::{io::Write, os::windows::process::CommandExt, process::Command};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+        Security::{
+            Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_ELEVATION,
+            TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+        },
+        System::Threading::{
+            GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
+        },
+        UI::{
+            Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
+            WindowsAndMessaging::SW_HIDE,
+        },
+    };
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn token() -> Result<Token> {
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: the pseudo handle of the current process needs no closing.
+        ensure!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) } != 0,
+            std::io::Error::last_os_error()
+        );
+        Ok(Token(handle))
+    }
+
+    /// The process runs with an elevated administrator token.
+    pub fn elevated() -> bool {
+        let Ok(token) = token() else {
+            return false;
+        };
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut length = 0;
+        // SAFETY: the buffer is a TOKEN_ELEVATION of the declared size.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenElevation,
+                (&raw mut elevation).cast(),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut length,
+            )
+        };
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+
+    /// SID of the account the process runs as, e.g. `S-1-5-21-…`.
+    pub fn user_sid() -> Result<String> {
+        let token = token()?;
+        let mut length = 0;
+        // SAFETY: the first call only reports the required size.
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut length);
+        }
+        ensure!(
+            length as usize >= size_of::<TOKEN_USER>(),
+            "Не удалось определить пользователя Windows."
+        );
+        let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
+        // SAFETY: the buffer is aligned for TOKEN_USER and has the reported size.
+        ensure!(
+            unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    length,
+                    &mut length,
+                )
+            } != 0,
+            std::io::Error::last_os_error()
+        );
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut text = std::ptr::null_mut();
+        // SAFETY: the SID points into `buffer`; the string is released with LocalFree.
+        ensure!(
+            unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } != 0,
+            std::io::Error::last_os_error()
+        );
+        let sid = unsafe {
+            let length = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let sid = String::from_utf16(std::slice::from_raw_parts(text, length));
+            LocalFree(text as HLOCAL);
+            sid
+        }?;
+        Ok(sid)
+    }
+
+    fn schtasks_path() -> std::path::PathBuf {
+        std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "C:\\Windows".into())
+            .join("System32")
+            .join("schtasks.exe")
+    }
+
+    fn schtasks(arguments: &[&str]) -> Result<std::process::Output> {
+        Command::new(schtasks_path())
+            .args(arguments)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("Не удалось запустить планировщик заданий Windows")
+    }
+
+    /// Runs schtasks with administrator rights, asking for consent, and waits for it.
+    fn schtasks_elevated(parameters: &str) -> Result<()> {
+        let wide = |text: &std::ffi::OsStr| -> Vec<u16> {
+            use std::os::windows::ffi::OsStrExt;
+            text.encode_wide().chain(Some(0)).collect()
+        };
+        let (verb, file, parameters) = (
+            wide("runas".as_ref()),
+            wide(schtasks_path().as_os_str()),
+            wide(parameters.as_ref()),
+        );
+        // SAFETY: an all-zero structure is the documented starting point; the strings
+        // outlive the call and the returned process handle is closed below.
+        unsafe {
+            let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+            info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+            info.fMask = SEE_MASK_NOCLOSEPROCESS;
+            info.lpVerb = verb.as_ptr();
+            info.lpFile = file.as_ptr();
+            info.lpParameters = parameters.as_ptr();
+            info.nShow = SW_HIDE;
+            ensure!(
+                ShellExecuteExW(&mut info) != 0 && !info.hProcess.is_null(),
+                "Права администратора не предоставлены."
+            );
+            WaitForSingleObject(info.hProcess, INFINITE);
+            let mut code = 1;
+            let read = GetExitCodeProcess(info.hProcess, &mut code);
+            CloseHandle(info.hProcess);
+            ensure!(
+                read != 0 && code == 0,
+                "Планировщик заданий Windows отказал."
+            );
+        }
+        Ok(())
+    }
+
+    fn names(config: &Path, kind: Kind) -> Result<(String, String)> {
+        let (_, registration) = crate::autostart::registration(config)?;
+        let executable = std::env::current_exe()?;
+        let executable = executable
+            .to_str()
+            .context("Путь программы не является корректным Unicode.")?;
+        Ok((
+            prefix(&registration, kind),
+            task_name(&registration, kind, executable),
+        ))
+    }
+
+    fn listed(prefix: &str) -> Result<Vec<String>> {
+        let output = schtasks(&["/query", "/fo", "csv", "/nh"])?;
+        ensure!(
+            output.status.success(),
+            "Не удалось прочитать задания Windows."
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(listed_names(&text)
+            .into_iter()
+            .filter(|name| {
+                name.get(..prefix.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+            })
+            .collect())
+    }
+
+    /// The task of this copy exists, or with `any_copy` a task of any copy of КРОТ.
+    pub fn registered(config: &Path, kind: Kind, any_copy: bool) -> Result<bool> {
+        let (prefix, name) = names(config, kind)?;
+        if any_copy {
+            return Ok(!listed(&prefix)?.is_empty());
+        }
+        Ok(schtasks(&["/query", "/tn", &name])?.status.success())
+    }
+
+    /// Registers the task for the current user and copy, replacing the tasks of other copies.
+    /// `Divert` needs administrator rights: call it from an elevated process.
+    pub fn register(config: &Path, kind: Kind) -> Result<()> {
+        let (prefix, name) = names(config, kind)?;
+        let config = crate::config::Store::new(config)?.path;
+        let executable = std::env::current_exe()?;
+        let command = executable
+            .to_str()
+            .context("Путь программы не является корректным Unicode.")?;
+        let arguments = crate::autostart::windows_command(&[
+            "--config".into(),
+            config
+                .to_str()
+                .context("Путь конфигурации не является корректным Unicode.")?
+                .into(),
+            kind.command().into(),
+        ]);
+        let xml = task_xml(kind, &user_sid()?, command, &arguments);
+        let mut file = tempfile::Builder::new()
+            .prefix("krot-task-")
+            .suffix(".xml")
+            .tempfile()?;
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        file.write_all(&bytes)?;
+        file.as_file().sync_all()?;
+        let path = file
+            .path()
+            .to_str()
+            .context("Путь временного файла не является корректным Unicode.")?
+            .to_owned();
+        let output = schtasks(&["/create", "/tn", &name, "/xml", &path, "/f"])?;
+        if !output.status.success() {
+            bail!(
+                "Планировщик заданий Windows не создал задание: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        for stale in listed(&prefix)? {
+            if !stale.eq_ignore_ascii_case(&name) {
+                let _ = schtasks(&["/delete", "/tn", &stale, "/f"]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes the tasks of every copy; an elevated task may need administrator consent.
+    pub fn unregister(config: &Path, kind: Kind) -> Result<()> {
+        let (prefix, _) = names(config, kind)?;
+        for name in listed(&prefix)? {
+            if schtasks(&["/delete", "/tn", &name, "/f"])?.status.success() {
+                continue;
+            }
+            ensure!(
+                kind == Kind::Divert,
+                "Не удалось удалить задание автозапуска {name}."
+            );
+            schtasks_elevated(&format!("/delete /tn \"{name}\" /f"))?;
+        }
+        Ok(())
+    }
+
+    /// Starts the task of this copy; Windows applies its rights without asking.
+    pub fn run(config: &Path, kind: Kind) -> Result<()> {
+        let (_, name) = names(config, kind)?;
+        let output = schtasks(&["/run", "/tn", &name])?;
+        ensure!(
+            output.status.success(),
+            "Задание Windows не запустилось: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_names_separate_configurations_kinds_and_copies() {
+        let logon = task_name("krot-0123456789abcdef", Kind::Logon, "C:\\КРОТ\\krot.exe");
+        assert!(logon.starts_with("\\krot-0123456789abcdef-logon-"));
+        assert_eq!(
+            logon.len(),
+            prefix("krot-0123456789abcdef", Kind::Logon).len() + 8
+        );
+        assert!(logon.is_ascii());
+        assert_eq!(
+            logon,
+            task_name("krot-0123456789abcdef", Kind::Logon, "c:/кРОТ/KROT.exe")
+        );
+        assert_ne!(
+            logon,
+            task_name("krot-0123456789abcdef", Kind::Logon, "D:\\КРОТ\\krot.exe")
+        );
+        assert_ne!(
+            logon,
+            task_name("krot-0123456789abcdef", Kind::Divert, "C:\\КРОТ\\krot.exe")
+        );
+    }
+
+    #[test]
+    fn task_xml_escapes_paths_and_keeps_the_helper_on_demand() {
+        let xml = task_xml(
+            Kind::Divert,
+            "S-1-5-21-1",
+            "C:\\R&D <x>\\krot.exe",
+            "--config \"C:\\Users\\Алиса\\a'b.json\" divert",
+        );
+        assert!(xml.contains("<Command>C:\\R&amp;D &lt;x&gt;\\krot.exe</Command>"));
+        assert!(xml.contains("&quot;C:\\Users\\Алиса\\a&apos;b.json&quot; divert"));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(!xml.contains("<Triggers>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        let logon = task_xml(Kind::Logon, "S-1-5-21-1", "C:\\krot.exe", "serve");
+        assert!(logon.contains("<LogonTrigger><Enabled>true</Enabled><UserId>S-1-5-21-1</UserId>"));
+        assert!(logon.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(!logon.contains("Delay"));
+    }
+
+    #[test]
+    fn listed_names_take_the_first_csv_field() {
+        let output = "\"\\krot-a-logon-1\",\"N/A\",\"Ready\"\r\n\r\n\"\\Microsoft\\x\",\"N/A\",\"Готово\"\r\nINFO: none\r\n";
+        assert_eq!(listed_names(output), ["\\krot-a-logon-1", "\\Microsoft\\x"]);
+    }
+}
