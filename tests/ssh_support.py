@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import random
 import re
 import secrets
 import signal
@@ -21,6 +22,10 @@ import asyncssh
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 AUTH_TIMEOUT = 2.0
 REQUEST_TIMEOUT = 15.0
+# A probe that neither connects nor is refused this long means the listener is still there.
+PROBE_TIMEOUT = 10.0
+# How long a listener may keep accepting probes after its tunnel stops.
+CLOSE_TIMEOUT = 3.0
 
 
 @dataclass
@@ -123,6 +128,20 @@ def _receive_line(connection: socket.socket, deadline: float, max_bytes: int) ->
     return bytes(raw)
 
 
+def _handshake(connection: socket.socket, token: str, deadline: float) -> None:
+    """Prove that the listener knows `token` before the token itself is sent."""
+    nonce = secrets.token_hex(32)
+    connection.settimeout(max(.001, deadline - time.monotonic()))
+    connection.sendall(json.dumps({'nonce': nonce}).encode('ascii') + b'\n')
+    proof = _json(_receive_line(connection, deadline, 4096))
+    expected = hmac.digest(token.encode('ascii'), nonce.encode('ascii'), 'sha256').hex()
+    if (not isinstance(proof, dict) or set(proof) != {'proof'}
+            or not isinstance(proof['proof'], str)
+            or re.fullmatch('[0-9a-f]{64}', proof['proof']) is None
+            or not hmac.compare_digest(proof['proof'], expected)):
+        raise ValueError('Не удалось подтвердить фоновый процесс КРОТ.')
+
+
 class Client:
     def __init__(self, path: Path):
         self.path = Path(path).expanduser().resolve()
@@ -143,16 +162,7 @@ class Client:
             auth_deadline = min(deadline, time.monotonic() + AUTH_TIMEOUT)
             with socket.create_connection(('127.0.0.1', metadata['port']),
                                           timeout=min(timeout, AUTH_TIMEOUT)) as connection:
-                nonce = secrets.token_hex(32)
-                connection.settimeout(max(.001, auth_deadline - time.monotonic()))
-                connection.sendall(json.dumps({'nonce': nonce}).encode('ascii') + b'\n')
-                proof = _json(_receive_line(connection, auth_deadline, 4096))
-                expected = hmac.digest(metadata['token'].encode('ascii'), nonce.encode('ascii'), 'sha256').hex()
-                if (not isinstance(proof, dict) or set(proof) != {'proof'}
-                        or not isinstance(proof['proof'], str)
-                        or re.fullmatch('[0-9a-f]{64}', proof['proof']) is None
-                        or not hmac.compare_digest(proof['proof'], expected)):
-                    raise ValueError('Не удалось подтвердить фоновый процесс КРОТ.')
+                _handshake(connection, metadata['token'], auth_deadline)
                 connection.settimeout(max(.001, deadline - time.monotonic()))
                 connection.sendall(request)
                 raw = _receive_line(connection, deadline, MAX_MESSAGE_BYTES)
@@ -172,15 +182,12 @@ class Client:
 def attach_udp(path: Path, version: int = 1) -> socket.socket:
     """Open the helper's binary UDP channel like the elevated helper does."""
     metadata = _metadata(endpoint_path(Path(path).expanduser().resolve()))
-    deadline = time.monotonic() + REQUEST_TIMEOUT
+    auth_deadline = time.monotonic() + AUTH_TIMEOUT
     connection = socket.create_connection(('127.0.0.1', metadata['port']), timeout=AUTH_TIMEOUT)
     try:
-        nonce = secrets.token_hex(32)
-        connection.sendall(json.dumps({'nonce': nonce}).encode('ascii') + b'\n')
-        proof = _json(_receive_line(connection, deadline, 4096))
-        expected = hmac.digest(metadata['token'].encode('ascii'), nonce.encode('ascii'), 'sha256').hex()
-        if not hmac.compare_digest(proof.get('proof', ''), expected):
-            raise ValueError('Не удалось подтвердить фоновый процесс КРОТ.')
+        _handshake(connection, metadata['token'], auth_deadline)
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        connection.settimeout(REQUEST_TIMEOUT)
         connection.sendall(json.dumps({'token': metadata['token'], 'command': 'udp_attach',
                                        'payload': {'version': version}}).encode('utf-8') + b'\n')
         response = _json(_receive_line(connection, deadline, MAX_MESSAGE_BYTES))
@@ -226,10 +233,27 @@ class Frames:
         return body[0], body[1:]
 
 
+_issued_ports = set()
+
+
 def unused_port():
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        return sock.getsockname()[1]
+    """A free port for a listener that the tested process opens later.
+
+    The port lies below the default ephemeral ranges (Linux 32768+, Windows and macOS 49152+),
+    so with default settings outgoing connections and `bind` to port 0 do not take it while it
+    waits for its listener. Another process that binds the port explicitly still can."""
+    for _ in range(100):
+        port = random.randint(20000, 32767)
+        if port in _issued_ports:
+            continue
+        with socket.socket() as sock:
+            try:
+                sock.bind(('127.0.0.1', port))
+            except OSError:
+                continue
+        _issued_ports.add(port)
+        return port
+    raise RuntimeError('No free port below the ephemeral range')
 
 
 def kill_group(process):
@@ -357,17 +381,22 @@ class SSHFixtures:
             await writer.wait_closed()
 
     async def assert_closed(self, port):
-        try:
-            # Remote teardown completes after SSH disconnect reaches the test server.
-            async with asyncio.timeout(3):
-                while True:
-                    try:
-                        _, writer = await asyncio.open_connection('127.0.0.1', port)
-                    except OSError:
-                        return
-                    writer.close()
-                    with contextlib.suppress(OSError):
-                        await writer.wait_closed()
-                    await asyncio.sleep(.025)
-        except TimeoutError:
-            self.fail(f'Listener on port {port} is still open')
+        # Remote teardown completes after SSH disconnect reaches the test server. Only a
+        # probe that connects counts against CLOSE_TIMEOUT: Windows takes about 2 seconds
+        # to refuse a connection to a closed loopback port.
+        deadline = time.monotonic() + CLOSE_TIMEOUT
+        while True:
+            try:
+                _, writer = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', port),
+                                                   PROBE_TIMEOUT)
+            except TimeoutError:
+                # TimeoutError is an OSError, but an unanswered probe is not a refusal.
+                self.fail(f'Probe to port {port} timed out: the listener may still be open')
+            except OSError:
+                return
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            if time.monotonic() >= deadline:
+                self.fail(f'Listener on port {port} is still open')
+            await asyncio.sleep(.025)

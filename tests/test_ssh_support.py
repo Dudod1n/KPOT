@@ -7,9 +7,11 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
-from ssh_support import Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _metadata, _receive_line
+import ssh_support
+from ssh_support import (Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _handshake, _metadata,
+                         _receive_line, endpoint_path)
 
 
 class FixtureTests(unittest.TestCase):
@@ -26,13 +28,16 @@ class FixtureTests(unittest.TestCase):
     def test_invalid_metadata_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'endpoint.json'
-            for data in ({'port': True, 'token': 'a' * 64},
-                         {'port': 1234, 'token': 'invalid'},
-                         {'port': 1234, 'token': 'a' * 64, 'extra': 1},
-                         'x' * 4097):
-                with self.subTest(data=data):
-                    path.write_text(json.dumps(data))
-                    with self.assertRaises(ValueError):
+            valid = json.dumps({'port': 1234, 'token': 'a' * 64})
+            path.write_text(valid.ljust(4096))
+            self.assertEqual(_metadata(path), {'port': 1234, 'token': 'a' * 64})
+            for data in (json.dumps({'port': True, 'token': 'a' * 64}),
+                         json.dumps({'port': 1234, 'token': 'invalid'}),
+                         json.dumps({'port': 1234, 'token': 'a' * 64, 'extra': 1}),
+                         valid.ljust(4097)):
+                with self.subTest(data=data[:80]):
+                    path.write_text(data)
+                    with self.assertRaisesRegex(ValueError, 'Некорректный адрес'):
                         _metadata(path)
 
     def test_response_frames_require_newline_and_respect_size_limit(self):
@@ -46,6 +51,15 @@ class FixtureTests(unittest.TestCase):
                         _receive_line(connection, time.monotonic() + 1, 4)
                 else:
                     self.assertEqual(_receive_line(connection, time.monotonic() + 1, 4), expected)
+
+    def test_handshake_rejects_malformed_proof(self):
+        for reply in (b'[]\n', b'{"proof": 1}\n', '{"proof": "\u00e9"}\n'.encode(),
+                      b'{"proof": "' + b'0' * 64 + b'", "extra": 1}\n', b'{"proof": "' + b'0' * 64 + b'"}\n'):
+            with self.subTest(reply=reply):
+                connection = Mock()
+                connection.recv.side_effect = [reply]
+                with self.assertRaisesRegex(ValueError, 'Не удалось подтвердить'):
+                    _handshake(connection, 'a' * 64, time.monotonic() + 1)
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
@@ -73,7 +87,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / 'config.json')
             async with await asyncio.start_server(serve, '127.0.0.1', 0) as server:
-                store.path.with_name('config.json.background.json').write_text(json.dumps({
+                endpoint_path(store.path).write_text(json.dumps({
                     'port': server.sockets[0].getsockname()[1], 'token': 'a' * 64}))
                 try:
                     result = await asyncio.to_thread(Client(store.path).request, 'snapshot')
@@ -89,14 +103,16 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(received[0]), {'nonce'})
 
     async def test_authenticated_response_and_errors(self):
+        invalid = ValueError('Некорректный ответ фонового процесса.')
         for response, expected in (({'ok': True, 'value': {'version': 1}}, {'version': 1}),
-                                   ({'ok': False, 'error': 'rejected'}, ValueError),
-                                   ({'ok': True, 'value': None, 'extra': 1}, ValueError)):
+                                   ({'ok': False, 'error': 'rejected'}, ValueError('rejected')),
+                                   ({'ok': True, 'value': None, 'extra': 1}, invalid)):
             with self.subTest(response=response):
                 result, received = await self.exchange(True, response)
                 self.assertEqual(received[1], {'token': 'a' * 64, 'command': 'snapshot', 'payload': None})
-                if expected is ValueError:
+                if isinstance(expected, ValueError):
                     self.assertIsInstance(result, ValueError)
+                    self.assertEqual(str(result), str(expected))
                 else:
                     self.assertEqual(result, expected)
 
@@ -134,6 +150,27 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         async with await asyncio.start_server(self.close_connection, '127.0.0.1', 0) as server:
             with self.assertRaisesRegex(AssertionError, 'still open'):
                 await self.assert_closed(server.sockets[0].getsockname()[1])
+
+    async def test_slow_refusal_does_not_count_against_the_deadline(self):
+        async def connect(host, port):
+            calls.append(port)
+            if len(calls) == 1:
+                return Mock(), Mock(wait_closed=AsyncMock())
+            await asyncio.sleep(.2)
+            raise ConnectionRefusedError
+        calls = []
+        with (patch.object(ssh_support, 'CLOSE_TIMEOUT', .1),
+              patch.object(ssh_support.asyncio, 'open_connection', connect)):
+            await self.assert_closed(1)
+        self.assertEqual(len(calls), 2)
+
+    async def test_unanswered_probe_is_rejected(self):
+        async def connect(host, port):
+            await asyncio.sleep(10)
+        with (patch.object(ssh_support, 'PROBE_TIMEOUT', .05),
+              patch.object(ssh_support.asyncio, 'open_connection', connect),
+              self.assertRaisesRegex(AssertionError, 'timed out')):
+            await self.assert_closed(1)
 
 
 if __name__ == '__main__':
