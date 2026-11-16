@@ -1094,6 +1094,10 @@ impl Desktop {
                                 self.dialog = None;
                             }
                             self.snapshot = Some(*snapshot);
+                            // A row whose new state the filter hides gives up the selection:
+                            // keys must not act on a row the list does not show.
+                            self.move_selection(0);
+                            self.move_app_selection(0);
                         }
                         Err(error) => {
                             if self.snapshot.is_some()
@@ -3460,7 +3464,10 @@ fn list_row(
 
 /// Words that mark a journal line, each in lower case and capitalised for a line start.
 /// Negated success words are failures: «туннель не работает», «действие не выполнено».
-const LOG_WARN: [(&str, &str); 11] = [
+const LOG_WARN: [(&str, &str); 14] = [
+    ("заблокирован", "Заблокирован"),
+    ("нет связи", "Нет связи"),
+    ("отброшен", "Отброшен"),
     ("ошибк", "Ошибк"),
     ("не удалось", "Не удалось"),
     ("потерян", "Потерян"),
@@ -6178,6 +6185,22 @@ mod tests {
         assert_eq!(app.selected.as_deref(), Some("t1"));
     }
     #[test]
+    fn a_row_hidden_by_its_new_state_gives_up_the_selection() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        app.snapshot = Some(long_list());
+        app.filter = Group::Live;
+        app.selected = Some("t4".into());
+        // The selected tunnel stops: the «Работают» filter no longer shows it.
+        let mut next = long_list();
+        next.runtimes.get_mut("t4").unwrap().state = "stopped".into();
+        app.tx.send(Event::Snapshot(Ok(Box::new(next)))).unwrap();
+        app.drain(&ctx);
+        assert_eq!(app.selected.as_deref(), Some("t0"));
+    }
+    #[test]
     fn waiting_count_matches_the_attention_filter() {
         let ctx = egui::Context::default();
         configure(&ctx, "dark");
@@ -6213,6 +6236,9 @@ mod tests {
             "Действие не выполнено: нет доступа",
             "10:00:01 Ошибка подключения",
             "Не удалось открыть порт",
+            "10:00:02 UDP заблокирован: нет связи с фоновым КРОТом",
+            "10:00:03 QUIC (UDP 443) заблокирован: браузер перейдёт на TCP",
+            "10:00:04 Фрагментированная UDP-датаграмма отброшена",
         ] {
             assert_eq!(log_tone(line), Some(Tone::Warn), "{line}");
         }

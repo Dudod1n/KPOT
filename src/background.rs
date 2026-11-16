@@ -101,8 +101,14 @@ pub struct Snapshot {
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pause between attempts to start the helper without asking the user; it doubles after
-/// every failed attempt, up to 32 times.
+/// every failed attempt, up to 32 times. An attempt has failed until the helper attaches:
+/// a started task says nothing about the helper it starts.
 const DIVERT_RETRY: Duration = Duration::from_secs(60);
+/// Starts in a row after which a helper that never attaches is reported as failed, so the
+/// window asks for consent again instead of running the remembered task.
+const DIVERT_SILENT_STARTS: u32 = 3;
+const DIVERT_SILENT_ERROR: &str =
+    "Помощник перехвата запускается, но не подключается. Нажмите «Предоставить права…».";
 const MAX_APP_LOGS: usize = 200;
 
 /// The last word from the elevated helper and what it has reported so far.
@@ -1020,6 +1026,9 @@ pub async fn serve(store: Store) -> Result<()> {
     let mut backoff = crate::ssh::AcceptBackoff::default();
     let mut divert_retry = Instant::now();
     let divert_failures = Arc::new(AtomicU64::new(0));
+    // A helper was started and has not attached since.
+    let divert_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut divert_silent = 0u32;
     loop {
         let terminated = async {
             #[cfg(unix)]
@@ -1042,21 +1051,34 @@ pub async fn serve(store: Store) -> Result<()> {
             },
             _ = tray_poll.tick() => {
                 // Keep the previous icon while a command holds the state.
-                if let Ok(owned) = service.owned.try_lock() {
+                if let Ok(mut owned) = service.owned.try_lock() {
                     let (states, waiting) = owned.manager.states().await;
                     tray.update(crate::tray::Status::count(&owned.config.tunnels, &states, &waiting));
-                    if Instant::now() >= divert_retry && owned.divert.wanted(&owned.apps) {
-                        let failures = divert_failures.load(Ordering::Relaxed).min(5) as u32;
-                        divert_retry = Instant::now() + DIVERT_RETRY * 2u32.pow(failures);
-                        let (path, failures) = (store.path.clone(), divert_failures.clone());
-                        tokio::task::spawn_blocking(move || {
-                            let ready = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| crate::divert::missing_components(dir).is_empty()));
-                            if ready == Some(true) && crate::divert::launch(&path, crate::divert::Prompt::Never).is_ok() {
-                                failures.store(0, Ordering::Relaxed);
-                            } else {
-                                failures.fetch_add(1, Ordering::Relaxed);
-                            }
-                        });
+                    if owned.divert.attached() {
+                        divert_failures.store(0, Ordering::Relaxed);
+                        divert_started.store(false, Ordering::Relaxed);
+                        divert_silent = 0;
+                    } else if Instant::now() >= divert_retry && owned.divert.wanted(&owned.apps) {
+                        if divert_started.swap(false, Ordering::Relaxed) {
+                            divert_failures.fetch_add(1, Ordering::Relaxed);
+                            divert_silent += 1;
+                        }
+                        if divert_silent >= DIVERT_SILENT_STARTS {
+                            divert_silent = 0;
+                            owned.divert.error = DIVERT_SILENT_ERROR.into();
+                        } else {
+                            let failures = divert_failures.load(Ordering::Relaxed).min(5) as u32;
+                            divert_retry = Instant::now() + DIVERT_RETRY * 2u32.pow(failures);
+                            let (path, failures, started) = (store.path.clone(), divert_failures.clone(), divert_started.clone());
+                            tokio::task::spawn_blocking(move || {
+                                let ready = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| crate::divert::missing_components(dir).is_empty()));
+                                if ready == Some(true) && crate::divert::launch(&path, crate::divert::Prompt::Never).is_ok() {
+                                    started.store(true, Ordering::Relaxed);
+                                } else {
+                                    failures.fetch_add(1, Ordering::Relaxed);
+                                }
+                            });
+                        }
                     }
                 }
             },

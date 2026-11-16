@@ -733,7 +733,8 @@ impl Relay {
         while self.data_count >= CHANNEL_QUEUE_DATAGRAMS
             || self.data_bytes + pending.frame.len() > CHANNEL_QUEUE_BYTES
         {
-            if !self.drop_reply(flow) {
+            let by_count = self.data_count >= CHANNEL_QUEUE_DATAGRAMS;
+            if !self.drop_reply(flow, by_count) {
                 break;
             }
         }
@@ -751,14 +752,28 @@ impl Relay {
         replies.queue.push_back(pending);
     }
 
-    /// Drops the oldest answer of the flow that holds most bytes; `false` when none waits.
-    fn drop_reply(&mut self, arriving: u32) -> bool {
+    /// Drops the oldest answer of the flow that holds most of what ran out: datagrams with
+    /// `by_count`, bytes otherwise, so a flood of small datagrams pays for the places it takes.
+    /// `false` when none waits.
+    fn drop_reply(&mut self, arriving: u32, by_count: bool) -> bool {
+        let size = |replies: &Replies| {
+            if by_count {
+                replies.queue.len()
+            } else {
+                replies.bytes
+            }
+        };
+        let total = if by_count {
+            self.data_count
+        } else {
+            self.data_bytes
+        };
         // A flow that holds half of everything holds most: no search while it floods.
-        let holds = |flow: &u32| self.data.get(flow).map_or(0, |replies| replies.bytes);
-        let largest = if holds(&arriving) * 2 >= self.data_bytes && holds(&arriving) > 0 {
+        let held = self.data.get(&arriving).map_or(0, size);
+        let largest = if held * 2 >= total && held > 0 {
             arriving
         } else {
-            let Some((flow, _)) = self.data.iter().max_by_key(|(_, replies)| replies.bytes) else {
+            let Some((flow, _)) = self.data.iter().max_by_key(|(_, replies)| size(replies)) else {
                 return false;
             };
             *flow
@@ -1019,6 +1034,21 @@ mod tests {
         assert!(relay.output.windows(voice.len()).any(|part| part == voice));
         assert!(!relay.data.contains_key(&1));
         assert_eq!(relay.turns, [2]);
+    }
+
+    #[test]
+    fn a_flood_of_small_datagrams_pays_for_the_places_it_takes() {
+        let mut relay = Relay::new();
+        let now = Instant::now();
+        // Fewer datagrams, but more bytes than the whole flood.
+        for _ in 0..200 {
+            queue_flow_reply(&mut relay, 1, &[0u8; 1200], now);
+        }
+        for _ in 0..2 * CHANNEL_QUEUE_DATAGRAMS {
+            queue_flow_reply(&mut relay, 2, &[0u8; 1], now);
+        }
+        assert_eq!(relay.data_count, CHANNEL_QUEUE_DATAGRAMS);
+        assert_eq!(relay.data[&1].queue.len(), 200);
     }
 
     #[test]

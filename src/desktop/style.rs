@@ -544,7 +544,8 @@ fn dashes(
     }
     let direction = (to - from) / length;
     let period = 16.0;
-    let offset = time.map_or(0.0, |time| (time * speed) as f32 % period);
+    // The remainder first: seconds since start times the speed outgrow `f32` within days.
+    let offset = time.map_or(0.0, |time| (time * speed % f64::from(period)) as f32);
     let mut start = offset - period;
     while start < length {
         let a = start.max(0.0);

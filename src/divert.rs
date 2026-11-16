@@ -658,6 +658,9 @@ pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Res
             && crate::tasks::remembering(&store.path)
             && crate::tasks::elevated()
             && crate::tasks::user_sid().is_ok_and(|own| own == sid)
+            // Registering lists every task of the system: not before each start of the helper.
+            && !crate::tasks::registered(&store.path, crate::tasks::Kind::Divert, false)
+                .unwrap_or(false)
         {
             // Without the task the helper still works; the next start asks again.
             let _ = crate::tasks::register(&store.path, crate::tasks::Kind::Divert);
