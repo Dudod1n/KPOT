@@ -362,9 +362,8 @@ impl Desktop {
                 return;
             }
             style::caps(ui, "На участке", pal.dim);
-            ui.add_space(12.0);
-            style::mole(ui, 4.0, style::Pose::default(), pal);
-            ui.add_space(12.0);
+            ui.add_space(8.0);
+            // The action comes first so it stays visible in the smallest window.
             if has_socks {
                 ui.label("Добавьте приложение, чтобы направить его трафик через туннель.");
                 ui.label(
@@ -377,6 +376,8 @@ impl Desktop {
                     self.new_socks_tunnel();
                 }
             }
+            ui.add_space(12.0);
+            style::mole(ui, 4.0, style::Pose::default(), pal);
         });
     }
     fn app_detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rule: &AppRule, pal: &Pal) {

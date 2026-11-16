@@ -1687,13 +1687,14 @@ impl Desktop {
                     .inner_margin(egui::Margin::symmetric(20, 8)),
             )
             .show(ctx, |ui| {
-                // Two floors: the lights on top, the count and buttons below, both from the left.
+                // Two floors from the left: lights and the count on top, buttons below.
                 ui.spacing_mut().item_spacing.y = 6.0;
-                if total > 0 {
-                    ui.horizontal(|ui| style::lamps(ui, &lamps, blink_on, pal));
-                }
                 ui.horizontal_wrapped(|ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    if total > 0 {
+                        style::lamps(ui, &lamps, blink_on, pal);
+                        ui.add_space(6.0);
+                    }
                     ui.label(
                         RichText::new(if apps {
                             format!("ЧЕРЕЗ ТУННЕЛЬ {running} ИЗ {total}")
@@ -1714,8 +1715,10 @@ impl Desktop {
                             .color(pal.warn),
                         );
                     }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     if total > 8 {
-                        ui.add_space(12.0);
                         let filter = if apps {
                             &mut self.app_filter
                         } else {
@@ -1753,7 +1756,6 @@ impl Desktop {
                             }
                         }
                     } else {
-                        ui.add_space(12.0);
                         ui.label(
                             RichText::new(if apps {
                                 "↑ ↓ Выбор · Space Вкл / выкл · 1 2 Вкладки"
