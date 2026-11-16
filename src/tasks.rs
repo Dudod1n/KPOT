@@ -3,7 +3,7 @@
 //! `Logon` starts the background КРОТ right after sign-in: unlike the Run key it is not held
 //! back by Explorer's startup delay. `Divert` starts the interception helper with administrator
 //! rights on demand: Windows asks for consent once, when the task is registered.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -26,6 +26,59 @@ impl Kind {
             Kind::Divert => "divert",
         }
     }
+}
+
+/// The windowed program that sits next to a console one: tasks always start the windowed
+/// program, so `krot-cli` and the window find the same task and no console opens at logon.
+#[cfg(any(windows, test))]
+fn windowed_name(name: &str) -> Option<&'static str> {
+    [
+        ("krot-cli.exe", "krot.exe"),
+        ("krot-cli-windows-x64.exe", "krot-windows-x64.exe"),
+    ]
+    .into_iter()
+    .find(|(console, _)| name.eq_ignore_ascii_case(console))
+    .map(|(_, windowed)| windowed)
+}
+
+/// Program that tasks and the elevated helper start: the windowed КРОТ of this copy.
+pub fn program() -> std::io::Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    #[cfg(windows)]
+    if let Some(windowed) = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(windowed_name)
+    {
+        let sibling = current.with_file_name(windowed);
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    Ok(current)
+}
+
+fn refusal(config: &Path) -> anyhow::Result<PathBuf> {
+    Ok(crate::config::Store::new(config)?.sidecar(".elevation-off"))
+}
+
+/// The user has not turned remembering off with `krot-cli elevation disable`.
+pub fn remembering(config: &Path) -> bool {
+    refusal(config).is_ok_and(|path| !path.exists())
+}
+
+/// Turning remembering off survives later consents until it is turned on again.
+pub fn set_remembering(config: &Path, enabled: bool) -> anyhow::Result<()> {
+    let path = refusal(config)?;
+    if enabled {
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error)?,
+            _ => {}
+        }
+    } else {
+        std::fs::write(&path, b"")?;
+    }
+    Ok(())
 }
 
 /// Every task of this configuration and kind, whichever copy of КРОТ registered it.
@@ -106,6 +159,23 @@ fn task_xml(kind: Kind, user: &str, command: &str, arguments: &str) -> String {
     )
 }
 
+/// `schtasks /query /xml` output of a task that Windows will not start.
+#[cfg(any(windows, test))]
+fn disabled(output: &[u8]) -> bool {
+    let text = if output.len() >= 2 && output.len().is_multiple_of(2) && output.contains(&0) {
+        let units: Vec<u16> = output
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(output).into_owned()
+    };
+    text.split_whitespace()
+        .collect::<String>()
+        .contains("<Enabled>false</Enabled>")
+}
+
 /// Task names from `schtasks /query /fo csv /nh`: the first quoted field of every row.
 #[cfg(any(windows, test))]
 fn listed_names(output: &str) -> Vec<String> {
@@ -117,7 +187,7 @@ fn listed_names(output: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-pub use system::{elevated, register, registered, run, unregister, user_sid};
+pub use system::{elevated, register, registered, run, runas, unregister, user_sid};
 
 /// Administrator rights exist only on Windows.
 #[cfg(not(windows))]
@@ -250,46 +320,50 @@ mod system {
             .context("Не удалось запустить планировщик заданий Windows")
     }
 
-    /// Runs schtasks with administrator rights, asking for consent, and waits for it.
-    fn schtasks_elevated(parameters: &str) -> Result<()> {
+    /// Starts `file` with administrator rights after the user's consent. With `wait` it also
+    /// waits for the program and requires a zero exit code.
+    pub fn runas(file: &std::ffi::OsStr, parameters: &str, wait: bool) -> Result<()> {
         let wide = |text: &std::ffi::OsStr| -> Vec<u16> {
             use std::os::windows::ffi::OsStrExt;
             text.encode_wide().chain(Some(0)).collect()
         };
         let (verb, file, parameters) = (
             wide("runas".as_ref()),
-            wide(schtasks_path().as_os_str()),
+            wide(file),
             wide(parameters.as_ref()),
         );
         // SAFETY: an all-zero structure is the documented starting point; the strings
-        // outlive the call and the returned process handle is closed below.
+        // outlive the call and a returned process handle is closed below.
         unsafe {
             let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
             info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
-            info.fMask = SEE_MASK_NOCLOSEPROCESS;
+            if wait {
+                info.fMask = SEE_MASK_NOCLOSEPROCESS;
+            }
             info.lpVerb = verb.as_ptr();
             info.lpFile = file.as_ptr();
             info.lpParameters = parameters.as_ptr();
             info.nShow = SW_HIDE;
             ensure!(
-                ShellExecuteExW(&mut info) != 0 && !info.hProcess.is_null(),
+                ShellExecuteExW(&mut info) != 0,
                 "Права администратора не предоставлены."
             );
+            if !wait {
+                return Ok(());
+            }
+            ensure!(!info.hProcess.is_null(), "Программа не запустилась.");
             WaitForSingleObject(info.hProcess, INFINITE);
             let mut code = 1;
             let read = GetExitCodeProcess(info.hProcess, &mut code);
             CloseHandle(info.hProcess);
-            ensure!(
-                read != 0 && code == 0,
-                "Планировщик заданий Windows отказал."
-            );
+            ensure!(read != 0 && code == 0, "Программа завершилась с ошибкой.");
         }
         Ok(())
     }
 
     fn names(config: &Path, kind: Kind) -> Result<(String, String)> {
         let (_, registration) = crate::autostart::registration(config)?;
-        let executable = std::env::current_exe()?;
+        let executable = program()?;
         let executable = executable
             .to_str()
             .context("Путь программы не является корректным Unicode.")?;
@@ -315,13 +389,14 @@ mod system {
             .collect())
     }
 
-    /// The task of this copy exists, or with `any_copy` a task of any copy of КРОТ.
+    /// The task of this copy exists and is enabled, or with `any_copy` a task of any copy exists.
     pub fn registered(config: &Path, kind: Kind, any_copy: bool) -> Result<bool> {
         let (prefix, name) = names(config, kind)?;
         if any_copy {
             return Ok(!listed(&prefix)?.is_empty());
         }
-        Ok(schtasks(&["/query", "/tn", &name])?.status.success())
+        let output = schtasks(&["/query", "/tn", &name, "/xml"])?;
+        Ok(output.status.success() && !disabled(&output.stdout))
     }
 
     /// Registers the task for the current user and copy, replacing the tasks of other copies.
@@ -329,7 +404,7 @@ mod system {
     pub fn register(config: &Path, kind: Kind) -> Result<()> {
         let (prefix, name) = names(config, kind)?;
         let config = crate::config::Store::new(config)?.path;
-        let executable = std::env::current_exe()?;
+        let executable = program()?;
         let command = executable
             .to_str()
             .context("Путь программы не является корректным Unicode.")?;
@@ -381,7 +456,12 @@ mod system {
                 kind == Kind::Divert,
                 "Не удалось удалить задание автозапуска {name}."
             );
-            schtasks_elevated(&format!("/delete /tn \"{name}\" /f"))?;
+            runas(
+                schtasks_path().as_os_str(),
+                &format!("/delete /tn \"{name}\" /f"),
+                true,
+            )
+            .context("Планировщик заданий Windows не удалил задание.")?;
         }
         Ok(())
     }
@@ -444,6 +524,39 @@ mod tests {
         assert!(logon.contains("<LogonTrigger><Enabled>true</Enabled><UserId>S-1-5-21-1</UserId>"));
         assert!(logon.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(!logon.contains("Delay"));
+    }
+
+    #[test]
+    fn console_programs_map_to_the_windowed_one() {
+        assert_eq!(windowed_name("KROT-CLI.exe"), Some("krot.exe"));
+        assert_eq!(
+            windowed_name("krot-cli-windows-x64.exe"),
+            Some("krot-windows-x64.exe")
+        );
+        assert_eq!(windowed_name("krot.exe"), None);
+    }
+
+    #[test]
+    fn disabled_tasks_are_recognised_in_utf8_and_utf16() {
+        let enabled = "<Settings>\r\n  <Enabled>true</Enabled>\r\n</Settings>";
+        let off = "<Settings>\r\n  <Enabled>false</Enabled>\r\n</Settings>";
+        assert!(!disabled(enabled.as_bytes()));
+        assert!(disabled(off.as_bytes()));
+        let utf16: Vec<u8> = off.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(disabled(&utf16));
+    }
+
+    #[test]
+    fn refusal_to_remember_persists_per_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.json");
+        assert!(remembering(&config));
+        set_remembering(&config, false).unwrap();
+        assert!(!remembering(&config));
+        assert!(remembering(&directory.path().join("other.json")));
+        set_remembering(&config, true).unwrap();
+        set_remembering(&config, true).unwrap();
+        assert!(remembering(&config));
     }
 
     #[test]

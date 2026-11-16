@@ -100,7 +100,8 @@ pub struct Snapshot {
 }
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Pause between attempts to start the helper without asking the user.
+/// Pause between attempts to start the helper without asking the user; it doubles after
+/// every failed attempt, up to 32 times.
 const DIVERT_RETRY: Duration = Duration::from_secs(60);
 const MAX_APP_LOGS: usize = 200;
 
@@ -1018,6 +1019,7 @@ pub async fn serve(store: Store) -> Result<()> {
     let mut tray_poll = tokio::time::interval(Duration::from_secs(1));
     let mut backoff = crate::ssh::AcceptBackoff::default();
     let mut divert_retry = Instant::now();
+    let divert_failures = Arc::new(AtomicU64::new(0));
     loop {
         let terminated = async {
             #[cfg(unix)]
@@ -1044,12 +1046,15 @@ pub async fn serve(store: Store) -> Result<()> {
                     let (states, waiting) = owned.manager.states().await;
                     tray.update(crate::tray::Status::count(&owned.config.tunnels, &states, &waiting));
                     if Instant::now() >= divert_retry && owned.divert.wanted(&owned.apps) {
-                        divert_retry = Instant::now() + DIVERT_RETRY;
-                        let path = store.path.clone();
+                        let failures = divert_failures.load(Ordering::Relaxed).min(5) as u32;
+                        divert_retry = Instant::now() + DIVERT_RETRY * 2u32.pow(failures);
+                        let (path, failures) = (store.path.clone(), divert_failures.clone());
                         tokio::task::spawn_blocking(move || {
                             let ready = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| crate::divert::missing_components(dir).is_empty()));
-                            if ready == Some(true) {
-                                let _ = crate::divert::launch(&path, false);
+                            if ready == Some(true) && crate::divert::launch(&path, crate::divert::Prompt::Never).is_ok() {
+                                failures.store(0, Ordering::Relaxed);
+                            } else {
+                                failures.fetch_add(1, Ordering::Relaxed);
                             }
                         });
                     }

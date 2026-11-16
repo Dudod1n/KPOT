@@ -129,19 +129,25 @@ pub fn run() -> Result<()> {
             Some(Command::Serve) => runtime.block_on(background::serve(store)),
             Some(Command::Divert { remember }) => crate::divert::run(store, remember),
             Some(Command::Elevation { action }) => {
-                use crate::tasks::{Kind, registered};
-                #[cfg(windows)]
-                match action.as_str() {
-                    "enable" => {
-                        anyhow::ensure!(crate::tasks::elevated(), "Запустите команду от имени администратора или нажмите «Предоставить права…» на вкладке приложений.");
-                        crate::tasks::register(&store.path, Kind::Divert)?;
-                    }
-                    "disable" => crate::tasks::unregister(&store.path, Kind::Divert)?,
-                    _ => {}
-                }
+                use crate::tasks::{Kind, registered, remembering, set_remembering};
                 #[cfg(not(windows))]
                 anyhow::ensure!(action == "status", "Перехват трафика приложений работает только в Windows.");
-                println!("Перехват без запроса прав: {}.", if registered(&store.path, Kind::Divert, false)? {"включён"} else {"выключен"});
+                match action.as_str() {
+                    "enable" => {
+                        set_remembering(&store.path, true)?;
+                        #[cfg(windows)]
+                        if crate::tasks::elevated() { crate::tasks::register(&store.path, Kind::Divert)?; }
+                        else { println!("Права запомнятся при следующем подтверждении запроса Windows («Предоставить права…»)."); }
+                    }
+                    "disable" => {
+                        set_remembering(&store.path, false)?;
+                        #[cfg(windows)]
+                        crate::tasks::unregister(&store.path, Kind::Divert)?;
+                    }
+                    _ => {}
+                }
+                let enabled = remembering(&store.path) && registered(&store.path, Kind::Divert, false)?;
+                println!("Перехват без запроса прав: {}.", if enabled {"включён"} else {"выключен"});
                 Ok(())
             }
             Some(Command::ApplyUpdate { manifest }) => runtime.block_on(crate::update::apply_install(&manifest)),

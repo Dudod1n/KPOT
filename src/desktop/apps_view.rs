@@ -165,7 +165,7 @@ impl Desktop {
             _ => Vec::new(),
         };
         let (Some(directory), false) = (directory, missing.is_empty()) else {
-            self.launch_divert();
+            self.launch_divert(ctx);
             return;
         };
         self.fetching_components = true;
@@ -178,12 +178,27 @@ impl Desktop {
             ctx.request_repaint();
         });
     }
-    pub(super) fn launch_divert(&mut self) {
-        if let Some(backend) = &self.backend
-            && let Err(error) = crate::divert::launch(&backend.store.path, true)
+    /// Starts the helper off the interface thread: the Task Scheduler may take a while.
+    pub(super) fn launch_divert(&mut self, ctx: &egui::Context) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        // A helper that failed after the remembered task asks for consent again.
+        let prompt = if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.divert_error.is_empty())
         {
-            self.error = error.to_string();
-        }
+            crate::divert::Prompt::Always
+        } else {
+            crate::divert::Prompt::IfNeeded
+        };
+        let (path, tx, ctx) = (backend.store.path.clone(), self.tx.clone(), ctx.clone());
+        backend.runtime.spawn_blocking(move || {
+            let result = crate::divert::launch(&path, prompt).map_err(|error| error.to_string());
+            let _ = tx.send(Event::DivertLaunched(result));
+            ctx.request_repaint();
+        });
     }
     pub(super) fn new_socks_tunnel(&mut self) {
         let mut form = TunnelForm::new(None);

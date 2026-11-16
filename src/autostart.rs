@@ -20,7 +20,7 @@ pub(crate) fn registration(path: &Path) -> Result<(PathBuf, String)> {
 }
 
 fn launch_command(config: &Path) -> Result<Vec<String>> {
-    let executable = std::env::current_exe()?;
+    let executable = crate::tasks::program()?;
     Ok(vec![
         executable
             .to_str()
@@ -480,7 +480,7 @@ pub fn is_enabled(path: &Path) -> Result<bool> {
     {
         Ok(
             registry::value(&name)?.is_some_and(|value| windows_owned(&value, &path))
-                || crate::tasks::registered(&path, crate::tasks::Kind::Logon, true)?,
+                || crate::tasks::registered(&path, crate::tasks::Kind::Logon, false)?,
         )
     }
     #[cfg(target_os = "linux")]
@@ -517,6 +517,8 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
                 }
                 return Ok(());
             }
+            // Tasks of moved copies must not start a second КРОТ next to the Run key.
+            let _ = crate::tasks::unregister(&path, crate::tasks::Kind::Logon);
             let command = windows_command(&launch_command(&path)?);
             ensure!(
                 command.encode_utf16().count() <= 260,
@@ -547,18 +549,29 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
     }
 }
 
-/// Moves an older Run-key registration to a logon task; errors leave the old entry working.
+/// Moves an older Run-key registration to a logon task. A refusal of the Task Scheduler
+/// leaves the Run key working and is not retried at every start.
 pub fn migrate(path: &Path) {
     #[cfg(windows)]
     {
-        let owned = registration(path).is_ok_and(|(path, name)| {
-            registry::value(&name)
-                .ok()
-                .flatten()
-                .is_some_and(|value| windows_owned(&value, &path))
-        });
-        if owned {
-            let _ = set_enabled(path, true);
+        let Ok((path, name)) = registration(path) else {
+            return;
+        };
+        let Ok(refused) = Store::new(&path).map(|store| store.sidecar(".logon-task-refused"))
+        else {
+            return;
+        };
+        let owned = registry::value(&name)
+            .ok()
+            .flatten()
+            .is_some_and(|value| windows_owned(&value, &path));
+        if !owned || refused.exists() {
+            return;
+        }
+        if crate::tasks::register(&path, crate::tasks::Kind::Logon).is_ok() {
+            let _ = registry::set(&name, None);
+        } else {
+            let _ = std::fs::write(refused, b"");
         }
     }
     #[cfg(not(windows))]

@@ -624,16 +624,27 @@ fn tcp_table_owner(table: &[u8], v6: bool, local_port: u16, remote_port: u16) ->
     fallback
 }
 
+/// When starting the helper may ask the user for administrator consent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Prompt {
+    /// Only without a question: from an elevated process or through the remembered task.
+    Never,
+    /// The remembered task first, then the consent prompt.
+    IfNeeded,
+    /// Straight to the consent prompt: the remembered task did not give the rights.
+    Always,
+}
+
 /// Starts the helper with administrator rights: directly from an elevated process, through
-/// the remembered task without a question, or, with `ask`, after the user's consent.
-pub fn launch(config: &std::path::Path, ask: bool) -> anyhow::Result<()> {
+/// the remembered task without a question, or after the user's consent as `prompt` allows.
+pub fn launch(config: &std::path::Path, prompt: Prompt) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        windows::launch(config, ask)
+        windows::launch(config, prompt)
     }
     #[cfg(not(windows))]
     {
-        let _ = (config, ask);
+        let _ = (config, prompt);
         anyhow::bail!("Перехват трафика приложений работает только в Windows.")
     }
 }
@@ -644,6 +655,7 @@ pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Res
     #[cfg(windows)]
     {
         if let Some(sid) = remember
+            && crate::tasks::remembering(&store.path)
             && crate::tasks::elevated()
             && crate::tasks::user_sid().is_ok_and(|own| own == sid)
         {
