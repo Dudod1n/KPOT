@@ -2,5 +2,18 @@
   "attribution": {
     "commit": "",
     "pr": "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "timeout 15 git fetch -q origin 2>/dev/null; [ \"$(git branch --show-current)\" = dev ] && git merge -q --ff-only origin/dev 2>/dev/null; n=$(git rev-list --count HEAD..origin/dev 2>/dev/null); [ \"${n:-0}\" -gt 0 ] && echo \"Рабочая копия отстаёт от origin/dev на $n коммитов: правила и код могут быть устаревшими. Обнови ветку до начала работы.\"; exit 0",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
   }
 }
