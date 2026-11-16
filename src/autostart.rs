@@ -530,10 +530,10 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
                 registry::set(&name, None)?;
             }
             // Where the Task Scheduler cannot be read no task was created either: turning on
-            // fell back to the Run key there. Only a task that is known to remain is an error.
+            // fell back to the Run key there. Only a task that is known to remain, of this
+            // copy or of a moved one, is an error.
             if let Err(error) = crate::tasks::unregister(&path, crate::tasks::Kind::Logon)
-                && crate::tasks::registered(&path, crate::tasks::Kind::Logon, false)
-                    .unwrap_or(false)
+                && crate::tasks::registered(&path, crate::tasks::Kind::Logon, true).unwrap_or(false)
             {
                 return Err(error);
             }

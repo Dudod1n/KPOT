@@ -1094,10 +1094,6 @@ impl Desktop {
                                 self.dialog = None;
                             }
                             self.snapshot = Some(*snapshot);
-                            // A row whose new state the filter hides gives up the selection:
-                            // keys must not act on a row the list does not show.
-                            self.move_selection(0);
-                            self.move_app_selection(0);
                         }
                         Err(error) => {
                             if self.snapshot.is_some()
@@ -1433,11 +1429,12 @@ impl Desktop {
         let shown: Vec<&str> = tunnels
             .iter()
             .filter(|tunnel| {
-                in_filter(
-                    tunnels.len(),
-                    self.filter,
-                    Self::tunnel_group(self.state(tunnel)),
-                )
+                self.selected.as_ref() == Some(&tunnel.id)
+                    || in_filter(
+                        tunnels.len(),
+                        self.filter,
+                        Self::tunnel_group(self.state(tunnel)),
+                    )
             })
             .map(|tunnel| tunnel.id.as_str())
             .collect();
@@ -1813,12 +1810,43 @@ impl Desktop {
                     }
                 });
             });
-        // A selection the new filter hides moves to the first row still shown.
+        // A selection the new filter hides moves to the first row of the filter; with none
+        // it stays, and its row with it.
         if refiltered {
             if apps {
-                self.move_app_selection(0);
+                let hidden = self.selected_app().is_some_and(|rule| {
+                    let rules = self
+                        .snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.apps.len());
+                    !in_filter(
+                        rules,
+                        self.app_filter,
+                        Self::app_group(&rule, self.app_state(&rule)),
+                    )
+                });
+                if hidden {
+                    let kept = self.selected_app.take();
+                    self.move_app_selection(0);
+                    self.selected_app = self.selected_app.take().or(kept);
+                }
             } else {
-                self.move_selection(0);
+                let hidden = self.selected_tunnel().is_some_and(|tunnel| {
+                    let tunnels = self
+                        .snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.config.tunnels.len());
+                    !in_filter(
+                        tunnels,
+                        self.filter,
+                        Self::tunnel_group(self.state(&tunnel)),
+                    )
+                });
+                if hidden {
+                    let kept = self.selected.take();
+                    self.move_selection(0);
+                    self.selected = self.selected.take().or(kept);
+                }
             }
         }
     }
@@ -1881,12 +1909,16 @@ impl Desktop {
                 }
                 for tunnel in &tunnels {
                     let state = self.state(tunnel).to_owned();
-                    if !in_filter(tunnels.len(), self.filter, Self::tunnel_group(&state)) {
+                    let selected = self.selected.as_ref() == Some(&tunnel.id);
+                    // The selected row stays while its new state is outside the filter: keys
+                    // act on the selection, which must be a row the list shows.
+                    if !selected
+                        && !in_filter(tunnels.len(), self.filter, Self::tunnel_group(&state))
+                    {
                         continue;
                     }
                     let (label, color) = state_label(&state);
                     let color = tone_of(pal, color);
-                    let selected = self.selected.as_ref() == Some(&tunnel.id);
                     let busy = self.busy_tunnels.contains(&tunnel.id);
                     let row = list_row(
                         ui,
@@ -6193,12 +6225,21 @@ mod tests {
         app.snapshot = Some(long_list());
         app.filter = Group::Live;
         app.selected = Some("t4".into());
-        // The selected tunnel stops: the «Работают» filter no longer shows it.
+        let shows = |output: &egui::FullOutput, label: &str| text_rect(output, label).is_some();
+        // The selected tunnel stops: it is outside the «Работают» filter now, but its row
+        // and the selection stay, so keys act neither on a hidden row nor on another one.
         let mut next = long_list();
         next.runtimes.get_mut("t4").unwrap().state = "stopped".into();
         app.tx.send(Event::Snapshot(Ok(Box::new(next)))).unwrap();
         app.drain(&ctx);
-        assert_eq!(app.selected.as_deref(), Some("t0"));
+        assert_eq!(app.selected.as_deref(), Some("t4"));
+        assert!(shows(&render(&mut app, &ctx, [900.0, 700.0]), "туннель 4"));
+        // Its neighbours are the rows of the filter; once left, the row is gone.
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("t6"));
+        app.move_selection(-1);
+        assert_eq!(app.selected.as_deref(), Some("t2"));
+        assert!(!shows(&render(&mut app, &ctx, [900.0, 700.0]), "туннель 4"));
     }
     #[test]
     fn waiting_count_matches_the_attention_filter() {
