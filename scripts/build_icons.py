@@ -9,50 +9,40 @@ ROOT = Path(__file__).resolve().parent.parent
 SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
 PALETTE = {
     '.': (0, 0, 0, 0),
-    'o': (16, 23, 26, 255),
-    'f': (52, 68, 75, 255),
-    'h': (82, 99, 106, 255),
-    's': (38, 59, 66, 255),
-    'c': (139, 205, 227, 255),
-    'l': (34, 62, 72, 255),
-    'i': (225, 242, 242, 255),
-    'm': (227, 188, 157, 255),
-    'p': (255, 155, 145, 255),
-    'n': (183, 105, 110, 255),
+    'o': (16, 17, 19, 255),
+    'y': (255, 196, 0, 255),
+    'd': (199, 149, 0, 255),
+    'g': (58, 61, 66, 255),
+    'w': (255, 246, 208, 255),
+    'f': (241, 239, 233, 255),
+    'l': (23, 24, 26, 255),
+    's': (90, 94, 100, 255),
 }
+
+# Mole in a miner's helmet with a lamp and goggles, as in the "Stroyka" theme.
+ART = (
+    '................',
+    '.....oooooo.....',
+    '....oyyggyyo....',
+    '...oyygwwgyyo...',
+    '..oyyygwwgyyyo..',
+    '..odddggggdddo..',
+    'oyyyyyyyyyyyyyyo',
+    '.offffffffffffo.',
+    '.ofllllffllllfo.',
+    'soflfylfflfylfos',
+    'soflyylfflyylfos',
+    '.ofllllffllllfo.',
+    '.offffffffffffo.',
+    '..oooooooooooo..',
+    '................',
+    '................',
+)
 
 
 def sprite():
-    pixels = [['.'] * 16 for _ in range(16)]
-
-    def rect(left, top, right, bottom, color):
-        for y in range(top, bottom):
-            pixels[y][left:right] = [color] * (right - left)
-
-    for y, left, right in [(1, 5, 11), (2, 3, 13), (3, 2, 14),
-                           (4, 2, 14), *[(y, 1, 15) for y in range(5, 12)],
-                           (12, 2, 14), (13, 3, 13), (14, 2, 14)]:
-        rect(left, y, right, y + 1, 'o')
-        if y > 1:
-            rect(left + 1, y, right - 1, y + 1, 'f')
-    rect(5, 2, 9, 3, 'h')
-    rect(3, 3, 7, 5, 'h')
-    rect(2, 6, 14, 8, 's')
-    for left in (3, 9):
-        rect(left, 5, left + 4, 9, 'c')
-        rect(left + 1, 6, left + 3, 8, 'l')
-        rect(left + 1, 6, left + 2, 7, 'i')
-    rect(7, 6, 9, 7, 'c')
-    rect(4, 9, 12, 10, 's')
-    rect(5, 9, 11, 12, 'm')
-    rect(6, 12, 10, 13, 'm')
-    rect(7, 10, 9, 11, 'p')
-    rect(7, 11, 9, 12, 'n')
-    rect(3, 13, 6, 15, 'o')
-    rect(10, 13, 13, 15, 'o')
-    rect(3, 13, 5, 14, 'm')
-    rect(11, 13, 13, 14, 'm')
-    return pixels
+    assert len(ART) == 16 and all(len(row) == 16 for row in ART), 'Icon art must be 16x16'
+    return [list(row) for row in ART]
 
 
 PIXELS = sprite()
@@ -92,7 +82,7 @@ def svg():
     return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" '
             'width="256" height="256" shape-rendering="crispEdges" '
             'role="img" aria-labelledby="title">\n'
-            '  <title id="title">КРОТ — крот в защитных очках</title>\n'
+            '  <title id="title">КРОТ — крот в шахтёрской каске и очках</title>\n'
             + '\n'.join(rectangles) + '\n</svg>\n').encode('utf-8')
 
 
