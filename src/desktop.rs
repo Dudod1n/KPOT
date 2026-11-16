@@ -362,6 +362,7 @@ enum Event {
     Complete(Operation, Result<(), String>),
     AutostartLoaded(Result<bool, String>),
     ComponentsFetched(Result<(), String>),
+    DivertLaunched(Result<(), String>),
     AutostartChanged(Result<bool, String>),
     ClosePreferenceSaved(Result<(), String>),
     UpdateChecked {
@@ -418,6 +419,9 @@ pub(crate) struct Desktop {
     selected_app: Option<String>,
     busy_apps: HashSet<String>,
     fetching_components: bool,
+    divert_auto_tried: bool,
+    /// The window runs with administrator rights; fixed for the life of the process.
+    elevated: bool,
     #[cfg(not(target_os = "linux"))]
     browse_app: bool,
     dialog: Option<Dialog>,
@@ -873,6 +877,8 @@ impl Desktop {
             selected_app: None,
             busy_apps: HashSet::new(),
             fetching_components: false,
+            divert_auto_tried: false,
+            elevated: crate::tasks::elevated(),
             #[cfg(not(target_os = "linux"))]
             browse_app: false,
             dialog: None,
@@ -1026,6 +1032,23 @@ impl Desktop {
                     self.next_poll = Instant::now() + POLL_TIME;
                     match result {
                         Ok(snapshot) => {
+                            // An elevated window needs no consent: start the helper at once, but
+                            // fetch missing driver files only when the user asks for it.
+                            if self.elevated
+                                && !self.divert_auto_tried
+                                && !snapshot.divert_attached
+                                && snapshot.apps.iter().any(|rule| rule.enabled)
+                            {
+                                self.divert_auto_tried = true;
+                                let ready = std::env::current_exe().ok().is_some_and(|exe| {
+                                    exe.parent().is_some_and(|directory| {
+                                        crate::divert::missing_components(directory).is_empty()
+                                    })
+                                });
+                                if ready {
+                                    self.launch_divert(ctx);
+                                }
+                            }
                             if snapshot.activation != self.last_activation {
                                 self.last_activation = snapshot.activation;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1166,7 +1189,7 @@ impl Desktop {
                 Event::ComponentsFetched(result) => {
                     self.fetching_components = false;
                     match result {
-                        Ok(()) => self.launch_divert(),
+                        Ok(()) => self.launch_divert(ctx),
                         Err(error) => self.error = error,
                     }
                 }
@@ -1191,6 +1214,11 @@ impl Desktop {
                             }
                             Err(message) => *error = message,
                         }
+                    }
+                }
+                Event::DivertLaunched(result) => {
+                    if let Err(error) = result {
+                        self.error = error;
                     }
                 }
                 Event::AutostartChanged(result) => {

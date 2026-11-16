@@ -37,10 +37,6 @@ use windows_sys::Win32::{
             QueryFullProcessImageNameW,
         },
     },
-    UI::{
-        Shell::{SHELLEXECUTEINFOW, ShellExecuteExW},
-        WindowsAndMessaging::SW_HIDE,
-    },
 };
 
 use super::{
@@ -899,31 +895,47 @@ pub(super) fn run(store: Store) -> Result<()> {
     std::process::exit(if result.is_ok() { 0 } else { 1 })
 }
 
-pub(super) fn launch(config: &Path) -> Result<()> {
-    let executable = std::env::current_exe()?;
+pub(super) fn launch(config: &Path, prompt: super::Prompt) -> Result<()> {
+    use crate::tasks::{self, Kind};
+    let program = tasks::program()?;
+    let path = config;
     let config = config
         .to_str()
         .filter(|path| !path.contains('"'))
         .context("Путь к конфигурации нельзя передать помощнику.")?;
-    let (verb, file, parameters) = (
-        wide("runas".as_ref()),
-        wide(executable.as_os_str()),
-        wide(format!("--config \"{config}\" divert").as_ref()),
-    );
-    // SAFETY: an all-zero structure is the documented starting point; every string is
-    // NUL-terminated and outlives the call.
-    let started = unsafe {
-        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        info.lpVerb = verb.as_ptr();
-        info.lpFile = file.as_ptr();
-        info.lpParameters = parameters.as_ptr();
-        info.nShow = SW_HIDE;
-        ShellExecuteExW(&mut info) != 0
-    };
+    let remember = tasks::remembering(path);
+    let sid = tasks::user_sid()?;
+    let mut arguments = vec!["--config", config, "divert"];
+    if remember {
+        arguments.extend(["--remember", sid.as_str()]);
+    }
+    if tasks::elevated() {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new(&program)
+            .args(&arguments)
+            .creation_flags(0x0800_0000 | 0x0000_0200)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Не удалось запустить помощник перехвата.")?;
+        return Ok(());
+    }
+    if remember
+        && prompt != super::Prompt::Always
+        && tasks::registered(path, Kind::Divert, false).unwrap_or(false)
+        && tasks::run(path, Kind::Divert).is_ok()
+    {
+        return Ok(());
+    }
     ensure!(
-        started,
-        "Права администратора не предоставлены: перехват не запущен."
+        prompt != super::Prompt::Never,
+        "Права администратора для перехвата не сохранены: нажмите «Предоставить права…»."
     );
-    Ok(())
+    let mut parameters = format!("--config \"{config}\" divert");
+    if remember {
+        parameters.push_str(&format!(" --remember {sid}"));
+    }
+    tasks::runas(program.as_os_str(), &parameters, false)
+        .context("Права администратора не предоставлены: перехват не запущен.")
 }

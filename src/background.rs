@@ -100,6 +100,9 @@ pub struct Snapshot {
 }
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause between attempts to start the helper without asking the user; it doubles after
+/// every failed attempt, up to 32 times.
+const DIVERT_RETRY: Duration = Duration::from_secs(60);
 const MAX_APP_LOGS: usize = 200;
 
 /// The last word from the elevated helper and what it has reported so far.
@@ -116,6 +119,13 @@ impl Divert {
     fn attached(&self) -> bool {
         self.seen
             .is_some_and(|seen| seen.elapsed() < DIVERT_TIMEOUT)
+    }
+    /// Enabled rules wait for a helper that has not failed: start it without a question.
+    fn wanted(&self, apps: &Apps) -> bool {
+        cfg!(windows)
+            && apps.rules.iter().any(|rule| rule.enabled)
+            && !self.attached()
+            && self.error.is_empty()
     }
 }
 
@@ -992,6 +1002,8 @@ pub async fn serve(store: Store) -> Result<()> {
     let endpoint = store.sidecar(".background.json");
     atomic_json(&endpoint, &metadata, Some(4096))?;
     drop(guard);
+    let path = store.path.clone();
+    tokio::task::spawn_blocking(move || crate::autostart::migrate(&path));
     {
         let owned = service.owned.lock().await;
         manager.set_udp(owned.udp_tunnels()).await;
@@ -1006,6 +1018,8 @@ pub async fn serve(store: Store) -> Result<()> {
     let (tray, mut tray_actions) = crate::tray::Tray::start(service.shutdown.child_token());
     let mut tray_poll = tokio::time::interval(Duration::from_secs(1));
     let mut backoff = crate::ssh::AcceptBackoff::default();
+    let mut divert_retry = Instant::now();
+    let divert_failures = Arc::new(AtomicU64::new(0));
     loop {
         let terminated = async {
             #[cfg(unix)]
@@ -1031,6 +1045,19 @@ pub async fn serve(store: Store) -> Result<()> {
                 if let Ok(owned) = service.owned.try_lock() {
                     let (states, waiting) = owned.manager.states().await;
                     tray.update(crate::tray::Status::count(&owned.config.tunnels, &states, &waiting));
+                    if Instant::now() >= divert_retry && owned.divert.wanted(&owned.apps) {
+                        let failures = divert_failures.load(Ordering::Relaxed).min(5) as u32;
+                        divert_retry = Instant::now() + DIVERT_RETRY * 2u32.pow(failures);
+                        let (path, failures) = (store.path.clone(), divert_failures.clone());
+                        tokio::task::spawn_blocking(move || {
+                            let ready = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| crate::divert::missing_components(dir).is_empty()));
+                            if ready == Some(true) && crate::divert::launch(&path, crate::divert::Prompt::Never).is_ok() {
+                                failures.store(0, Ordering::Relaxed);
+                            } else {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
+                    }
                 }
             },
             _ = tokio::time::sleep_until(backoff.resume_at()), if !backoff.ready() => backoff.resume(),
