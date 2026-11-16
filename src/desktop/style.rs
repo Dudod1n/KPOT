@@ -384,8 +384,14 @@ pub(super) fn lamps(ui: &mut egui::Ui, lamps: &[Lamp], blink_on: bool, pal: &Pal
         StrokeKind::Inside,
     );
     let inner = rect.shrink(3.0);
-    let gap = 2.0;
-    let width = (inner.width() - gap * (lamps.len() - 1) as f32) / lamps.len() as f32;
+    // Gaps go first when sectors get thin, so a very long list still fits the bar.
+    let count = lamps.len() as f32;
+    let gap = if (inner.width() - 2.0 * (count - 1.0)) / count < 2.0 {
+        0.0
+    } else {
+        2.0
+    };
+    let width = (inner.width() - gap * (count - 1.0)) / count;
     for (index, lamp) in lamps.iter().enumerate() {
         let left = inner.left() + index as f32 * (width + gap);
         let sector = Rect::from_min_size(

@@ -1396,19 +1396,28 @@ impl Desktop {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        if snapshot.config.tunnels.is_empty() {
+        let tunnels = &snapshot.config.tunnels;
+        // Only the rows the list shows: a hidden tunnel must not be selected or toggled.
+        let shown: Vec<&str> = tunnels
+            .iter()
+            .filter(|tunnel| {
+                in_filter(
+                    tunnels.len(),
+                    self.filter,
+                    Self::tunnel_group(self.state(tunnel)),
+                )
+            })
+            .map(|tunnel| tunnel.id.as_str())
+            .collect();
+        if shown.is_empty() {
             return;
         }
-        let index = snapshot
-            .config
-            .tunnels
+        let index = shown
             .iter()
-            .position(|t| Some(&t.id) == self.selected.as_ref())
+            .position(|id| Some(*id) == self.selected.as_deref())
             .unwrap_or(0);
-        let next = index
-            .saturating_add_signed(delta)
-            .min(snapshot.config.tunnels.len() - 1);
-        self.selected = Some(snapshot.config.tunnels[next].id.clone());
+        let next = index.saturating_add_signed(delta).min(shown.len() - 1);
+        self.selected = Some(shown[next].to_owned());
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if self.confirm.is_some() || self.dialog.is_some() || self.update.is_some() {
@@ -1675,13 +1684,19 @@ impl Desktop {
     /// The line under the header: state lights, «РАБОТАЮТ N ИЗ M» and, for long lists, filters.
     fn summary(&mut self, ctx: &egui::Context, pal: &Pal) {
         let apps = self.view == View::Apps;
-        let (lamps, running, waiting) = if apps {
+        let (lamps, running) = if apps {
             self.app_lamps(pal)
         } else {
             self.tunnel_lamps(pal)
         };
         let total = lamps.len();
+        // The same group the «Ждут» / «Без туннеля» filter shows, so both numbers agree.
+        let waiting = lamps
+            .iter()
+            .filter(|lamp| lamp.group == Group::Attention)
+            .count();
         let blink_on = self.blink_on();
+        let mut refiltered = false;
         egui::TopBottomPanel::top("summary")
             .frame(
                 egui::Frame::new()
@@ -1750,6 +1765,7 @@ impl Desktop {
                                 .clicked()
                             {
                                 *filter = group;
+                                refiltered = true;
                             }
                         }
                     } else {
@@ -1765,6 +1781,14 @@ impl Desktop {
                     }
                 });
             });
+        // A selection the new filter hides moves to the first row still shown.
+        if refiltered {
+            if apps {
+                self.move_app_selection(0);
+            } else {
+                self.move_selection(0);
+            }
+        }
     }
     fn tunnel_group(state: &str) -> Group {
         match state {
@@ -1773,12 +1797,11 @@ impl Desktop {
             _ => Group::Off,
         }
     }
-    fn tunnel_lamps(&self, pal: &Pal) -> (Vec<style::Lamp>, usize, usize) {
+    fn tunnel_lamps(&self, pal: &Pal) -> (Vec<style::Lamp>, usize) {
         let Some(snapshot) = &self.snapshot else {
-            return (Vec::new(), 0, 0);
+            return (Vec::new(), 0);
         };
         let mut running = 0;
-        let mut waiting = 0;
         let lamps = snapshot
             .config
             .tunnels
@@ -1787,7 +1810,6 @@ impl Desktop {
                 let state = self.state(tunnel);
                 let (label, color) = state_label(state);
                 running += usize::from(state == "running");
-                waiting += usize::from(state == "waiting");
                 style::Lamp {
                     color: tone_of(pal, color),
                     filled: !matches!(state, "stopped" | "idle"),
@@ -1798,7 +1820,7 @@ impl Desktop {
                 }
             })
             .collect();
-        (lamps, running, waiting)
+        (lamps, running)
     }
     fn tunnel_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Pal) {
         let tunnels = self
@@ -1825,14 +1847,9 @@ impl Desktop {
                         .color(pal.dim),
                     );
                 }
-                let filter = if tunnels.len() > style::LONG_LIST {
-                    self.filter
-                } else {
-                    Group::All
-                };
                 for tunnel in &tunnels {
                     let state = self.state(tunnel).to_owned();
-                    if filter != Group::All && Self::tunnel_group(&state) != filter {
+                    if !in_filter(tunnels.len(), self.filter, Self::tunnel_group(&state)) {
                         continue;
                     }
                     let (label, color) = state_label(&state);
@@ -3281,6 +3298,11 @@ enum Group {
     Off,
 }
 
+/// Whether a row of this group is shown: filters apply only to long lists.
+fn in_filter(len: usize, filter: Group, group: Group) -> bool {
+    len <= style::LONG_LIST || filter == Group::All || group == filter
+}
+
 fn tone_of(pal: &Pal, tone: Tone) -> Color32 {
     match tone {
         Tone::Ok => pal.ok,
@@ -3408,21 +3430,51 @@ fn list_row(
     }
 }
 
-/// A journal line: monospace, with a coloured mark on success and warning lines.
-fn log_line(ui: &mut egui::Ui, line: &str, pal: &Pal) {
-    let lower = line.to_lowercase();
-    let mark = if ["ошибк", "не удалось", "потерян", "разрыв", "отказ"]
-        .iter()
-        .any(|word| lower.contains(word))
-    {
-        Some(pal.warn)
-    } else if ["слушаем", "открыт", "выполнен", "загружен", "работает"]
-        .iter()
-        .any(|word| lower.contains(word))
-    {
-        Some(pal.ok)
+/// Words that mark a journal line, each in lower case and capitalised for a line start.
+/// Negated success words are failures: «туннель не работает», «действие не выполнено».
+const LOG_WARN: [(&str, &str); 11] = [
+    ("ошибк", "Ошибк"),
+    ("не удалось", "Не удалось"),
+    ("потерян", "Потерян"),
+    ("разрыв", "Разрыв"),
+    ("отказ", "Отказ"),
+    ("отклонен", "Отклонен"),
+    ("не работает", "Не работает"),
+    ("не выполнен", "Не выполнен"),
+    ("не открыт", "Не открыт"),
+    ("не загружен", "Не загружен"),
+    ("не слушаем", "Не слушаем"),
+];
+const LOG_OK: [(&str, &str); 5] = [
+    ("слушаем", "Слушаем"),
+    ("открыт", "Открыт"),
+    ("выполнен", "Выполнен"),
+    ("загружен", "Загружен"),
+    ("работает", "Работает"),
+];
+
+/// The mark of a journal line: a warning, a success or none; checked without allocating.
+fn log_tone(line: &str) -> Option<Tone> {
+    let has = |words: &[(&str, &str)]| {
+        words
+            .iter()
+            .any(|(lower, upper)| line.contains(lower) || line.contains(upper))
+    };
+    if has(&LOG_WARN) {
+        Some(Tone::Warn)
+    } else if has(&LOG_OK) {
+        Some(Tone::Ok)
     } else {
         None
+    }
+}
+
+/// A journal line: monospace, with a coloured mark on success and warning lines.
+fn log_line(ui: &mut egui::Ui, line: &str, pal: &Pal) {
+    let mark = match log_tone(line) {
+        Some(Tone::Warn) => Some(pal.warn),
+        Some(_) => Some(pal.ok),
+        None => None,
     };
     let response = ui.add(
         egui::Label::new(
@@ -6043,6 +6095,144 @@ mod tests {
         assert!(!render(&mut app, &ctx, [700.0, 500.0]).shapes.is_empty());
     }
 
+    /// Twelve tunnels: even ones running, odd ones stopped, the last one waiting for a password.
+    fn long_list() -> Snapshot {
+        let mut snapshot = snapshot();
+        snapshot.config.tunnels = (0..12)
+            .map(|index| {
+                let mut tunnel = tunnel();
+                tunnel.id = format!("t{index}");
+                tunnel.name = format!("туннель {index}");
+                tunnel
+            })
+            .collect();
+        snapshot.runtimes = (0..12)
+            .map(|index| {
+                (
+                    format!("t{index}"),
+                    crate::ssh::Runtime {
+                        state: if index % 2 == 0 { "running" } else { "stopped" }.into(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        snapshot
+            .prompts
+            .insert("t11".into(), pending("t11", "p11", "password"));
+        snapshot
+    }
+    #[test]
+    fn arrows_and_filter_change_never_select_a_hidden_tunnel() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        app.snapshot = Some(long_list());
+        app.deferred.insert("p11".into());
+        app.filter = Group::Live;
+        app.selected = Some("t0".into());
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("t2"));
+        app.move_selection(-1);
+        assert_eq!(app.selected.as_deref(), Some("t0"));
+        app.selected = Some("t10".into());
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("t10"), "Last shown row stays");
+        // Switching to a filter that hides the selection moves it to the first row shown.
+        click_label(&mut app, &ctx, "Выключены · 5");
+        assert_eq!(app.filter, Group::Off);
+        assert_eq!(app.selected.as_deref(), Some("t1"));
+        // A short list shows everything whatever filter was left.
+        app.snapshot.as_mut().unwrap().config.tunnels.truncate(3);
+        app.selected = Some("t0".into());
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("t1"));
+    }
+    #[test]
+    fn waiting_count_matches_the_attention_filter() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        let mut snapshot = long_list();
+        snapshot.runtimes.get_mut("t1").unwrap().state = "error".into();
+        app.snapshot = Some(snapshot);
+        app.deferred.insert("p11".into());
+        let output = render(&mut app, &ctx, [1000.0, 800.0]);
+        assert!(text_rect(&output, "! Ждут участия: 2").is_some());
+        assert!(text_rect(&output, "Ждут · 2").is_some());
+    }
+    #[test]
+    fn switched_on_rule_without_interception_is_without_tunnel() {
+        let rule = |enabled| crate::apps::AppRule {
+            enabled,
+            ..Default::default()
+        };
+        assert_eq!(
+            Desktop::app_group(&rule(true), "unavailable"),
+            Group::Attention
+        );
+        assert_eq!(Desktop::app_group(&rule(false), "unavailable"), Group::Off);
+        assert_eq!(Desktop::app_group(&rule(false), "stopped"), Group::Off);
+        assert_eq!(Desktop::app_group(&rule(true), "running"), Group::Live);
+    }
+    #[test]
+    fn journal_marks_negated_success_as_a_warning() {
+        for line in [
+            "example.com:443 отклонено: туннель не работает",
+            "example.com:443 напрямую: туннель не работает",
+            "Действие не выполнено: нет доступа",
+            "10:00:01 Ошибка подключения",
+            "Не удалось открыть порт",
+        ] {
+            assert_eq!(log_tone(line), Some(Tone::Warn), "{line}");
+        }
+        for line in [
+            "Слушаем 127.0.0.1:1080",
+            "10:02:11 Туннель работает",
+            "Помощник загружен",
+        ] {
+            assert_eq!(log_tone(line), Some(Tone::Ok), "{line}");
+        }
+        assert_eq!(log_tone("10:02:11 Правило включено"), None);
+    }
+    #[test]
+    fn state_bar_keeps_every_sector_inside_for_a_very_long_list() {
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let lamps: Vec<style::Lamp> = (0..300)
+            .map(|index| style::Lamp {
+                color: Color32::GREEN,
+                filled: true,
+                blink: false,
+                selected: false,
+                name: format!("{index}"),
+                group: Group::Live,
+            })
+            .collect();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                style::lamps(ui, &lamps, true, &style::pal(ctx));
+            });
+        });
+        let bar = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) if rect.fill == Color32::GREEN => Some(rect.rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bar.len(), 300);
+        let left = bar
+            .iter()
+            .map(|rect| rect.left())
+            .fold(f32::INFINITY, f32::min);
+        let right = bar.iter().map(|rect| rect.right()).fold(0.0, f32::max);
+        assert!(bar.iter().all(|rect| rect.width() > 0.0));
+        assert!(right - left <= 254.5, "bar spans {}", right - left);
+    }
     #[test]
     fn udp_is_offered_only_with_consent_and_its_state_shows_on_tunnel_and_rule() {
         let ctx = egui::Context::default();

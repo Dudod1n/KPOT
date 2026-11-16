@@ -114,18 +114,28 @@ impl Desktop {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        if snapshot.apps.is_empty() {
+        let rules = &snapshot.apps;
+        // Only the rows the list shows: a hidden rule must not be selected or toggled.
+        let shown: Vec<&str> = rules
+            .iter()
+            .filter(|rule| {
+                in_filter(
+                    rules.len(),
+                    self.app_filter,
+                    Self::app_group(rule, self.app_state(rule)),
+                )
+            })
+            .map(|rule| rule.id.as_str())
+            .collect();
+        if shown.is_empty() {
             return;
         }
-        let index = snapshot
-            .apps
+        let index = shown
             .iter()
-            .position(|rule| Some(&rule.id) == self.selected_app.as_ref())
+            .position(|id| Some(*id) == self.selected_app.as_deref())
             .unwrap_or(0);
-        let next = index
-            .saturating_add_signed(delta)
-            .min(snapshot.apps.len() - 1);
-        self.selected_app = Some(snapshot.apps[next].id.clone());
+        let next = index.saturating_add_signed(delta).min(shown.len() - 1);
+        self.selected_app = Some(shown[next].to_owned());
     }
     pub(super) fn toggle_app(&mut self, ctx: &egui::Context, rule: &AppRule) {
         if !self.busy_apps.insert(rule.id.clone()) {
@@ -182,20 +192,21 @@ impl Desktop {
         self.view = View::Tunnels;
         self.dialog = Some(Dialog::Form(Box::new(form)));
     }
-    pub(super) fn app_group(state: &str) -> Group {
+    /// A switched-on rule without interception is «без туннеля», not «выключено».
+    pub(super) fn app_group(rule: &AppRule, state: &str) -> Group {
         match state {
             "running" => Group::Live,
             "blocked" | "direct" | "orphan" | "elevation" => Group::Attention,
+            "unavailable" if rule.enabled => Group::Attention,
             _ => Group::Off,
         }
     }
-    /// State lights of the rules, the number going through a tunnel and the number without one.
-    pub(super) fn app_lamps(&self, pal: &Pal) -> (Vec<style::Lamp>, usize, usize) {
+    /// State lights of the rules and the number going through a tunnel.
+    pub(super) fn app_lamps(&self, pal: &Pal) -> (Vec<style::Lamp>, usize) {
         let Some(snapshot) = &self.snapshot else {
-            return (Vec::new(), 0, 0);
+            return (Vec::new(), 0);
         };
         let mut running = 0;
-        let mut trouble = 0;
         let lamps = snapshot
             .apps
             .iter()
@@ -203,18 +214,17 @@ impl Desktop {
                 let state = self.app_state(rule);
                 let (label, color) = app_state_label(state);
                 running += usize::from(state == "running");
-                trouble += usize::from(Self::app_group(state) == Group::Attention);
                 style::Lamp {
                     color: tone_of(pal, color),
                     filled: !matches!(state, "stopped" | "unavailable"),
                     blink: matches!(state, "blocked" | "direct" | "elevation"),
                     selected: self.selected_app.as_ref() == Some(&rule.id),
                     name: format!("{}: {label}", rule.name),
-                    group: Self::app_group(state),
+                    group: Self::app_group(rule, state),
                 }
             })
             .collect();
-        (lamps, running, trouble)
+        (lamps, running)
     }
     pub(super) fn apps_side(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Pal) {
         let rules = self
@@ -241,14 +251,9 @@ impl Desktop {
                         .color(pal.dim),
                     );
                 }
-                let filter = if rules.len() > style::LONG_LIST {
-                    self.app_filter
-                } else {
-                    Group::All
-                };
                 for rule in &rules {
                     let state = self.app_state(rule).to_owned();
-                    if filter != Group::All && Self::app_group(&state) != filter {
+                    if !in_filter(rules.len(), self.app_filter, Self::app_group(rule, &state)) {
                         continue;
                     }
                     let (label, color) = app_state_label(&state);
