@@ -44,8 +44,9 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(notes.read_text(), '### Fixed\n- Port cleanup.\n')
             self.assertEqual(len(list(output.iterdir())), 13)
             self.assertEqual((output / 'WinDivert64.sys').read_bytes(), b'WinDivert64.sys')
-            sums = dict(reversed(line.split('  ', 1))
-                        for line in (output / 'SHA256SUMS').read_text().splitlines())
+            lines = (output / 'SHA256SUMS').read_text().splitlines()
+            sums = dict(reversed(line.split('  ', 1)) for line in lines)
+            self.assertEqual(len(sums), len(lines))
             self.assertEqual(set(sums), {path.name for path in output.iterdir()} - {'SHA256SUMS'})
             for name, digest in sums.items():
                 self.assertEqual(digest, hashlib.sha256((output / name).read_bytes()).hexdigest())

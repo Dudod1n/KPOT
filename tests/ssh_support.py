@@ -22,6 +22,10 @@ import asyncssh
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 AUTH_TIMEOUT = 2.0
 REQUEST_TIMEOUT = 15.0
+# A probe that neither connects nor is refused this long means the listener is still there.
+PROBE_TIMEOUT = 10.0
+# How long a listener may keep accepting probes after its tunnel stops.
+CLOSE_TIMEOUT = 3.0
 
 
 @dataclass
@@ -178,9 +182,10 @@ class Client:
 def attach_udp(path: Path, version: int = 1) -> socket.socket:
     """Open the helper's binary UDP channel like the elevated helper does."""
     metadata = _metadata(endpoint_path(Path(path).expanduser().resolve()))
+    auth_deadline = time.monotonic() + AUTH_TIMEOUT
     connection = socket.create_connection(('127.0.0.1', metadata['port']), timeout=AUTH_TIMEOUT)
     try:
-        _handshake(connection, metadata['token'], time.monotonic() + AUTH_TIMEOUT)
+        _handshake(connection, metadata['token'], auth_deadline)
         deadline = time.monotonic() + REQUEST_TIMEOUT
         connection.settimeout(REQUEST_TIMEOUT)
         connection.sendall(json.dumps({'token': metadata['token'], 'command': 'udp_attach',
@@ -234,8 +239,9 @@ _issued_ports = set()
 def unused_port():
     """A free port for a listener that the tested process opens later.
 
-    The port lies below the ephemeral ranges (Linux 32768+, Windows and macOS 49152+), so
-    outgoing connections and `bind` to port 0 never take it while it waits for its listener."""
+    The port lies below the default ephemeral ranges (Linux 32768+, Windows and macOS 49152+),
+    so with default settings outgoing connections and `bind` to port 0 do not take it while it
+    waits for its listener. Another process that binds the port explicitly still can."""
     for _ in range(100):
         port = random.randint(20000, 32767)
         if port in _issued_ports:
@@ -376,12 +382,16 @@ class SSHFixtures:
 
     async def assert_closed(self, port):
         # Remote teardown completes after SSH disconnect reaches the test server. Only a
-        # probe that connects counts against the 3 seconds: Windows takes about 2 seconds
+        # probe that connects counts against CLOSE_TIMEOUT: Windows takes about 2 seconds
         # to refuse a connection to a closed loopback port.
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + CLOSE_TIMEOUT
         while True:
             try:
-                _, writer = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', port), 10)
+                _, writer = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', port),
+                                                   PROBE_TIMEOUT)
+            except TimeoutError:
+                # TimeoutError is an OSError, but an unanswered probe is not a refusal.
+                self.fail(f'Probe to port {port} timed out: the listener may still be open')
             except OSError:
                 return
             writer.close()

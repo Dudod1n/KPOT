@@ -7,8 +7,9 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
+import ssh_support
 from ssh_support import (Client, Config, Endpoint, SSHFixtures, Store, Tunnel, _handshake, _metadata,
                          _receive_line, endpoint_path)
 
@@ -149,6 +150,27 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         async with await asyncio.start_server(self.close_connection, '127.0.0.1', 0) as server:
             with self.assertRaisesRegex(AssertionError, 'still open'):
                 await self.assert_closed(server.sockets[0].getsockname()[1])
+
+    async def test_slow_refusal_does_not_count_against_the_deadline(self):
+        async def connect(host, port):
+            calls.append(port)
+            if len(calls) == 1:
+                return Mock(), Mock(wait_closed=AsyncMock())
+            await asyncio.sleep(.2)
+            raise ConnectionRefusedError
+        calls = []
+        with (patch.object(ssh_support, 'CLOSE_TIMEOUT', .1),
+              patch.object(ssh_support.asyncio, 'open_connection', connect)):
+            await self.assert_closed(1)
+        self.assertEqual(len(calls), 2)
+
+    async def test_unanswered_probe_is_rejected(self):
+        async def connect(host, port):
+            await asyncio.sleep(10)
+        with (patch.object(ssh_support, 'PROBE_TIMEOUT', .05),
+              patch.object(ssh_support.asyncio, 'open_connection', connect),
+              self.assertRaisesRegex(AssertionError, 'timed out')):
+            await self.assert_closed(1)
 
 
 if __name__ == '__main__':
