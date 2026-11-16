@@ -9,7 +9,7 @@
 //! queue drops from the flow that holds most, so a flood into the port of one flow, which
 //! needs no credentials, costs the other flows neither their place nor their turn.
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     ops::Range,
@@ -39,6 +39,10 @@ const MAX_CONTROL: usize = 8192;
 const MAX_PEERS: usize = 32;
 /// Flow ids the relay closed itself, remembered so that each is answered by one `CLOSE` only.
 const MAX_REFUSED: usize = 65_536;
+/// How long a closed id stays refused. The client does not answer a `CLOSE` of the relay and
+/// may give the id to a new flow later, so the id is held only while datagrams sent before the
+/// client read the `CLOSE` can still arrive.
+const REFUSED_HOLD: Duration = Duration::from_secs(10);
 /// Bytes a flow may write to the client before the next flow with answers takes its turn.
 const TURN_BYTES: usize = 2048;
 
@@ -140,8 +144,9 @@ struct Relay {
     stats: RelayStats,
     scratch: Vec<u8>,
     chunk: Vec<u8>,
-    /// Flows refused with `CLOSE`: further datagrams of them are dropped quietly.
-    refused: HashSet<u32>,
+    /// Flows refused with `CLOSE` and when: their datagrams are dropped quietly for
+    /// `REFUSED_HOLD`.
+    refused: HashMap<u32, Instant>,
     /// Bytes waiting in all flow queues together.
     flow_bytes: usize,
     /// Flows the descriptor limit allows, besides the relay's own descriptors.
@@ -296,7 +301,7 @@ impl Relay {
             stats: RelayStats::default(),
             scratch: vec![0; 65_536],
             chunk: vec![0; READ_CHUNK],
-            refused: HashSet::new(),
+            refused: HashMap::new(),
             flow_bytes: 0,
             descriptor_flows: RELAY_MAX_FLOWS,
         }
@@ -438,7 +443,7 @@ impl Relay {
             // the client forgets the id once it reads the `CLOSE`.
             for flow in expired {
                 self.remove_flow(flow);
-                self.refuse(flow, CloseReason::Idle);
+                self.refuse(flow, CloseReason::Idle, now);
             }
             self.stats.flows_active = self.flows.len() as u32;
             let stats = self.stats.clone();
@@ -461,11 +466,15 @@ impl Relay {
     }
 
     /// Closes a flow from this side; further datagrams of it are dropped quietly.
-    fn refuse(&mut self, flow: u32, reason: CloseReason) {
+    fn refuse(&mut self, flow: u32, reason: CloseReason, now: Instant) {
         if self.refused.len() >= MAX_REFUSED {
-            self.refused.clear();
+            self.refused
+                .retain(|_, at| now.saturating_duration_since(*at) < REFUSED_HOLD);
+            if self.refused.len() >= MAX_REFUSED {
+                self.refused.clear();
+            }
         }
-        self.refused.insert(flow);
+        self.refused.insert(flow, now);
         self.push_control(&Frame::Close { flow, reason });
     }
 
@@ -559,18 +568,25 @@ impl Relay {
         if !self.flows.contains_key(&id) {
             // One `CLOSE` per closed flow, not one per datagram: datagrams that were already
             // on their way are dropped quietly.
-            if self.refused.contains(&id) {
-                self.stats.drops.add(DropReason::Channel);
-                return;
+            match self.refused.get(&id) {
+                Some(at) if now.saturating_duration_since(*at) < REFUSED_HOLD => {
+                    self.stats.drops.add(DropReason::Channel);
+                    return;
+                }
+                // The hold is over: the client may have given the id to a new flow.
+                Some(_) => {
+                    self.refused.remove(&id);
+                }
+                None => {}
             }
             if self.flows.len() >= usize::from(settings.max_flows) {
                 self.stats.flows_refused += 1;
-                self.refuse(id, CloseReason::Limit);
+                self.refuse(id, CloseReason::Limit, now);
                 return;
             }
             let Ok((socket, dual)) = open_socket() else {
                 self.stats.drops.add(DropReason::Channel);
-                self.refuse(id, CloseReason::Socket);
+                self.refuse(id, CloseReason::Socket, now);
                 return;
             };
             self.stats.flows_opened += 1;
@@ -1032,6 +1048,30 @@ mod tests {
         assert_eq!(small_before_second_large, 12);
         assert!(relay.data.is_empty() && relay.turns.is_empty());
         assert_eq!((relay.data_count, relay.data_bytes), (0, 0));
+    }
+
+    #[test]
+    fn an_id_closed_by_the_relay_opens_a_new_flow_after_the_hold() {
+        let mut relay = Relay::new();
+        let settings = Settings {
+            max_flows: 4,
+            idle_ms: 1000,
+            idle_bidirectional_ms: 1000,
+        };
+        let peer = "127.0.0.1:9".parse().unwrap();
+        let closed = Instant::now();
+        relay.refuse(7, CloseReason::Idle, closed);
+
+        // A datagram that crossed the `CLOSE` is dropped.
+        relay.send(settings, 7, peer, b"late", closed + REFUSED_HOLD / 2);
+        assert!(!relay.flows.contains_key(&7));
+        assert_eq!(relay.stats.drops.get(DropReason::Channel), 1);
+
+        // The client never answers the `CLOSE`; a later flow with the same id still opens.
+        relay.send(settings, 7, peer, b"new", closed + REFUSED_HOLD);
+        assert!(relay.flows.contains_key(&7));
+        assert!(!relay.refused.contains_key(&7));
+        assert_eq!(relay.stats.flows_opened, 1);
     }
 
     #[test]
