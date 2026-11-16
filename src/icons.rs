@@ -19,7 +19,7 @@ pub fn tray_icon(badge: Option<[u8; 4]>) -> IconData {
                 let pixel = if (24..30).contains(&x) && (24..30).contains(&y) {
                     color
                 } else {
-                    [16, 23, 26, 255]
+                    [16, 17, 19, 255]
                 };
                 let offset = ((y * icon.width + x) * 4) as usize;
                 icon.rgba[offset..offset + 4].copy_from_slice(&pixel);
@@ -59,7 +59,7 @@ mod tests {
             <[u8; 4]>::try_from(&icon.rgba[offset..offset + 4]).unwrap()
         };
         assert_eq!(pixel(&badged, 26, 26), color);
-        assert_eq!(pixel(&badged, 23, 26), [16, 23, 26, 255]);
+        assert_eq!(pixel(&badged, 23, 26), [16, 17, 19, 255]);
         assert_eq!(pixel(&badged, 31, 31), pixel(&original, 31, 31));
         for y in 0..32 {
             for x in 0..32 {

@@ -260,7 +260,7 @@ pub fn run(
         "КРОТ",
         desktop::native_options(),
         Box::new(move |cc| {
-            desktop::configure(&cc.egui_ctx, "dark");
+            desktop::configure(&cc.egui_ctx, crate::config::THEMES[0]);
             let (tx, rx) = mpsc::channel();
             let mut app = Launcher {
                 store,
