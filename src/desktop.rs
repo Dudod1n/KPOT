@@ -116,7 +116,17 @@ pub(crate) fn native_options() -> eframe::NativeOptions {
     }
 }
 
-/// Палитра цветной темы. Смысловые цвета заменяют CYAN, GREEN, AMBER и RED в `tone`.
+/// Смысловой цвет интерфейса; конкретный цвет выбирает `tone` по теме.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Accent,
+    Ok,
+    Warn,
+    Error,
+    Dim,
+}
+
+/// Палитра цветной темы.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color32,
@@ -134,15 +144,13 @@ struct Palette {
 }
 
 impl Palette {
-    fn tone(&self, color: Color32) -> Color32 {
-        match color {
-            CYAN => self.accent,
-            GREEN => self.ok,
-            AMBER => self.warn,
-            RED => self.error,
-            DIM => self.dim,
-            INK => self.ink,
-            other => other,
+    fn tone(&self, tone: Tone) -> Color32 {
+        match tone {
+            Tone::Accent => self.accent,
+            Tone::Ok => self.ok,
+            Tone::Warn => self.warn,
+            Tone::Error => self.error,
+            Tone::Dim => self.dim,
         }
     }
 }
@@ -164,7 +172,7 @@ fn palette(theme: &str) -> Option<Palette> {
             ink: rgb(241, 239, 233),
             dim: rgb(166, 168, 171),
             accent: rgb(255, 196, 0),
-            ok: rgb(255, 196, 0),
+            ok: rgb(124, 214, 108),
             warn: rgb(255, 159, 69),
             error: rgb(255, 90, 54),
         },
@@ -178,7 +186,7 @@ fn palette(theme: &str) -> Option<Palette> {
             ink: rgb(230, 234, 242),
             dim: rgb(154, 166, 189),
             accent: rgb(169, 196, 255),
-            ok: rgb(169, 196, 255),
+            ok: rgb(120, 220, 170),
             warn: rgb(255, 180, 84),
             error: rgb(255, 122, 107),
         },
@@ -192,7 +200,7 @@ fn palette(theme: &str) -> Option<Palette> {
             ink: rgb(245, 236, 232),
             dim: rgb(196, 168, 162),
             accent: rgb(255, 177, 153),
-            ok: rgb(255, 177, 153),
+            ok: rgb(160, 220, 130),
             warn: rgb(255, 210, 63),
             error: rgb(255, 75, 43),
         },
@@ -206,7 +214,7 @@ fn palette(theme: &str) -> Option<Palette> {
             ink: rgb(228, 230, 216),
             dim: rgb(163, 168, 142),
             accent: rgb(194, 184, 106),
-            ok: rgb(194, 184, 106),
+            ok: rgb(150, 196, 110),
             warn: rgb(232, 135, 90),
             error: rgb(255, 95, 109),
         },
@@ -295,20 +303,25 @@ pub(crate) fn configure(ctx: &egui::Context, theme: &str) {
     });
 }
 
-fn tone(ui: &egui::Ui, color: Color32) -> Color32 {
-    if ui.visuals().dark_mode {
-        ui.data(|data| data.get_temp::<Palette>(palette_id()))
-            .map_or(color, |colors| colors.tone(color))
-    } else if color == GREEN {
-        Color32::from_rgb(51, 101, 66)
-    } else if color == AMBER {
-        Color32::from_rgb(130, 89, 28)
-    } else if color == RED {
-        Color32::from_rgb(171, 52, 64)
-    } else if color == CYAN {
-        Color32::from_rgb(22, 102, 121)
-    } else {
-        ui.visuals().weak_text_color()
+fn tone(ui: &egui::Ui, tone: Tone) -> Color32 {
+    if !ui.visuals().dark_mode {
+        return match tone {
+            Tone::Accent => Color32::from_rgb(22, 102, 121),
+            Tone::Ok => Color32::from_rgb(51, 101, 66),
+            Tone::Warn => Color32::from_rgb(130, 89, 28),
+            Tone::Error => Color32::from_rgb(171, 52, 64),
+            Tone::Dim => ui.visuals().weak_text_color(),
+        };
+    }
+    if let Some(colors) = ui.data(|data| data.get_temp::<Palette>(palette_id())) {
+        return colors.tone(tone);
+    }
+    match tone {
+        Tone::Accent => CYAN,
+        Tone::Ok => GREEN,
+        Tone::Warn => AMBER,
+        Tone::Error => RED,
+        Tone::Dim => DIM,
     }
 }
 
@@ -333,15 +346,15 @@ fn mascot(state: &str, frame: usize) -> String {
     }
 }
 
-fn state_label(state: &str) -> (&'static str, Color32) {
+fn state_label(state: &str) -> (&'static str, Tone) {
     match state {
-        "running" => ("↟ Работает", GREEN),
-        "connecting" => ("◷ Подключение…", AMBER),
-        "reconnecting" => ("◷ Восстановление…", AMBER),
-        "waiting" => ("! Нужно ваше участие", AMBER),
-        "error" => ("! Ошибка", RED),
-        "stopped" => ("○ Остановлен", DIM),
-        _ => ("◌ Создан", DIM),
+        "running" => ("↟ Работает", Tone::Ok),
+        "connecting" => ("◷ Подключение…", Tone::Warn),
+        "reconnecting" => ("◷ Восстановление…", Tone::Warn),
+        "waiting" => ("! Нужно ваше участие", Tone::Warn),
+        "error" => ("! Ошибка", Tone::Error),
+        "stopped" => ("○ Остановлен", Tone::Dim),
+        _ => ("◌ Создан", Tone::Dim),
     }
 }
 
@@ -1526,7 +1539,7 @@ impl Desktop {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("КРОТ / ДИСПЕТЧЕРСКАЯ").color(tone(ui, CYAN)));
+                ui.label(RichText::new("КРОТ / ДИСПЕТЧЕРСКАЯ").color(tone(ui, Tone::Accent)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let version_response = ui
                         .add_enabled(
@@ -1625,9 +1638,12 @@ impl Desktop {
                 })
                 .unwrap_or_default();
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(tone(ui, GREEN), format!("● Работают {running} из {total}"));
+                ui.colored_label(
+                    tone(ui, Tone::Ok),
+                    format!("● Работают {running} из {total}"),
+                );
                 if waiting > 0 {
-                    ui.colored_label(tone(ui, AMBER), format!("Ждут участия: {waiting}"));
+                    ui.colored_label(tone(ui, Tone::Warn), format!("Ждут участия: {waiting}"));
                 }
                 ui.weak(if apps {
                     "↑ ↓ Выбор   Space Вкл / выкл   1 2 Вкладки"
@@ -1637,7 +1653,7 @@ impl Desktop {
             });
             if !self.error.is_empty() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(tone(ui, RED), &self.error);
+                    ui.colored_label(tone(ui, Tone::Error), &self.error);
                     if ui.small_button("Скрыть").clicked() {
                         self.error.clear();
                     }
@@ -1708,7 +1724,7 @@ impl Desktop {
                     } else {
                         ui.heading("На участке");
                         ui.add_space(24.0);
-                        ui.label(RichText::new(mascot("idle", 0)).color(tone(ui, DIM)));
+                        ui.label(RichText::new(mascot("idle", 0)).color(tone(ui, Tone::Dim)));
                         ui.add_space(16.0);
                         ui.label("Создайте туннель, чтобы открыть проход к нужному сервису.");
                         ui.weak("L — локальный порт, R — обратный, D — SOCKS5.");
@@ -1734,7 +1750,7 @@ impl Desktop {
                 .color(tone(ui, color)),
         );
         ui.add_space(16.0);
-        ui.colored_label(tone(ui, CYAN), tunnel.route());
+        ui.colored_label(tone(ui, Tone::Accent), tunnel.route());
         ui.weak(match tunnel.kind.as_str() {
             "R" => "Порт на SSH-сервере → сервис на вашем устройстве",
             "D" => "Локальный SOCKS5-прокси → сеть SSH-сервера",
@@ -1780,7 +1796,7 @@ impl Desktop {
             .and_then(|snapshot| snapshot.prompts.get(&tunnel.id))
         {
             ui.separator();
-            ui.colored_label(tone(ui, AMBER), prompt_title(&pending.request.kind));
+            ui.colored_label(tone(ui, Tone::Warn), prompt_title(&pending.request.kind));
             ui.weak(format!(
                 "{} · {}",
                 pending.request.hop,
@@ -1800,7 +1816,7 @@ impl Desktop {
             if ui
                 .add_enabled(
                     !self.busy_tunnels.contains(&tunnel.id),
-                    egui::Button::new(RichText::new(action).color(tone(ui, CYAN))),
+                    egui::Button::new(RichText::new(action).color(tone(ui, Tone::Accent))),
                 )
                 .clicked()
             {
@@ -1822,7 +1838,7 @@ impl Desktop {
                 )))));
             }
             if ui
-                .button(RichText::new("Удалить").color(tone(ui, RED)))
+                .button(RichText::new("Удалить").color(tone(ui, Tone::Error)))
                 .clicked()
             {
                 self.confirm = Some(Confirm::Delete {
@@ -1849,18 +1865,18 @@ impl Desktop {
             .cloned()
             .unwrap_or_default();
         let (text, color) = if !consent {
-            ("выключен".to_owned(), DIM)
+            ("выключен".to_owned(), Tone::Dim)
         } else {
             let color = match runtime.state.as_str() {
-                "running" => GREEN,
-                "unavailable" => RED,
-                _ => AMBER,
+                "running" => Tone::Ok,
+                "unavailable" => Tone::Error,
+                _ => Tone::Warn,
             };
             (crate::udp::state_text(&runtime), color)
         };
         ui.colored_label(tone(ui, color), format!("UDP через сервер: {text}"));
         if !snapshot.udp_error.is_empty() {
-            ui.colored_label(tone(ui, RED), &snapshot.udp_error);
+            ui.colored_label(tone(ui, Tone::Error), &snapshot.udp_error);
         }
         if let Some(metrics) = snapshot.udp_metrics.get(&tunnel.id) {
             let lost: u64 =
@@ -1937,7 +1953,7 @@ impl Desktop {
                     } else {
                         ui.add_enabled(false, egui::Checkbox::new(&mut false, if settings.error.is_empty() { "Автозапуск: проверяем состояние…" } else { "Автозапуск недоступен" }));
                     }
-                    if !settings.error.is_empty() { ui.colored_label(tone(ui, RED), &settings.error); }
+                    if !settings.error.is_empty() { ui.colored_label(tone(ui, Tone::Error), &settings.error); }
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
                         if ui.add_enabled(!settings.busy, egui::Button::new("Отмена")).clicked() { action = DialogAction::Close; }
@@ -1956,10 +1972,10 @@ impl Desktop {
                             "trust" | "hostchanged" => {
                                 if request.kind == "hostchanged" {
                                     ui.label("Сохранённый ключ:");
-                                    ui.colored_label(tone(ui, AMBER), &request.old_fingerprint);
+                                    ui.colored_label(tone(ui, Tone::Warn), &request.old_fingerprint);
                                 }
                                 ui.label("Полученный ключ:");
-                                ui.colored_label(tone(ui, AMBER), &request.new_fingerprint);
+                                ui.colored_label(tone(ui, Tone::Warn), &request.new_fingerprint);
                                 ui.weak("Сверьте отпечаток с администратором по независимому каналу.");
                                 if request.kind == "hostchanged" { ui.checkbox(&mut prompt.verified, "Я проверил новый отпечаток"); }
                             }
@@ -2011,7 +2027,7 @@ impl Desktop {
                     });
                     match self.update_check {
                         UpdateCheck::Current => { ui.label("Обновлений нет."); }
-                        UpdateCheck::Failed => { ui.colored_label(tone(ui, RED), "Не удалось проверить обновления. Проверьте подключение к сети и повторите попытку."); }
+                        UpdateCheck::Failed => { ui.colored_label(tone(ui, Tone::Error), "Не удалось проверить обновления. Проверьте подключение к сети и повторите попытку."); }
                         _ => {}
                     }
                     if ui.button("Назад").clicked() { action = DialogAction::Close; }
@@ -2197,19 +2213,19 @@ impl Desktop {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.label(RichText::new("КРОТ").size(30.0));
                     ui.colored_label(
-                        tone(ui, CYAN),
+                        tone(ui, Tone::Accent),
                         concat!("Версия ", env!("CARGO_PKG_VERSION")),
                     );
                     ui.weak("Ваши туннели. Наша работа.");
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(mascot("head", self.frame()))
-                            .color(tone(ui, AMBER))
+                            .color(tone(ui, Tone::Warn))
                             .size(if max_height < 450.0 { 14.0 } else { 18.0 }),
                     );
                     ui.add_space(10.0);
                     let quote = self.about_quote.unwrap_or(0);
-                    ui.colored_label(tone(ui, AMBER), format!("«{}»", ABOUT_QUOTES[quote]));
+                    ui.colored_label(tone(ui, Tone::Warn), format!("«{}»", ABOUT_QUOTES[quote]));
                     if ui.button("Ещё фраза").clicked() {
                         action = DialogAction::NextAboutQuote;
                     }
@@ -2275,10 +2291,14 @@ impl Desktop {
             "Все проходы на месте"
         };
         ui.label(title);
-        ui.label(
-            RichText::new(mascot("head", self.frame()))
-                .color(tone(ui, if waiting + errors > 0 { AMBER } else { GREEN })),
-        );
+        ui.label(RichText::new(mascot("head", self.frame())).color(tone(
+            ui,
+            if waiting + errors > 0 {
+                Tone::Warn
+            } else {
+                Tone::Ok
+            },
+        )));
         ui.label(format!(
             "{} из {} работают · {} ждут вас · {} с ошибкой",
             running,
@@ -2302,7 +2322,7 @@ impl Desktop {
                     let (state, color) = if tunnel.enabled {
                         state_label(self.state(&tunnel))
                     } else {
-                        ("○ Выключен при запуске", DIM)
+                        ("○ Выключен при запуске", Tone::Dim)
                     };
                     ui.horizontal_wrapped(|ui| {
                         if ui
@@ -2360,7 +2380,7 @@ impl Desktop {
                     ui.label(format!("«{name}» будет удалён из настроек. Его соединение и порт закроются."));
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Отмена").clicked() { choice = 1; }
-                        if ui.button(RichText::new("Удалить").color(tone(ui, RED))).clicked() { choice = 2; }
+                        if ui.button(RichText::new("Удалить").color(tone(ui, Tone::Error))).clicked() { choice = 2; }
                     });
                 }
                 Confirm::DeleteApp { name, .. } => {
@@ -2368,7 +2388,7 @@ impl Desktop {
                     ui.label(format!("«{name}» будет удалено. Приложение снова пойдёт в сеть напрямую."));
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Отмена").clicked() { choice = 1; }
-                        if ui.button(RichText::new("Удалить").color(tone(ui, RED))).clicked() { choice = 2; }
+                        if ui.button(RichText::new("Удалить").color(tone(ui, Tone::Error))).clicked() { choice = 2; }
                     });
                 }
                 Confirm::UdpConsent { name, .. } => {
@@ -2379,7 +2399,7 @@ impl Desktop {
                     ui.weak("Согласие действует только для этого сервера и учётной записи. Выключение UDP, смена сервера или удаление туннеля удаляют помощник с сервера, если он доступен.");
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Отмена").clicked() { choice = 1; }
-                        if ui.button(RichText::new("Загрузить и включить").color(tone(ui, CYAN))).clicked() { choice = 2; }
+                        if ui.button(RichText::new("Загрузить и включить").color(tone(ui, Tone::Accent))).clicked() { choice = 2; }
                     });
                 }
                 Confirm::Discard { .. } => {
@@ -2400,10 +2420,10 @@ impl Desktop {
                     ui.weak("Остановить КРОТ и закрыть соединения можно через меню значка в трее или «Q Выход».");
                     ui.add_enabled_ui(!*busy, |ui| {
                         ui.checkbox(dont_show_again, "Больше не показывать");
-                        if !error.is_empty() { ui.colored_label(tone(ui, RED), error.as_str()); }
+                        if !error.is_empty() { ui.colored_label(tone(ui, Tone::Error), error.as_str()); }
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Назад").clicked() { choice = 1; }
-                            if ui.button(RichText::new("Понятно").color(tone(ui, CYAN))).clicked() { choice = 2; }
+                            if ui.button(RichText::new("Понятно").color(tone(ui, Tone::Accent))).clicked() { choice = 2; }
                         });
                     });
                     if *busy { ui.weak("Запоминаем выбор…"); }
@@ -2416,8 +2436,8 @@ impl Desktop {
                     ui.add_enabled_ui(!self.shutdown_busy, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Назад").clicked() { choice = 1; }
-                            if ui.button(RichText::new("Оставить в фоне").color(tone(ui, CYAN))).clicked() { choice = 2; }
-                            if ui.button(RichText::new("Остановить КРОТ").color(tone(ui, RED))).clicked() { choice = 3; }
+                            if ui.button(RichText::new("Оставить в фоне").color(tone(ui, Tone::Accent))).clicked() { choice = 2; }
+                            if ui.button(RichText::new("Остановить КРОТ").color(tone(ui, Tone::Error))).clicked() { choice = 3; }
                         });
                     });
                     if self.shutdown_busy { ui.weak("Закрываем соединения…"); }
@@ -2581,7 +2601,7 @@ impl Desktop {
                         "До завершения скачивания и проверки файлов туннели продолжат работать.",
                     );
                     if !update.error.is_empty() {
-                        ui.colored_label(tone(ui, RED), &update.error);
+                        ui.colored_label(tone(ui, Tone::Error), &update.error);
                     }
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Обновить").clicked() {
@@ -2610,7 +2630,7 @@ impl Desktop {
                     ui.label("Запускаем установщик…");
                 }
                 UpdateStage::Failed(error) => {
-                    ui.colored_label(tone(ui, RED), error);
+                    ui.colored_label(tone(ui, Tone::Error), error);
                     if !update.error.is_empty() {
                         ui.label(&update.error);
                     }
@@ -2801,7 +2821,7 @@ fn endpoint_view(
     let mut browse = false;
     ui.push_id(id, |ui| {
         ui.separator();
-        ui.label(RichText::new(title).color(tone(ui, CYAN)));
+        ui.label(RichText::new(title).color(tone(ui, Tone::Accent)));
         field(ui, "SSH-хост", &mut endpoint.host);
         ui.columns(2, |columns| {
             field(&mut columns[0], "SSH-порт", port);
@@ -2838,7 +2858,7 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
         "Новый туннель"
     });
     if !form.error.is_empty() {
-        ui.colored_label(tone(ui, RED), &form.error);
+        ui.colored_label(tone(ui, Tone::Error), &form.error);
     }
     let content_height = max_height - if form.error.is_empty() { 0.0 } else { 45.0 };
     ui.add_enabled_ui(!form.busy && !form.picking(), |ui| {
@@ -2854,7 +2874,7 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
                 action = DialogAction::BrowseKey(KeyTarget::Server);
             }
             ui.separator();
-            ui.label(RichText::new("Переадресация").color(tone(ui, CYAN)));
+            ui.label(RichText::new("Переадресация").color(tone(ui, Tone::Accent)));
             ui.weak(match form.draft.kind.as_str() {
                 "R" => "Порт на SSH-сервере → сервис на вашем устройстве.",
                 "D" => "Локальный SOCKS5-прокси → сеть SSH-сервера.",
@@ -4714,7 +4734,7 @@ mod tests {
             let mut colors = Vec::new();
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    colors = [CYAN, GREEN, AMBER, RED]
+                    colors = [Tone::Accent, Tone::Ok, Tone::Warn, Tone::Error]
                         .map(|color| tone(ui, color))
                         .to_vec();
                 });
@@ -4733,6 +4753,7 @@ mod tests {
             let colors = toned(&ctx);
             assert_ne!(colors[2], colors[3], "{theme}: ожидание и ошибка совпали");
             assert_ne!(colors[0], colors[3], "{theme}: акцент и ошибка совпали");
+            assert_ne!(colors[0], colors[1], "{theme}: акцент и «работает» совпали");
             assert_eq!(
                 visuals.widgets.inactive.bg_stroke.color,
                 palette(theme).unwrap().line
