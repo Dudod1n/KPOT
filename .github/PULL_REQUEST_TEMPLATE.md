@@ -23,4 +23,5 @@
 
 ## Связанные задачи
 
-Добавьте ссылку на issue, если она есть.
+Укажите задачу строкой `Closes #N`, если она есть. В PR `dev → main` укажите каждую
+задачу отдельной строкой по [правилам](https://github.com/Dudod1n/KPOT/blob/dev/docs/WORKFLOW.md#pull-request).
