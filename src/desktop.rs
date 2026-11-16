@@ -4,7 +4,7 @@ use crate::{
     config::{Endpoint, Store, Tunnel, atomic_json},
     ssh::PendingPrompt,
 };
-use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText, Stroke};
+use eframe::egui::{self, Color32, Key, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -17,7 +17,11 @@ use std::{
 use zeroize::Zeroize;
 
 mod apps_view;
+#[cfg(test)]
+mod screenshots;
+mod style;
 use apps_view::{AppForm, app_form_view};
+use style::Pal;
 
 const FRAME_TIME: Duration = Duration::from_millis(180);
 const POLL_TIME: Duration = Duration::from_millis(450);
@@ -119,7 +123,6 @@ pub(crate) fn native_options() -> eframe::NativeOptions {
 /// Смысловой цвет интерфейса; конкретный цвет выбирает `tone` по теме.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tone {
-    Accent,
     Ok,
     Warn,
     Error,
@@ -141,18 +144,6 @@ struct Palette {
     ok: Color32,
     warn: Color32,
     error: Color32,
-}
-
-impl Palette {
-    fn tone(&self, tone: Tone) -> Color32 {
-        match tone {
-            Tone::Accent => self.accent,
-            Tone::Ok => self.ok,
-            Tone::Warn => self.warn,
-            Tone::Error => self.error,
-            Tone::Dim => self.dim,
-        }
-    }
 }
 
 fn palette_id() -> egui::Id {
@@ -288,62 +279,18 @@ pub(crate) fn configure(ctx: &egui::Context, theme: &str) {
         }
         ctx.set_visuals_of(mode, visuals);
     }
+    style::sync_fonts(ctx);
     ctx.all_styles_mut(|style| {
-        style.override_font_id = Some(FontId::new(14.0, FontFamily::Monospace));
+        style::text_styles(style);
         style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-        style.spacing.button_padding = egui::vec2(10.0, 7.0);
-        style
-            .text_styles
-            .insert(egui::TextStyle::Heading, FontId::monospace(19.0));
+        style.spacing.button_padding = egui::vec2(14.0, 8.0);
+        style.spacing.interact_size.y = 36.0;
     });
     ctx.set_theme(match theme {
         "light" => egui::ThemePreference::Light,
         "system" => egui::ThemePreference::System,
         _ => egui::ThemePreference::Dark,
     });
-}
-
-fn tone(ui: &egui::Ui, tone: Tone) -> Color32 {
-    if !ui.visuals().dark_mode {
-        return match tone {
-            Tone::Accent => Color32::from_rgb(22, 102, 121),
-            Tone::Ok => Color32::from_rgb(51, 101, 66),
-            Tone::Warn => Color32::from_rgb(130, 89, 28),
-            Tone::Error => Color32::from_rgb(171, 52, 64),
-            Tone::Dim => ui.visuals().weak_text_color(),
-        };
-    }
-    if let Some(colors) = ui.data(|data| data.get_temp::<Palette>(palette_id())) {
-        return colors.tone(tone);
-    }
-    match tone {
-        Tone::Accent => CYAN,
-        Tone::Ok => GREEN,
-        Tone::Warn => AMBER,
-        Tone::Error => RED,
-        Tone::Dim => DIM,
-    }
-}
-
-fn mascot(state: &str, frame: usize) -> String {
-    match state {
-        "head" => format!(
-            "         _______\n      __/__[{eye}]__\\__\n    _/_____________\\_\n   /    [#]---[#]    \\\n  /      \\     /      \\\n  |  \\====\\   /====/  |\n   \\      \\_v_/      /\n    `----._____.----'",
-            eye = if frame == 0 { "*" } else { "o" }
-        ),
-        "running" => {
-            let legs = [
-                "   __     __   \n  (__)   (__)  \n    \\ \\_/ /    ",
-                "  __           \n (__)      __  \n   \\ \\___/(__) ",
-                "   __     __   \n  (__)   (__)  \n    \\ \\_/ /    ",
-                "           __  \n  __      (__) \n (__)\\___/ /   ",
-            ];
-            format!("{}\n    .\\___/.    \n   .-(   )-.   \n__(_________)__", legs[frame % 4])
-        }
-        "error" => "   ┌───────┐   \n   │ ERROR │   \n   └───┬───┘   \n       │       \n   .---│---.   \n__(_________)__".into(),
-        "connecting" | "reconnecting" | "waiting" => "     _____     \n   _/_____\\_   \n  / [#]─[#] \\  \n  |   \\v/   |  \n   .-------.   \n__(_________)__".into(),
-        _ => "               \n               \n               \n               \n   .-------.   \n__(_________)__".into(),
-    }
 }
 
 fn state_label(state: &str) -> (&'static str, Tone) {
@@ -491,6 +438,8 @@ pub(crate) struct Desktop {
     update: Option<UpdateDialog>,
     pending_operations: usize,
     about_quote: Option<usize>,
+    filter: Group,
+    app_filter: Group,
     #[cfg(target_os = "linux")]
     key_picks: u64,
 }
@@ -945,6 +894,8 @@ impl Desktop {
             update: None,
             pending_operations: 0,
             about_quote: None,
+            filter: Group::All,
+            app_filter: Group::All,
             #[cfg(target_os = "linux")]
             key_picks: 0,
         }
@@ -1269,16 +1220,12 @@ impl Desktop {
                 .unwrap_or("idle")
         }
     }
-    fn frame(&self) -> usize {
-        if self
-            .snapshot
+    /// Milliseconds since start for animations, or `None` when «Анимация кротов» is off.
+    fn anim_ms(&self) -> Option<u128> {
+        self.snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.config.settings.motion)
-        {
-            (self.started.elapsed().as_millis() / FRAME_TIME.as_millis()) as usize % 4
-        } else {
-            0
-        }
+            .then(|| self.started.elapsed().as_millis())
     }
     fn selected_tunnel(&self) -> Option<Tunnel> {
         self.snapshot
@@ -1536,17 +1483,84 @@ impl Desktop {
         }
     }
     fn main_view(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("КРОТ / ДИСПЕТЧЕРСКАЯ").color(tone(ui, Tone::Accent)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let pal = style::pal(ctx);
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg)
+                    .inner_margin(egui::Margin::symmetric(20, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    // Whole items wrap; a label never starts mid-row with a leading gap.
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    style::mole(ui, 2.0, style::Pose::default(), &pal);
+                    ui.label(
+                        RichText::new("КРОТ / ДИСПЕТЧЕРСКАЯ")
+                            .family(style::bold())
+                            .size(18.0)
+                            .color(pal.ink),
+                    );
+                    ui.add_space(8.0);
+                    for (view, label) in
+                        [(View::Tunnels, "1 Туннели"), (View::Apps, "2 Приложения")]
+                    {
+                        if ui
+                            .add(style::choice(label, self.view == view, &pal))
+                            .clicked()
+                        {
+                            self.view = view;
+                        }
+                    }
+                    ui.add_space(8.0);
+                    let apps = self.view == View::Apps;
+                    if ui
+                        .add_enabled(
+                            self.snapshot.is_some(),
+                            style::secondary(
+                                if apps {
+                                    "N Новое правило"
+                                } else {
+                                    "N Новый туннель"
+                                },
+                                &pal,
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.dialog = Some(if apps {
+                            Dialog::AppForm(Box::new(AppForm::new(None)))
+                        } else {
+                            Dialog::Form(Box::new(TunnelForm::new(None)))
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            self.snapshot.is_some(),
+                            style::secondary("S Настройки", &pal),
+                        )
+                        .clicked()
+                    {
+                        self.open_settings(ctx);
+                    }
+                    if ui.add(style::secondary("? Справка", &pal)).clicked() {
+                        self.dialog = Some(Dialog::Help);
+                    }
+                    if ui.add(style::secondary("Q Выход", &pal)).clicked() {
+                        self.request_exit();
+                    }
                     let version_response = ui
                         .add_enabled(
                             self.dialog.is_none()
                                 && self.confirm.is_none()
                                 && self.update.is_none(),
-                            egui::Link::new(concat!("v", env!("CARGO_PKG_VERSION"))),
+                            egui::Link::new(
+                                RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                    .monospace()
+                                    .color(pal.dim),
+                            ),
                         )
                         .on_hover_text("О программе");
                     if version_response.clicked() {
@@ -1561,248 +1575,465 @@ impl Desktop {
                     }
                 });
             });
-            ui.add_space(5.0);
-            ui.horizontal_wrapped(|ui| {
-                for (view, label) in [(View::Tunnels, "1 Туннели"), (View::Apps, "2 Приложения")]
-                {
-                    if ui
-                        .add(egui::Button::new(label).selected(self.view == view))
-                        .clicked()
-                    {
-                        self.view = view;
-                    }
-                }
-                ui.separator();
-                let apps = self.view == View::Apps;
-                if ui
-                    .add_enabled(
-                        self.snapshot.is_some(),
-                        egui::Button::new(if apps {
-                            "N Новое правило"
-                        } else {
-                            "N Новый туннель"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.dialog = Some(if apps {
-                        Dialog::AppForm(Box::new(AppForm::new(None)))
-                    } else {
-                        Dialog::Form(Box::new(TunnelForm::new(None)))
+        self.summary(ctx, &pal);
+        if !self.error.is_empty() {
+            egui::TopBottomPanel::bottom("footer")
+                .frame(
+                    egui::Frame::new()
+                        .fill(pal.panel)
+                        .inner_margin(egui::Margin::symmetric(20, 8)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(pal.error, &self.error);
+                        if ui.small_button("Скрыть").clicked() {
+                            self.error.clear();
+                        }
                     });
-                }
-                if ui
-                    .add_enabled(self.snapshot.is_some(), egui::Button::new("S Настройки"))
-                    .clicked()
-                {
-                    self.open_settings(ctx);
-                }
-                if ui.button("? Справка").clicked() {
-                    self.dialog = Some(Dialog::Help);
-                }
-                if ui.button("Q Выход").clicked() {
-                    self.request_exit();
+                });
+        }
+        egui::SidePanel::left("tunnels")
+            .default_width(330.0)
+            .min_width(260.0)
+            .max_width(520.0)
+            .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg)
+                    .inner_margin(egui::Margin::symmetric(16, 14)),
+            )
+            .show(ctx, |ui| {
+                if self.view == View::Apps {
+                    self.apps_side(ui, ctx, &pal);
+                } else {
+                    self.tunnel_list(ui, ctx, &pal);
                 }
             });
-            ui.add_space(5.0);
-        });
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
-            let apps = self.view == View::Apps;
-            let (running, waiting, total) = self
-                .snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    if apps {
-                        let count = |states: &[&str]| {
-                            snapshot
-                                .app_runtimes
-                                .values()
-                                .filter(|runtime| states.contains(&runtime.state.as_str()))
-                                .count()
-                        };
-                        return (
-                            count(&["running"]),
-                            count(&["blocked", "direct", "orphan", "elevation"]),
-                            snapshot.apps.len(),
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg)
+                    .inner_margin(egui::Margin::symmetric(16, 14)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("detail_scroll")
+                    .show(ui, |ui| {
+                        if self.view == View::Apps {
+                            self.apps_main(ui, ctx, &pal);
+                        } else if let Some(tunnel) = self.selected_tunnel() {
+                            style::card(&pal).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                self.detail(ui, ctx, &tunnel, &pal);
+                            });
+                        } else {
+                            style::card(&pal).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                style::caps(ui, "На участке", pal.dim);
+                                ui.add_space(12.0);
+                                style::mole(ui, 4.0, style::Pose::default(), &pal);
+                                ui.add_space(12.0);
+                                ui.label(
+                                    "Создайте туннель, чтобы открыть проход к нужному сервису.",
+                                );
+                                ui.label(
+                                    RichText::new("L — локальный порт, R — обратный, D — SOCKS5.")
+                                        .color(pal.dim),
+                                );
+                            });
+                        }
+                    });
+            });
+    }
+    /// The line under the header: state lights, «РАБОТАЮТ N ИЗ M» and, for long lists, filters.
+    fn summary(&mut self, ctx: &egui::Context, pal: &Pal) {
+        let apps = self.view == View::Apps;
+        let (lamps, running, waiting) = if apps {
+            self.app_lamps(pal)
+        } else {
+            self.tunnel_lamps(pal)
+        };
+        let total = lamps.len();
+        let blink_on = self.anim_ms().is_none_or(|ms| ms / 600 % 2 == 0);
+        egui::TopBottomPanel::top("summary")
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.panel)
+                    .inner_margin(egui::Margin::symmetric(20, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    if total > 0 {
+                        style::lamps(ui, &lamps, blink_on, pal);
+                    }
+                    ui.label(
+                        RichText::new(if apps {
+                            format!("ЧЕРЕЗ ТУННЕЛЬ {running} ИЗ {total}")
+                        } else {
+                            format!("РАБОТАЮТ {running} ИЗ {total}")
+                        })
+                        .family(style::bold())
+                        .size(17.0)
+                        .color(pal.ink),
+                    );
+                    if waiting > 0 {
+                        ui.label(
+                            RichText::new(if apps {
+                                format!("! Без туннеля: {waiting}")
+                            } else {
+                                format!("! Ждут участия: {waiting}")
+                            })
+                            .color(pal.warn),
                         );
                     }
-                    (
-                        snapshot
-                            .runtimes
-                            .values()
-                            .filter(|runtime| runtime.state == "running")
-                            .count(),
-                        snapshot.prompts.len(),
-                        snapshot.config.tunnels.len(),
-                    )
-                })
-                .unwrap_or_default();
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(
-                    tone(ui, Tone::Ok),
-                    format!("● Работают {running} из {total}"),
-                );
-                if waiting > 0 {
-                    ui.colored_label(tone(ui, Tone::Warn), format!("Ждут участия: {waiting}"));
-                }
-                ui.weak(if apps {
-                    "↑ ↓ Выбор   Space Вкл / выкл   1 2 Вкладки"
-                } else {
-                    "↑ ↓ Выбор   Space Пуск / стоп   Enter Запрос   L Журнал   1 2 Вкладки"
-                });
-            });
-            if !self.error.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(tone(ui, Tone::Error), &self.error);
-                    if ui.small_button("Скрыть").clicked() {
-                        self.error.clear();
+                    if total > 8 {
+                        ui.add_space(12.0);
+                        let filter = if apps {
+                            &mut self.app_filter
+                        } else {
+                            &mut self.filter
+                        };
+                        let counts =
+                            |group: Group| lamps.iter().filter(|lamp| lamp.group == group).count();
+                        let names = if apps {
+                            ["Через туннель", "Без туннеля"]
+                        } else {
+                            ["Работают", "Ждут"]
+                        };
+                        for (group, label) in [
+                            (Group::All, "Все".to_owned()),
+                            (
+                                Group::Live,
+                                format!("{} · {}", names[0], counts(Group::Live)),
+                            ),
+                            (
+                                Group::Attention,
+                                format!("{} · {}", names[1], counts(Group::Attention)),
+                            ),
+                            (Group::Off, format!("Выключены · {}", counts(Group::Off))),
+                        ] {
+                            let text = if group == Group::All {
+                                format!("{label} · {total}")
+                            } else {
+                                label
+                            };
+                            if ui
+                                .add(style::choice(&text, *filter == group, pal))
+                                .clicked()
+                            {
+                                *filter = group;
+                            }
+                        }
+                    } else {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(if apps {
+                                "↑ ↓ Выбор · Space Вкл / выкл · 1 2 Вкладки"
+                            } else {
+                                "↑ ↓ Выбор · Space Пуск / стоп · Enter Запрос · L Журнал"
+                            })
+                            .size(13.0)
+                            .color(pal.dim),
+                        );
                     }
                 });
-            }
-        });
+            });
+    }
+    fn tunnel_group(state: &str) -> Group {
+        match state {
+            "running" | "connecting" | "reconnecting" => Group::Live,
+            "waiting" | "error" => Group::Attention,
+            _ => Group::Off,
+        }
+    }
+    fn tunnel_lamps(&self, pal: &Pal) -> (Vec<style::Lamp>, usize, usize) {
+        let Some(snapshot) = &self.snapshot else {
+            return (Vec::new(), 0, 0);
+        };
+        let mut running = 0;
+        let mut waiting = 0;
+        let lamps = snapshot
+            .config
+            .tunnels
+            .iter()
+            .map(|tunnel| {
+                let state = self.state(tunnel);
+                let (label, color) = state_label(state);
+                running += usize::from(state == "running");
+                waiting += usize::from(state == "waiting");
+                style::Lamp {
+                    color: tone_of(pal, color),
+                    filled: !matches!(state, "stopped" | "idle"),
+                    blink: matches!(state, "waiting" | "connecting" | "reconnecting"),
+                    selected: self.selected.as_ref() == Some(&tunnel.id),
+                    name: format!("{}: {label}", tunnel.name),
+                    group: Self::tunnel_group(state),
+                }
+            })
+            .collect();
+        (lamps, running, waiting)
+    }
+    fn tunnel_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Pal) {
         let tunnels = self
             .snapshot
             .as_ref()
             .map(|snapshot| snapshot.config.tunnels.clone())
             .unwrap_or_default();
-        egui::SidePanel::left("tunnels")
-            .default_width(280.0)
-            .min_width(210.0)
-            .max_width(400.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                if self.view == View::Apps {
-                    self.apps_side(ui);
-                    return;
+        style::caps(ui, "Мои туннели", pal.dim);
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .id_salt("tunnel_scroll")
+            .show(ui, |ui| {
+                if tunnels.is_empty() {
+                    ui.add_space(16.0);
+                    style::mole(ui, 3.0, style::Pose::default(), pal);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(if self.snapshot.is_some() {
+                            "Здесь начнётся первый туннель.\nN — добавить подключение."
+                        } else {
+                            "Подключаемся к фоновому КРОТу…"
+                        })
+                        .color(pal.dim),
+                    );
                 }
-                ui.add_space(12.0);
-                ui.weak("Мои туннели");
-                ui.add_space(5.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("tunnel_scroll")
-                    .show(ui, |ui| {
-                        if tunnels.is_empty() {
-                            ui.add_space(20.0);
-                            ui.label(mascot("idle", 0));
-                            ui.weak(if self.snapshot.is_some() {
-                                "Здесь начнётся первый туннель.\nN — добавить подключение."
-                            } else {
-                                "Подключаемся к фоновому КРОТу…"
-                            });
-                        }
-                        for tunnel in &tunnels {
-                            let state = self.state(tunnel);
-                            let (label, color) = state_label(state);
-                            let text = format!(
-                                "{}\n{}\n{} · {}:{}",
-                                tunnel.name, label, tunnel.kind, tunnel.bind, tunnel.port
-                            );
-                            let button =
-                                egui::Button::new(RichText::new(text).color(tone(ui, color)))
-                                    .selected(self.selected.as_ref() == Some(&tunnel.id))
-                                    .wrap();
-                            let response = ui.add_sized([ui.available_width(), 80.0], button);
-                            if response.clicked() {
-                                self.selected = Some(tunnel.id.clone());
-                            }
-                            if response.double_clicked() {
-                                self.selected = Some(tunnel.id.clone());
-                                self.resolve(tunnel);
-                            }
-                        }
-                    });
-            });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(12.0);
-            egui::ScrollArea::vertical()
-                .id_salt("detail_scroll")
-                .show(ui, |ui| {
-                    if self.view == View::Apps {
-                        self.apps_main(ui, ctx);
-                    } else if let Some(tunnel) = self.selected_tunnel() {
-                        self.detail(ui, ctx, &tunnel);
-                    } else {
-                        ui.heading("На участке");
-                        ui.add_space(24.0);
-                        ui.label(RichText::new(mascot("idle", 0)).color(tone(ui, Tone::Dim)));
-                        ui.add_space(16.0);
-                        ui.label("Создайте туннель, чтобы открыть проход к нужному сервису.");
-                        ui.weak("L — локальный порт, R — обратный, D — SOCKS5.");
+                let filter = if tunnels.len() > 8 {
+                    self.filter
+                } else {
+                    Group::All
+                };
+                for tunnel in &tunnels {
+                    let state = self.state(tunnel).to_owned();
+                    if filter != Group::All && Self::tunnel_group(&state) != filter {
+                        continue;
                     }
-                });
-        });
+                    let (label, color) = state_label(&state);
+                    let color = tone_of(pal, color);
+                    let selected = self.selected.as_ref() == Some(&tunnel.id);
+                    let busy = self.busy_tunnels.contains(&tunnel.id);
+                    let row = list_row(
+                        ui,
+                        pal,
+                        &tunnel.id,
+                        selected,
+                        &tunnel.kind,
+                        &tunnel.name,
+                        &tunnel.route(),
+                        label,
+                        color,
+                        |ui| {
+                            ui.add_enabled_ui(!busy, |ui| {
+                                style::lever(
+                                    ui,
+                                    active(&state),
+                                    matches!(state.as_str(), "connecting" | "reconnecting"),
+                                    color,
+                                    pal,
+                                    &if active(&state) {
+                                        format!("Остановить туннель «{}»", tunnel.name)
+                                    } else {
+                                        format!("Запустить туннель «{}»", tunnel.name)
+                                    },
+                                    self.anim_ms().is_some(),
+                                )
+                                .clicked()
+                            })
+                            .inner
+                        },
+                    );
+                    if row.lever {
+                        self.selected = Some(tunnel.id.clone());
+                        self.toggle(ctx, tunnel);
+                    }
+                    if row.response.clicked() {
+                        self.selected = Some(tunnel.id.clone());
+                    }
+                    if row.response.double_clicked() {
+                        self.selected = Some(tunnel.id.clone());
+                        self.resolve(tunnel);
+                    }
+                    ui.add_space(2.0);
+                }
+            });
     }
-    fn detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tunnel: &Tunnel) {
+    fn detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tunnel: &Tunnel, pal: &Pal) {
         let state = self.state(tunnel).to_owned();
         let (label, color) = state_label(&state);
+        let color = tone_of(pal, color);
         let runtime = self
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.runtimes.get(&tunnel.id))
             .cloned();
-        ui.heading(&tunnel.name);
-        ui.colored_label(tone(ui, color), label);
-        ui.add_space(14.0);
-        ui.label(
-            RichText::new(mascot(&state, self.frame()))
-                .monospace()
-                .size(16.0)
-                .color(tone(ui, color)),
-        );
-        ui.add_space(16.0);
-        ui.colored_label(tone(ui, Tone::Accent), tunnel.route());
-        ui.weak(match tunnel.kind.as_str() {
-            "R" => "Порт на SSH-сервере → сервис на вашем устройстве",
-            "D" => "Локальный SOCKS5-прокси → сеть SSH-сервера",
-            _ => "Локальный порт → сервис со стороны SSH-сервера",
-        });
-        ui.separator();
-        ui.label(format!("SSH-узел: {}", tunnel.server.address()));
-        ui.label(format!("Вход: {}", auth_label(&tunnel.server.auth)));
-        if tunnel.server.auth == "key" {
-            ui.weak(&tunnel.server.key);
-        }
-        if tunnel.jumps_enabled {
-            for (index, jump) in tunnel.jumps.iter().enumerate() {
-                ui.label(format!(
-                    "Через {}: {} · {}",
-                    index + 1,
-                    jump.address(),
-                    auth_label(&jump.auth)
-                ));
-            }
-        }
-        ui.weak(if tunnel.enabled {
-            "При следующем запуске: восстановить туннель"
-        } else {
-            "При следующем запуске: оставить выключенным"
-        });
-        ui.weak(if tunnel.reconnect {
-            "После разрыва: подключиться снова"
-        } else {
-            "После разрыва: ждать ручного запуска"
-        });
-        if let Some(runtime) = runtime {
-            if !runtime.hop.is_empty() && active(&state) {
-                ui.weak(&runtime.hop);
-            }
-            if !runtime.message.is_empty() {
-                ui.colored_label(tone(ui, color), &runtime.message);
-            }
-        }
-        if let Some(pending) = self
+        let pending = self
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.prompts.get(&tunnel.id))
-        {
-            ui.separator();
-            ui.colored_label(tone(ui, Tone::Warn), prompt_title(&pending.request.kind));
-            ui.weak(format!(
-                "{} · {}",
-                pending.request.hop,
-                pending.request.endpoint.address()
-            ));
-            ui.weak("Остальные туннели продолжают работать.");
+            .cloned();
+        if let Some(pending) = &pending {
+            let banner = egui::Frame::new()
+                .fill(pal.warn)
+                .corner_radius(4)
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {} — без вас туннель не откроется.",
+                            prompt_title(&pending.request.kind),
+                            pending.request.endpoint.address()
+                        ))
+                        .family(style::bold())
+                        .color(pal.on_accent),
+                    );
+                    ui.label(
+                        RichText::new("Остальные туннели продолжают работать.")
+                            .color(pal.on_accent),
+                    );
+                })
+                .response
+                .interact(egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if banner.clicked() {
+                self.resolve(tunnel);
+            }
+            ui.add_space(12.0);
+        }
+        style::caps(ui, &format!("На участке · режим {}", tunnel.kind), pal.dim);
+        ui.label(
+            RichText::new(&tunnel.name)
+                .family(style::bold())
+                .size(30.0)
+                .color(pal.ink),
+        );
+        ui.label(
+            RichText::new(match tunnel.kind.as_str() {
+                "R" => "Порт на SSH-сервере → сервис на вашем устройстве",
+                "D" => "Локальный SOCKS5-прокси → сеть SSH-сервера",
+                _ => "Локальный порт → сервис со стороны SSH-сервера",
+            })
+            .color(pal.dim),
+        );
+        ui.label(RichText::new(label).family(style::bold()).color(color));
+        ui.add_space(6.0);
+        let listen = format!(
+            "{}:{}",
+            crate::config::display_host(&tunnel.bind),
+            tunnel.port
+        );
+        let far = format!(
+            "{}:{}",
+            crate::config::display_host(&tunnel.target),
+            tunnel.target_port
+        );
+        let (first, last) = match tunnel.kind.as_str() {
+            "R" => (("Порт на сервере", listen), ("Ваш сервис", far)),
+            "D" => (
+                ("SOCKS5 у вас", listen),
+                ("Выход", "сеть SSH-сервера".to_owned()),
+            ),
+            _ => (("Ваш компьютер", listen), ("Сервис за сервером", far)),
+        };
+        let live = state == "running";
+        let trying = matches!(state.as_str(), "connecting" | "reconnecting");
+        let middle = if tunnel.jumps_enabled && !tunnel.jumps.is_empty() {
+            format!(
+                "{}\nчерез {} jump-хост(а)",
+                tunnel.server.address(),
+                tunnel.jumps.len()
+            )
+        } else {
+            tunnel.server.address()
+        };
+        style::route(
+            ui,
+            &[
+                style::Node {
+                    title: first.0.into(),
+                    value: first.1,
+                    lit: live || trying,
+                },
+                style::Node {
+                    title: "SSH-узел".into(),
+                    value: middle,
+                    lit: live,
+                },
+                style::Node {
+                    title: last.0.into(),
+                    value: last.1,
+                    lit: live,
+                },
+            ],
+            if live {
+                [style::Wire::Live; 2]
+            } else if trying {
+                [style::Wire::Trying, style::Wire::Idle]
+            } else {
+                [style::Wire::Idle; 2]
+            },
+            color,
+            self.anim_ms().map(|ms| ms as f64 / 1000.0),
+            pal,
+        );
+        ui.add_space(10.0);
+        style::facts(
+            ui,
+            &[
+                ("SSH-узел", tunnel.server.address()),
+                (
+                    "Вход",
+                    if tunnel.server.auth == "key" {
+                        format!(
+                            "{} · {}",
+                            auth_label(&tunnel.server.auth),
+                            tunnel.server.key
+                        )
+                    } else {
+                        auth_label(&tunnel.server.auth).to_owned()
+                    },
+                ),
+                (
+                    "При следующем запуске",
+                    if tunnel.enabled {
+                        "восстановить туннель"
+                    } else {
+                        "оставить выключенным"
+                    }
+                    .to_owned(),
+                ),
+                (
+                    "После разрыва",
+                    if tunnel.reconnect {
+                        "подключиться снова"
+                    } else {
+                        "ждать ручного запуска"
+                    }
+                    .to_owned(),
+                ),
+            ],
+            pal,
+        );
+        if tunnel.jumps_enabled {
+            for (index, jump) in tunnel.jumps.iter().enumerate() {
+                ui.label(
+                    RichText::new(format!(
+                        "Через {}: {} · {}",
+                        index + 1,
+                        jump.address(),
+                        auth_label(&jump.auth)
+                    ))
+                    .color(pal.dim),
+                );
+            }
+        }
+        if let Some(runtime) = runtime {
+            if !runtime.hop.is_empty() && active(&state) {
+                ui.label(RichText::new(&runtime.hop).color(pal.dim));
+            }
+            if !runtime.message.is_empty() {
+                ui.colored_label(color, &runtime.message);
+            }
         }
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
@@ -1816,7 +2047,7 @@ impl Desktop {
             if ui
                 .add_enabled(
                     !self.busy_tunnels.contains(&tunnel.id),
-                    egui::Button::new(RichText::new(action).color(tone(ui, Tone::Accent))),
+                    style::primary(action, pal),
                 )
                 .clicked()
             {
@@ -1826,21 +2057,18 @@ impl Desktop {
                     self.toggle(ctx, tunnel);
                 }
             }
-            if state == "waiting" && ui.button("Выключить").clicked() {
+            if state == "waiting" && ui.add(style::secondary("Выключить", pal)).clicked() {
                 self.toggle(ctx, tunnel);
             }
-            if ui.button("L Журнал").clicked() {
+            if ui.add(style::secondary("L Журнал", pal)).clicked() {
                 self.dialog = Some(Dialog::Logs(tunnel.id.clone()));
             }
-            if ui.button("E Изменить").clicked() {
+            if ui.add(style::secondary("E Изменить", pal)).clicked() {
                 self.dialog = Some(Dialog::Form(Box::new(TunnelForm::new(Some(
                     tunnel.clone(),
                 )))));
             }
-            if ui
-                .button(RichText::new("Удалить").color(tone(ui, Tone::Error)))
-                .clicked()
-            {
+            if ui.add(style::danger("Удалить", pal)).clicked() {
                 self.confirm = Some(Confirm::Delete {
                     id: tunnel.id.clone(),
                     name: tunnel.name.clone(),
@@ -1849,15 +2077,15 @@ impl Desktop {
         });
         // After the tunnel's own actions, so that they stay in view in a small window.
         if tunnel.kind == "D" {
-            self.tunnel_udp(ui, ctx, tunnel);
+            ui.add_space(12.0);
+            self.tunnel_udp(ui, ctx, tunnel, pal);
         }
     }
     /// UDP through the server relay: its state, its numbers and the switch.
-    fn tunnel_udp(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tunnel: &Tunnel) {
+    fn tunnel_udp(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tunnel: &Tunnel, pal: &Pal) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        ui.separator();
         let consent = snapshot.udp.consented(tunnel);
         let runtime = snapshot
             .udp_runtimes
@@ -1865,51 +2093,85 @@ impl Desktop {
             .cloned()
             .unwrap_or_default();
         let (text, color) = if !consent {
-            ("выключен".to_owned(), Tone::Dim)
+            ("выключен".to_owned(), pal.dim)
         } else {
             let color = match runtime.state.as_str() {
-                "running" => Tone::Ok,
-                "unavailable" => Tone::Error,
-                _ => Tone::Warn,
+                "running" => pal.ok,
+                "unavailable" => pal.error,
+                _ => pal.warn,
             };
             (crate::udp::state_text(&runtime), color)
         };
-        ui.colored_label(tone(ui, color), format!("UDP через сервер: {text}"));
-        if !snapshot.udp_error.is_empty() {
-            ui.colored_label(tone(ui, Tone::Error), &snapshot.udp_error);
-        }
-        if let Some(metrics) = snapshot.udp_metrics.get(&tunnel.id) {
-            let lost: u64 =
-                metrics.drops.values().sum::<u64>() + metrics.relay.drops.values().sum::<u64>();
-            ui.weak(format!(
-                "Датаграмм ↑ {} · ↓ {} · потоков {} · потеряно {}",
-                metrics.sent.datagrams, metrics.received.datagrams, metrics.flows_active, lost
-            ));
-            if let (Some(rtt), Some(queue)) = (metrics.rtt.p95_us, metrics.to_channel_delay.p95_us)
-            {
-                ui.weak(format!(
-                    "До сервера p95 {} мс · ожидание в очереди p95 {} мс",
-                    rtt / 1000,
-                    queue / 1000
-                ));
-            }
-        }
-        if !consent {
-            ui.weak("UDP приложений этого туннеля сейчас блокируется. Включение загрузит на сервер помощник КРОТа.");
-        }
+        let udp_error = snapshot.udp_error.clone();
+        let metrics = snapshot.udp_metrics.get(&tunnel.id).cloned();
         let busy = self.pending_operations > 0;
-        let label = if consent {
-            "Выключить UDP"
-        } else {
-            "Включить UDP через сервер…"
-        };
-        if ui
-            .add_enabled(
-                !busy && snapshot.udp_error.is_empty(),
-                egui::Button::new(label),
-            )
-            .clicked()
-        {
+        let mut clicked = false;
+        egui::Frame::new()
+            .stroke(Stroke::new(1.0, pal.line))
+            .corner_radius(4)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(format!("UDP через сервер: {text}"))
+                        .family(style::bold())
+                        .color(color),
+                );
+                if !udp_error.is_empty() {
+                    ui.colored_label(pal.error, &udp_error);
+                }
+                if let Some(metrics) = &metrics {
+                    let lost: u64 = metrics.drops.values().sum::<u64>()
+                        + metrics.relay.drops.values().sum::<u64>();
+                    ui.label(
+                        RichText::new(format!(
+                            "Датаграмм ↑ {} · ↓ {} · потоков {} · потеряно {}",
+                            metrics.sent.datagrams,
+                            metrics.received.datagrams,
+                            metrics.flows_active,
+                            lost
+                        ))
+                        .monospace()
+                        .color(pal.dim),
+                    );
+                    if let (Some(rtt), Some(queue)) =
+                        (metrics.rtt.p95_us, metrics.to_channel_delay.p95_us)
+                    {
+                        ui.label(
+                            RichText::new(format!(
+                                "До сервера p95 {} мс · ожидание в очереди p95 {} мс",
+                                rtt / 1000,
+                                queue / 1000
+                            ))
+                            .monospace()
+                            .color(pal.dim),
+                        );
+                    }
+                }
+                if !consent {
+                    ui.label(
+                        RichText::new("UDP приложений этого туннеля сейчас блокируется. Включение загрузит на сервер помощник КРОТа.")
+                            .color(pal.dim),
+                    );
+                }
+                let button = if consent {
+                    style::secondary("Выключить UDP", pal)
+                } else {
+                    egui::Button::new(
+                        RichText::new("Включить UDP через сервер…")
+                            .family(style::bold())
+                            .color(pal.accent),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, pal.accent))
+                    .corner_radius(4)
+                    .min_size(egui::vec2(0.0, 40.0))
+                };
+                clicked = ui
+                    .add_enabled(!busy && udp_error.is_empty(), button)
+                    .clicked();
+            });
+        if clicked {
             if consent {
                 self.request(
                     ctx,
@@ -1930,110 +2192,102 @@ impl Desktop {
         let max_height = (ctx.content_rect().height() - 140.0).max(180.0);
         let width = (ctx.content_rect().width() - 90.0).min(660.0);
         let mut action = DialogAction::None;
-        let response = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
+        let pal = style::pal(ctx);
+        let strip = match &dialog {
+            Dialog::Prompt(prompt) if prompt.pending.request.kind == "hostchanged" => pal.warn,
+            _ => pal.accent,
+        };
+        let width = match &dialog {
+            Dialog::Help | Dialog::Logs(_) => (ctx.content_rect().width() - 70.0).min(940.0),
+            _ => width,
+        };
+        let response = style::modal(ctx, "dialog", strip, |ui| {
             ui.set_width(width);
             match &mut dialog {
-                Dialog::Form(form) => { action = form_view(ui, form, max_height); }
+                Dialog::Form(form) => {
+                    action = form_view(ui, form, max_height);
+                }
                 Dialog::AppForm(form) => {
-                    let tunnels = self.snapshot.as_ref().map(|snapshot| snapshot.config.tunnels.as_slice()).unwrap_or_default();
+                    let tunnels = self
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.config.tunnels.as_slice())
+                        .unwrap_or_default();
                     action = app_form_view(ui, form, tunnels, max_height);
                 }
                 Dialog::Settings(settings) => {
-                    ui.heading("Настройки");
-                    if settings.busy { ui.disable(); }
-                    egui::ComboBox::from_id_salt("theme").selected_text(theme_label(&settings.theme)).show_ui(ui, |ui| {
-                        for value in crate::config::THEMES {
-                            ui.selectable_value(&mut settings.theme, value.into(), theme_label(value));
-                        }
-                    });
-                    ui.checkbox(&mut settings.motion, "Анимация кротов");
-                    ui.checkbox(&mut settings.splash, "Восстановление туннелей при запуске");
-                    if let Some(enabled) = &mut settings.autostart {
-                        ui.checkbox(enabled, "Запускать КРОТ в фоне после входа в систему");
-                    } else {
-                        ui.add_enabled(false, egui::Checkbox::new(&mut false, if settings.error.is_empty() { "Автозапуск: проверяем состояние…" } else { "Автозапуск недоступен" }));
-                    }
-                    if !settings.error.is_empty() { ui.colored_label(tone(ui, Tone::Error), &settings.error); }
-                    ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(!settings.busy, egui::Button::new("Отмена")).clicked() { action = DialogAction::Close; }
-                        if ui.add_enabled(!settings.busy, egui::Button::new("Сохранить")).clicked() { action = DialogAction::SaveSettings; }
-                    });
+                    action = settings_view(ui, settings, max_height, &pal);
                 }
                 Dialog::Prompt(prompt) => {
-                    let request = prompt.pending.request.clone();
-                    ui.heading(prompt_title(&request.kind));
-                    egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
-                        ui.label(&request.tunnel_name);
-                        ui.weak(&request.hop);
-                        ui.label(request.endpoint.address());
-                        if !request.message.is_empty() { ui.label(&request.message); }
-                        match request.kind.as_str() {
-                            "trust" | "hostchanged" => {
-                                if request.kind == "hostchanged" {
-                                    ui.label("Сохранённый ключ:");
-                                    ui.colored_label(tone(ui, Tone::Warn), &request.old_fingerprint);
-                                }
-                                ui.label("Полученный ключ:");
-                                ui.colored_label(tone(ui, Tone::Warn), &request.new_fingerprint);
-                                ui.weak("Сверьте отпечаток с администратором по независимому каналу.");
-                                if request.kind == "hostchanged" { ui.checkbox(&mut prompt.verified, "Я проверил новый отпечаток"); }
-                            }
-                            _ => {
-                                ui.label(if request.kind == "passphrase" { "Пароль ключа" } else { "Пароль SSH" });
-                                let mut edit = egui::TextEdit::singleline(&mut prompt.secret).password(true).desired_width(f32::INFINITY).show(ui);
-                                // Passwords must not remain in the widget's undo history.
-                                edit.state.clear_undoer();
-                                edit.state.store(ctx, edit.response.id);
-                                if !edit.response.has_focus() && ui.memory(|memory| memory.focused().is_none()) { edit.response.request_focus(); }
-                                ui.weak("Секрет используется для подключения и не сохраняется.");
-                                if (edit.response.has_focus() || edit.response.lost_focus()) && ctx.input(|input| input.key_pressed(Key::Enter)) && prompt.may_accept() {
-                                    action = DialogAction::Answer;
-                                }
-                            }
-                        }
-                    });
-                    ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Позже").clicked() { action = DialogAction::Close; }
-                        if ui.button("Отменить подключение").clicked() { action = DialogAction::CancelPrompt; }
-                        let accept = if prompt.pending.request.kind == "hostchanged" { "Заменить ключ и подключиться" } else { "Продолжить" };
-                        if ui.add_enabled(prompt.may_accept(), egui::Button::new(accept)).clicked() { action = DialogAction::Answer; }
-                    });
+                    action = prompt_view(ui, ctx, prompt, max_height, &pal);
                 }
                 Dialog::Logs(id) => {
-                    let tunnel = self.snapshot.as_ref().and_then(|snapshot| snapshot.config.tunnels.iter().find(|t| &t.id == id));
-                    ui.heading(format!("Журнал · {}", tunnel.map(|t| t.name.as_str()).unwrap_or("туннель")));
-                    egui::ScrollArea::vertical().stick_to_bottom(true).max_height(max_height).show(ui, |ui| {
-                        if let Some(runtime) = self.snapshot.as_ref().and_then(|snapshot| snapshot.runtimes.get(id)) {
-                            if runtime.logs.is_empty() { ui.weak("Журнал пока пуст."); }
-                            for line in &runtime.logs { ui.label(line); }
-                        } else { ui.weak("Журнал пока пуст."); }
+                    let tunnel = self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.config.tunnels.iter().find(|t| &t.id == id));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading(format!(
+                            "Журнал · {}",
+                            tunnel.map(|t| t.name.as_str()).unwrap_or("туннель")
+                        ));
+                        ui.label(
+                            RichText::new("Последние 300 записей · новые снизу")
+                                .size(13.0)
+                                .color(pal.dim),
+                        );
                     });
-                    if ui.button("Назад").clicked() { action = DialogAction::Close; }
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(pal.bg)
+                        .stroke(Stroke::new(1.0, pal.line))
+                        .corner_radius(4)
+                        .inner_margin(egui::Margin {
+                            left: 22,
+                            right: 12,
+                            top: 10,
+                            bottom: 10,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::ScrollArea::vertical()
+                                .stick_to_bottom(true)
+                                .max_height((max_height - 90.0).max(80.0))
+                                .show(ui, |ui| {
+                                    match self
+                                        .snapshot
+                                        .as_ref()
+                                        .and_then(|snapshot| snapshot.runtimes.get(id))
+                                    {
+                                        Some(runtime) if !runtime.logs.is_empty() => {
+                                            for line in &runtime.logs {
+                                                log_line(ui, line, &pal);
+                                            }
+                                        }
+                                        _ => {
+                                            ui.label(
+                                                RichText::new("Журнал пока пуст.").color(pal.dim),
+                                            );
+                                        }
+                                    }
+                                });
+                        });
+                    ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(style::primary("Назад", &pal)).clicked() {
+                            action = DialogAction::Close;
+                        }
+                    });
                 }
                 Dialog::Help => {
-                    ui.heading("Справка");
-                    egui::ScrollArea::vertical().max_height((max_height - 100.0).max(80.0)).show(ui, |ui| { ui.label(HELP); });
-                    ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(!matches!(self.update_check, UpdateCheck::Checking), egui::Button::new("Проверить обновление")).clicked() {
-                            action = DialogAction::CheckUpdates;
-                        }
-                        if matches!(self.update_check, UpdateCheck::Checking) {
-                            ui.spinner();
-                            ui.label("Проверяем обновления…");
-                        }
-                    });
-                    match self.update_check {
-                        UpdateCheck::Current => { ui.label("Обновлений нет."); }
-                        UpdateCheck::Failed => { ui.colored_label(tone(ui, Tone::Error), "Не удалось проверить обновления. Проверьте подключение к сети и повторите попытку."); }
-                        _ => {}
-                    }
-                    if ui.button("Назад").clicked() { action = DialogAction::Close; }
+                    action = help_view(ui, &self.update_check, max_height, &pal);
                 }
-                Dialog::Splash => { action = self.splash_view(ui, max_height); }
-                Dialog::About => { action = self.about_view(ui, max_height); }
+                Dialog::Splash => {
+                    action = self.splash_view(ui, max_height);
+                }
+                Dialog::About => {
+                    action = self.about_view(ui, max_height);
+                }
             }
         });
         let blocked = self.confirm.is_some()
@@ -2195,50 +2449,102 @@ impl Desktop {
         None
     }
     fn about_view(&mut self, ui: &mut egui::Ui, max_height: f32) -> DialogAction {
+        let pal = style::pal(ui.ctx());
         let mut action = DialogAction::None;
         ui.horizontal(|ui| {
-            ui.heading("О программе");
+            ui.label(
+                RichText::new("О программе")
+                    .family(style::bold())
+                    .size(18.0)
+                    .color(pal.dim),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("×").on_hover_text("Закрыть").clicked() {
+                if ui
+                    .add(style::secondary("×", &pal).min_size(egui::vec2(40.0, 40.0)))
+                    .on_hover_text("Закрыть")
+                    .clicked()
+                {
                     action = DialogAction::Close;
                 }
             });
         });
-        ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("about")
-            .max_height(max_height)
+            .max_height((max_height - 60.0).max(120.0))
             .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.label(RichText::new("КРОТ").size(30.0));
-                    ui.colored_label(
-                        tone(ui, Tone::Accent),
-                        concat!("Версия ", env!("CARGO_PKG_VERSION")),
+                ui.horizontal_wrapped(|ui| {
+                    style::mole(
+                        ui,
+                        if max_height < 450.0 { 5.0 } else { 7.0 },
+                        style::Pose::at(self.anim_ms(), true),
+                        &pal,
                     );
-                    ui.weak("Ваши туннели. Наша работа.");
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(mascot("head", self.frame()))
-                            .color(tone(ui, Tone::Warn))
-                            .size(if max_height < 450.0 { 14.0 } else { 18.0 }),
-                    );
-                    ui.add_space(10.0);
-                    let quote = self.about_quote.unwrap_or(0);
-                    ui.colored_label(tone(ui, Tone::Warn), format!("«{}»", ABOUT_QUOTES[quote]));
-                    if ui.button("Ещё фраза").clicked() {
-                        action = DialogAction::NextAboutQuote;
-                    }
-                    ui.add_space(8.0);
-                    ui.weak("Менеджер SSH-туннелей от Dudod1n");
-                    ui.hyperlink_to("github.com/Dudod1n/KPOT", env!("CARGO_PKG_REPOSITORY"));
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.label(
+                            RichText::new("КРОТ")
+                                .family(style::bold())
+                                .size(52.0)
+                                .color(pal.ink),
+                        );
+                        ui.label(
+                            RichText::new(concat!("Версия ", env!("CARGO_PKG_VERSION")))
+                                .monospace()
+                                .color(pal.dim),
+                        );
+                        ui.label(RichText::new("Ваши туннели. Наша работа.").family(style::bold()));
+                    });
                 });
+                ui.add_space(10.0);
+                let quote = self.about_quote.unwrap_or(0);
+                let frame = egui::Frame::new()
+                    .fill(pal.bg)
+                    .stroke(Stroke::new(1.0, pal.line))
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin {
+                        left: 20,
+                        right: 14,
+                        top: 14,
+                        bottom: 14,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!("«{}»", ABOUT_QUOTES[quote]))
+                                    .family(style::bold())
+                                    .size(18.0)
+                                    .color(pal.ink),
+                            );
+                            if ui.add(style::secondary("Ещё фраза", &pal)).clicked() {
+                                action = DialogAction::NextAboutQuote;
+                            }
+                        });
+                    });
+                let rect = frame.response.rect;
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height())),
+                    egui::CornerRadius {
+                        nw: 4,
+                        sw: 4,
+                        ne: 0,
+                        se: 0,
+                    },
+                    pal.accent,
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Менеджер SSH-туннелей от Dudod1n").color(pal.dim));
+                ui.hyperlink_to(
+                    RichText::new("github.com/Dudod1n/KPOT").monospace(),
+                    env!("CARGO_PKG_REPOSITORY"),
+                );
             });
         ui.separator();
         ui.horizontal(|ui| {
-            ui.weak("GPL-3.0-only");
+            ui.label(RichText::new("GPL-3.0-only").color(pal.dim));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("В диспетчерскую").clicked() {
+                if ui.add(style::primary("В диспетчерскую", &pal)).clicked() {
                     action = DialogAction::Close;
                 }
             });
@@ -2246,6 +2552,7 @@ impl Desktop {
         action
     }
     fn splash_view(&mut self, ui: &mut egui::Ui, max_height: f32) -> DialogAction {
+        let pal = style::pal(ui.ctx());
         if ui
             .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::ArrowDown))
@@ -2259,25 +2566,19 @@ impl Desktop {
             self.move_selection(-1);
         }
         let mut action = DialogAction::None;
-        ui.heading("КРОТ / ВОССТАНОВЛЕНИЕ");
         let tunnels = self
             .snapshot
             .as_ref()
             .map(|snapshot| snapshot.config.tunnels.clone())
             .unwrap_or_default();
         let enabled: Vec<_> = tunnels.iter().filter(|tunnel| tunnel.enabled).collect();
-        let running = enabled
-            .iter()
-            .filter(|tunnel| self.state(tunnel) == "running")
-            .count();
-        let waiting = enabled
-            .iter()
-            .filter(|tunnel| self.state(tunnel) == "waiting")
-            .count();
-        let errors = enabled
-            .iter()
-            .filter(|tunnel| self.state(tunnel) == "error")
-            .count();
+        let count = |state: &str| {
+            enabled
+                .iter()
+                .filter(|tunnel| self.state(tunnel) == state)
+                .count()
+        };
+        let (running, waiting, errors) = (count("running"), count("waiting"), count("error"));
         let busy = enabled
             .iter()
             .any(|tunnel| matches!(self.state(tunnel), "connecting" | "reconnecting"));
@@ -2290,75 +2591,164 @@ impl Desktop {
         } else {
             "Все проходы на месте"
         };
-        ui.label(title);
-        ui.label(RichText::new(mascot("head", self.frame())).color(tone(
-            ui,
-            if waiting + errors > 0 {
-                Tone::Warn
-            } else {
-                Tone::Ok
-            },
-        )));
-        ui.label(format!(
-            "{} из {} работают · {} ждут вас · {} с ошибкой",
-            running,
-            enabled.len(),
-            waiting,
-            errors
-        ));
-        let completed = running + waiting + errors;
-        ui.add(
-            egui::ProgressBar::new(if enabled.is_empty() {
-                1.0
-            } else {
-                completed as f32 / enabled.len() as f32
-            })
-            .text(format!("{completed} / {}", enabled.len())),
-        );
+        let small = max_height < 450.0;
+        ui.vertical_centered(|ui| {
+            style::mole(
+                ui,
+                if small { 4.0 } else { 7.0 },
+                style::Pose::at(self.anim_ms(), true),
+                &pal,
+            );
+            style::caps(ui, "КРОТ / ВОССТАНОВЛЕНИЕ", pal.dim);
+            ui.label(
+                RichText::new(title)
+                    .family(style::bold())
+                    .size(if small { 22.0 } else { 30.0 })
+                    .color(pal.ink),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} из {} работают · {} ждут вас · {} с ошибкой",
+                    running,
+                    enabled.len(),
+                    waiting,
+                    errors
+                ))
+                .color(pal.dim),
+            );
+        });
+        ui.add_space(8.0);
+        let blink_on = self.anim_ms().is_none_or(|ms| ms / 600 % 2 == 0);
         egui::ScrollArea::vertical()
-            .max_height((max_height - 230.0).max(70.0))
+            .max_height((max_height - if small { 200.0 } else { 300.0 }).max(70.0))
             .show(ui, |ui| {
                 for tunnel in tunnels {
-                    let (state, color) = if tunnel.enabled {
-                        state_label(self.state(&tunnel))
+                    let state = self.state(&tunnel).to_owned();
+                    let (label, tone) = if tunnel.enabled {
+                        state_label(&state)
                     } else {
                         ("○ Выключен при запуске", Tone::Dim)
                     };
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .selectable_label(
-                                self.selected.as_ref() == Some(&tunnel.id),
-                                &tunnel.name,
-                            )
-                            .clicked()
-                        {
-                            self.selected = Some(tunnel.id.clone());
-                        }
-                        ui.colored_label(tone(ui, color), state);
-                        if matches!(self.state(&tunnel), "waiting" | "error")
-                            && ui
-                                .button(if self.state(&tunnel) == "waiting" {
-                                    "Разобраться"
+                    let color = tone_of(&pal, tone);
+                    let selected = self.selected.as_ref() == Some(&tunnel.id);
+                    let frame = egui::Frame::new()
+                        .fill(if selected { pal.raised } else { pal.bg })
+                        .stroke(Stroke::new(1.0, pal.line))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin {
+                            left: 18,
+                            right: 10,
+                            top: 8,
+                            bottom: 8,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (dot, _) = ui.allocate_exact_size(
+                                    egui::vec2(18.0, 18.0),
+                                    egui::Sense::hover(),
+                                );
+                                let blinking = matches!(
+                                    state.as_str(),
+                                    "connecting" | "reconnecting" | "waiting"
+                                );
+                                let shown = if blinking && !blink_on {
+                                    color.gamma_multiply(0.3)
                                 } else {
-                                    "Повторить"
-                                })
-                                .clicked()
-                        {
-                            self.selected = Some(tunnel.id.clone());
-                            action = DialogAction::Resolve(tunnel.id.clone());
-                        }
-                    });
+                                    color
+                                };
+                                if tunnel.enabled && !matches!(state.as_str(), "stopped" | "idle") {
+                                    ui.painter().circle_filled(dot.center(), 7.0, shown);
+                                }
+                                ui.painter().circle_stroke(
+                                    dot.center(),
+                                    7.0,
+                                    Stroke::new(2.0, shown),
+                                );
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.label(
+                                        RichText::new(format!("{} · {}", tunnel.kind, tunnel.name))
+                                            .family(style::bold()),
+                                    );
+                                    ui.label(
+                                        RichText::new(tunnel.route())
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(pal.dim),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if matches!(state.as_str(), "waiting" | "error")
+                                            && ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new(if state == "waiting" {
+                                                            "Разобраться"
+                                                        } else {
+                                                            "Повторить"
+                                                        })
+                                                        .family(style::bold())
+                                                        .color(color),
+                                                    )
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(Stroke::new(1.0, color))
+                                                    .corner_radius(4)
+                                                    .min_size(egui::vec2(0.0, 36.0)),
+                                                )
+                                                .clicked()
+                                        {
+                                            self.selected = Some(tunnel.id.clone());
+                                            action = DialogAction::Resolve(tunnel.id.clone());
+                                        }
+                                        ui.label(RichText::new(label).color(color));
+                                    },
+                                );
+                            });
+                        });
+                    let rect = frame.response.rect;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(rect.min, egui::vec2(6.0, rect.height())),
+                        egui::CornerRadius {
+                            nw: 6,
+                            sw: 6,
+                            ne: 0,
+                            se: 0,
+                        },
+                        if tunnel.enabled { color } else { pal.line },
+                    );
+                    if ui
+                        .interact(
+                            egui::Rect::from_min_max(
+                                rect.min,
+                                egui::pos2(rect.center().x, rect.max.y),
+                            ),
+                            ui.id().with(("splash_row", &tunnel.id)),
+                            egui::Sense::click(),
+                        )
+                        .clicked()
+                    {
+                        self.selected = Some(tunnel.id.clone());
+                    }
+                    ui.add_space(2.0);
                 }
             });
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            if ui.button("В диспетчерскую").clicked() {
+            if ui.add(style::primary("В диспетчерскую", &pal)).clicked() {
                 action = DialogAction::Close;
             }
-            if ui.button("Выйти").clicked() {
+            if ui.add(style::secondary("Выйти", &pal)).clicked() {
                 action = DialogAction::Exit;
             }
         });
+        ui.label(
+            RichText::new("Enter или Esc — в диспетчерскую, подключение продолжится.")
+                .size(13.0)
+                .color(pal.dim),
+        );
         if ui
             .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter))
@@ -2372,75 +2762,172 @@ impl Desktop {
             return;
         };
         let mut choice = 0;
-        let response = egui::Modal::new(egui::Id::new("confirmation")).show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 100.0).min(570.0));
+        let pal = style::pal(ctx);
+        let strip = match &confirm {
+            Confirm::Delete { .. } | Confirm::DeleteApp { .. } | Confirm::UdpConsent { .. } => {
+                pal.warn
+            }
+            _ => pal.accent,
+        };
+        let dialog_is_app = matches!(self.dialog, Some(Dialog::AppForm(_)));
+        let shutdown_busy = self.shutdown_busy;
+        let width = match &confirm {
+            Confirm::UdpConsent { .. } => (ctx.content_rect().width() - 100.0).min(760.0),
+            _ => (ctx.content_rect().width() - 100.0).min(600.0),
+        };
+        let response = style::modal(ctx, "confirmation", strip, |ui| {
+            ui.set_width(width);
+            let row = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| add(ui));
+            };
             match &mut confirm {
                 Confirm::Delete { name, .. } => {
                     ui.heading("Удалить туннель?");
-                    ui.label(format!("«{name}» будет удалён из настроек. Его соединение и порт закроются."));
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Отмена").clicked() { choice = 1; }
-                        if ui.button(RichText::new("Удалить").color(tone(ui, Tone::Error))).clicked() { choice = 2; }
+                    ui.label(format!(
+                        "«{name}» будет удалён из настроек. Его соединение и порт закроются."
+                    ));
+                    row(ui, &mut |ui| {
+                        if ui.add(style::secondary("Отмена", &pal)).clicked() {
+                            choice = 1;
+                        }
+                        if ui.add(style::filled("Удалить", pal.error, &pal)).clicked() {
+                            choice = 2;
+                        }
                     });
                 }
                 Confirm::DeleteApp { name, .. } => {
                     ui.heading("Удалить правило?");
-                    ui.label(format!("«{name}» будет удалено. Приложение снова пойдёт в сеть напрямую."));
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Отмена").clicked() { choice = 1; }
-                        if ui.button(RichText::new("Удалить").color(tone(ui, Tone::Error))).clicked() { choice = 2; }
+                    ui.label(format!(
+                        "«{name}» будет удалено. Приложение снова пойдёт в сеть напрямую."
+                    ));
+                    row(ui, &mut |ui| {
+                        if ui.add(style::secondary("Отмена", &pal)).clicked() {
+                            choice = 1;
+                        }
+                        if ui.add(style::filled("Удалить", pal.error, &pal)).clicked() {
+                            choice = 2;
+                        }
                     });
                 }
                 Confirm::UdpConsent { name, .. } => {
                     ui.heading("Включить UDP через сервер?");
                     ui.label(format!("Для туннеля «{name}» КРОТ загрузит на SSH-сервер свой помощник krot-relay (около 0,4 МиБ) в каталог ~/.cache/krot и будет запускать его, пока туннель работает. UDP приложений из правил этого туннеля пойдёт в сеть с адреса сервера."));
-                    ui.weak("Помощник работает с правами вашей учётной записи на сервере и ничего не записывает, кроме своего файла. Управление идёт через отдельное SSH-соединение, снаружи это по-прежнему SSH. Для каждого UDP-потока приложения помощник открывает на сервере временный UDP-порт и принимает на него ответы с любого адреса — так работают звонки и WebRTC.");
-                    ui.weak("Помощник даёт UDP-выход и там, где администратор сервера запретил переадресацию портов (AllowTcpForwarding no). Убедитесь, что это допустимо на этом сервере.");
-                    ui.weak("Согласие действует только для этого сервера и учётной записи. Выключение UDP, смена сервера или удаление туннеля удаляют помощник с сервера, если он доступен.");
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Отмена").clicked() { choice = 1; }
-                        if ui.button(RichText::new("Загрузить и включить").color(tone(ui, Tone::Accent))).clicked() { choice = 2; }
+                    for (text, border) in [
+                        (
+                            "Помощник работает с правами вашей учётной записи на сервере и ничего не записывает, кроме своего файла. Управление идёт через отдельное SSH-соединение, снаружи это по-прежнему SSH. Для каждого UDP-потока приложения помощник открывает на сервере временный UDP-порт и принимает на него ответы с любого адреса — так работают звонки и WebRTC.",
+                            pal.line,
+                        ),
+                        (
+                            "Помощник даёт UDP-выход и там, где администратор сервера запретил переадресацию портов (AllowTcpForwarding no). Убедитесь, что это допустимо на этом сервере.",
+                            pal.warn,
+                        ),
+                        (
+                            "Согласие действует только для этого сервера и учётной записи. Выключение UDP, смена сервера или удаление туннеля удаляют помощник с сервера, если он доступен.",
+                            pal.line,
+                        ),
+                    ] {
+                        egui::Frame::new()
+                            .fill(pal.bg)
+                            .stroke(Stroke::new(1.0, border))
+                            .corner_radius(4)
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text).size(14.0).color(
+                                            if border == pal.warn { pal.ink } else { pal.dim },
+                                        ),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                    }
+                    row(ui, &mut |ui| {
+                        if ui.add(style::secondary("Отмена", &pal)).clicked() {
+                            choice = 1;
+                        }
+                        if ui.add(style::alarm("Загрузить и включить", &pal)).clicked()
+                        {
+                            choice = 2;
+                        }
                     });
                 }
                 Confirm::Discard { .. } => {
                     ui.heading("Несохранённые изменения");
-                    ui.label(if matches!(self.dialog, Some(Dialog::AppForm(_))) {
+                    ui.label(if dialog_is_app {
                         "Отменить изменения в этом правиле?"
                     } else {
                         "Отменить изменения в этом туннеле?"
                     });
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Продолжить редактирование").clicked() { choice = 1; }
-                        if ui.button("Отменить изменения").clicked() { choice = 2; }
+                    row(ui, &mut |ui| {
+                        if ui
+                            .add(style::primary("Продолжить редактирование", &pal))
+                            .clicked()
+                        {
+                            choice = 1;
+                        }
+                        if ui.add(style::danger("Отменить изменения", &pal)).clicked()
+                        {
+                            choice = 2;
+                        }
                     });
                 }
-                Confirm::CloseNotice { dont_show_again, busy, error } => {
+                Confirm::CloseNotice {
+                    dont_show_again,
+                    busy,
+                    error,
+                } => {
                     ui.heading("КРОТ продолжит работать в фоне");
                     ui.label("Туннели останутся подключены. Чтобы открыть диспетчерскую, нажмите значок КРОТа в трее.");
-                    ui.weak("Остановить КРОТ и закрыть соединения можно через меню значка в трее или «Q Выход».");
+                    ui.label(RichText::new("Остановить КРОТ и закрыть соединения можно через меню значка в трее или «Q Выход».").color(pal.dim));
                     ui.add_enabled_ui(!*busy, |ui| {
                         ui.checkbox(dont_show_again, "Больше не показывать");
-                        if !error.is_empty() { ui.colored_label(tone(ui, Tone::Error), error.as_str()); }
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Назад").clicked() { choice = 1; }
-                            if ui.button(RichText::new("Понятно").color(tone(ui, Tone::Accent))).clicked() { choice = 2; }
+                        if !error.is_empty() {
+                            ui.colored_label(pal.error, error.as_str());
+                        }
+                        row(ui, &mut |ui| {
+                            if ui.add(style::secondary("Назад", &pal)).clicked() {
+                                choice = 1;
+                            }
+                            if ui.add(style::primary("Понятно", &pal)).clicked() {
+                                choice = 2;
+                            }
                         });
                     });
-                    if *busy { ui.weak("Запоминаем выбор…"); }
-                    if !*busy && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter)) { choice = 2; }
+                    if *busy {
+                        ui.label(RichText::new("Запоминаем выбор…").color(pal.dim));
+                    }
+                    if !*busy
+                        && ctx
+                            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter))
+                    {
+                        choice = 2;
+                    }
                 }
                 Confirm::Exit => {
                     ui.heading("Закрыть диспетчерскую?");
                     ui.label("В фоне КРОТ продолжит держать туннели. Значок в трее или повторный запуск откроет их текущее состояние.");
-                    ui.weak("«Остановить КРОТ» закроет все соединения. Включённые туннели восстановятся при следующем запуске.");
-                    ui.add_enabled_ui(!self.shutdown_busy, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Назад").clicked() { choice = 1; }
-                            if ui.button(RichText::new("Оставить в фоне").color(tone(ui, Tone::Accent))).clicked() { choice = 2; }
-                            if ui.button(RichText::new("Остановить КРОТ").color(tone(ui, Tone::Error))).clicked() { choice = 3; }
+                    ui.label(RichText::new("«Остановить КРОТ» закроет все соединения. Включённые туннели восстановятся при следующем запуске.").color(pal.dim));
+                    ui.add_enabled_ui(!shutdown_busy, |ui| {
+                        row(ui, &mut |ui| {
+                            if ui.add(style::secondary("Назад", &pal)).clicked() {
+                                choice = 1;
+                            }
+                            if ui.add(style::primary("Оставить в фоне", &pal)).clicked()
+                            {
+                                choice = 2;
+                            }
+                            if ui.add(style::danger("Остановить КРОТ", &pal)).clicked()
+                            {
+                                choice = 3;
+                            }
                         });
                     });
-                    if self.shutdown_busy { ui.weak("Закрываем соединения…"); }
+                    if shutdown_busy {
+                        ui.label(RichText::new("Закрываем соединения…").color(pal.dim));
+                    }
                 }
             }
         });
@@ -2591,27 +3078,40 @@ impl Desktop {
             return;
         };
         let mut choice = 0;
-        let response = egui::Modal::new(egui::Id::new("update")).show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 100.0).min(570.0));
+        let pal = style::pal(ctx);
+        let strip = if matches!(update.stage, UpdateStage::Failed(_)) {
+            pal.error
+        } else {
+            pal.accent
+        };
+        let response = style::modal(ctx, "update", strip, |ui| {
+            ui.set_width((ctx.content_rect().width() - 100.0).min(600.0));
             ui.heading(format!("Доступен КРОТ {}", update.release.version));
             match &update.stage {
                 UpdateStage::Offer => {
                     ui.label("Обновить программу и перезапустить КРОТ?");
-                    ui.weak(
-                        "До завершения скачивания и проверки файлов туннели продолжат работать.",
+                    ui.label(
+                        RichText::new(
+                            "До завершения скачивания и проверки файлов туннели продолжат работать.",
+                        )
+                        .color(pal.dim),
                     );
                     if !update.error.is_empty() {
-                        ui.colored_label(tone(ui, Tone::Error), &update.error);
+                        ui.colored_label(pal.error, &update.error);
                     }
+                    ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Обновить").clicked() {
+                        if ui.add(style::primary("Обновить", &pal)).clicked() {
                             choice = 1;
                         }
-                        if !update.manual && ui.button("Пропустить версию").clicked()
+                        if !update.manual
+                            && ui
+                                .add(style::secondary("Пропустить версию", &pal))
+                                .clicked()
                         {
                             choice = 2;
                         }
-                        if ui.button("Позже").clicked() {
+                        if ui.add(style::secondary("Позже", &pal)).clicked() {
                             choice = 3;
                         }
                     });
@@ -2623,24 +3123,34 @@ impl Desktop {
                 UpdateStage::Preparing => {
                     ui.spinner();
                     ui.label("Скачиваем и проверяем обновление…");
-                    ui.weak("Туннели продолжают работать. Дождитесь завершения подготовки.");
+                    ui.label(
+                        RichText::new(
+                            "Туннели продолжают работать. Дождитесь завершения подготовки.",
+                        )
+                        .color(pal.dim),
+                    );
                 }
                 UpdateStage::Launching => {
                     ui.spinner();
                     ui.label("Запускаем установщик…");
                 }
                 UpdateStage::Failed(error) => {
-                    ui.colored_label(tone(ui, Tone::Error), error);
+                    ui.colored_label(pal.error, error);
                     if !update.error.is_empty() {
                         ui.label(&update.error);
                     }
                     ui.label("Проверьте подключение к сети и права записи в каталог программы.");
-                    ui.weak("Текущие файлы программы и туннели сохранены.");
+                    ui.label(
+                        RichText::new("Текущие файлы программы и туннели сохранены.")
+                            .color(pal.dim),
+                    );
+                    ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Повторить").clicked() {
+                        if ui.add(style::primary("Повторить", &pal)).clicked() {
                             choice = 1;
                         }
-                        if ui.button("Вернуться в КРОТ").clicked() {
+                        if ui.add(style::secondary("Вернуться в КРОТ", &pal)).clicked()
+                        {
                             choice = 3;
                         }
                     });
@@ -2658,6 +3168,7 @@ impl Desktop {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) -> Option<KeyTarget> {
+        style::sync_fonts(ctx);
         self.drain(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2764,6 +3275,528 @@ impl eframe::App for Desktop {
     }
 }
 
+/// Filter of long lists by what a row needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    All,
+    Live,
+    Attention,
+    Off,
+}
+
+fn tone_of(pal: &Pal, tone: Tone) -> Color32 {
+    match tone {
+        Tone::Ok => pal.ok,
+        Tone::Warn => pal.warn,
+        Tone::Error => pal.error,
+        Tone::Dim => pal.dim,
+    }
+}
+
+struct Row {
+    response: egui::Response,
+    lever: bool,
+}
+
+/// A list card: side strip, mode badge, name, route, state and the lever on the right.
+#[allow(clippy::too_many_arguments)]
+fn list_row(
+    ui: &mut egui::Ui,
+    pal: &Pal,
+    id: &str,
+    selected: bool,
+    badge: &str,
+    name: &str,
+    detail: &str,
+    status: &str,
+    color: Color32,
+    lever: impl FnOnce(&mut egui::Ui) -> bool,
+) -> Row {
+    let mut lever_clicked = false;
+    let mut lever_left = f32::INFINITY;
+    let frame = egui::Frame::new()
+        .fill(if selected { pal.raised } else { pal.panel })
+        .stroke(Stroke::new(1.0, pal.line))
+        .corner_radius(6)
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 6,
+            top: 10,
+            bottom: 10,
+        });
+    let inner = frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+            ui.painter().rect(
+                rect,
+                4,
+                pal.bg,
+                Stroke::new(1.0, pal.line),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                badge,
+                egui::FontId::new(20.0, style::bold()),
+                pal.ink,
+            );
+            let text_width = (ui.available_width() - 84.0).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(name)
+                                .family(style::bold())
+                                .size(16.0)
+                                .color(pal.ink),
+                        )
+                        .truncate(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(detail).monospace().size(13.0).color(pal.dim),
+                        )
+                        .truncate(),
+                    );
+                    ui.add(egui::Label::new(RichText::new(status).size(14.0).color(color)).wrap());
+                },
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let scope = ui.scope(lever);
+                lever_clicked = scope.inner;
+                lever_left = scope.response.rect.left();
+            });
+        });
+    });
+    let rect = inner.response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(6.0, rect.height())),
+        egui::CornerRadius {
+            nw: 6,
+            sw: 6,
+            ne: 0,
+            se: 0,
+        },
+        if selected { pal.accent } else { pal.line },
+    );
+    let click_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(lever_left.min(rect.right()), rect.max.y),
+    );
+    let response = ui.interact(click_rect, ui.id().with(("row", id)), egui::Sense::click());
+    Row {
+        response,
+        lever: lever_clicked,
+    }
+}
+
+/// A journal line: monospace, with a coloured mark on success and warning lines.
+fn log_line(ui: &mut egui::Ui, line: &str, pal: &Pal) {
+    let lower = line.to_lowercase();
+    let mark = if ["ошибк", "не удалось", "потерян", "разрыв", "отказ"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Some(pal.warn)
+    } else if ["слушаем", "открыт", "выполнен", "загружен", "работает"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Some(pal.ok)
+    } else {
+        None
+    };
+    let response = ui.add(
+        egui::Label::new(
+            RichText::new(line)
+                .monospace()
+                .color(mark.map_or(pal.ink, |color| color)),
+        )
+        .wrap(),
+    );
+    if let Some(color) = mark {
+        let rect = response.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() - 10.0, rect.top()),
+                egui::vec2(3.0, rect.height()),
+            ),
+            0,
+            color,
+        );
+    }
+}
+
+/// Settings: colour themes as cards with samples, classic themes in a row of their own.
+fn settings_view(
+    ui: &mut egui::Ui,
+    settings: &mut SettingsDraft,
+    max_height: f32,
+    pal: &Pal,
+) -> DialogAction {
+    let mut action = DialogAction::None;
+    ui.heading("Настройки");
+    if settings.busy {
+        ui.disable();
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("settings_scroll")
+        .max_height((max_height - 70.0).max(120.0))
+        .show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Тема оформления").family(style::bold()));
+            ui.horizontal_wrapped(|ui| {
+                for theme in ["build", "night", "danger", "stealth"] {
+                    let Some(colors) = palette(theme) else {
+                        continue;
+                    };
+                    let selected = settings.theme == theme;
+                    let mark = if selected {
+                        "● выбрана"
+                    } else if theme == "build" {
+                        "по умолчанию"
+                    } else {
+                        ""
+                    };
+                    if style::theme_card(ui, theme_label(theme), mark, &colors, selected).clicked()
+                    {
+                        settings.theme = theme.into();
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Классические:").color(pal.dim));
+                for theme in ["dark", "light", "system"] {
+                    if ui
+                        .add(style::choice(
+                            theme_label(theme),
+                            settings.theme == theme,
+                            pal,
+                        ))
+                        .clicked()
+                    {
+                        settings.theme = theme.into();
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.separator();
+            ui.checkbox(&mut settings.motion, "Анимация кротов");
+            ui.checkbox(&mut settings.splash, "Восстановление туннелей при запуске");
+            if let Some(enabled) = &mut settings.autostart {
+                ui.checkbox(enabled, "Запускать КРОТ в фоне после входа в систему");
+            } else {
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(
+                        &mut false,
+                        if settings.error.is_empty() {
+                            "Автозапуск: проверяем состояние…"
+                        } else {
+                            "Автозапуск недоступен"
+                        },
+                    ),
+                );
+            }
+        });
+    if !settings.error.is_empty() {
+        ui.colored_label(pal.error, &settings.error);
+    }
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new("Тема применяется после сохранения.")
+                .size(13.0)
+                .color(pal.dim),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(!settings.busy, style::primary("Сохранить", pal))
+                .clicked()
+            {
+                action = DialogAction::SaveSettings;
+            }
+            if ui
+                .add_enabled(!settings.busy, style::secondary("Отмена", pal))
+                .clicked()
+            {
+                action = DialogAction::Close;
+            }
+        });
+    });
+    action
+}
+
+/// A login request: a changed host key with both fingerprints, or a password.
+fn prompt_view(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    prompt: &mut PromptDialog,
+    max_height: f32,
+    pal: &Pal,
+) -> DialogAction {
+    let mut action = DialogAction::None;
+    let request = prompt.pending.request.clone();
+    let key = matches!(request.kind.as_str(), "trust" | "hostchanged");
+    let changed = request.kind == "hostchanged";
+    ui.horizontal(|ui| {
+        style::sign(
+            ui,
+            if key { '!' } else { '*' },
+            if changed { pal.warn } else { pal.accent },
+        );
+        ui.heading(prompt_title(&request.kind));
+    });
+    egui::ScrollArea::vertical()
+        .max_height((max_height - 70.0).max(120.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(&request.tunnel_name)
+                    .family(style::bold())
+                    .size(17.0),
+            );
+            ui.label(RichText::new(&request.hop).color(pal.dim));
+            ui.label(RichText::new(request.endpoint.address()).monospace());
+            if !request.message.is_empty() {
+                ui.label(&request.message);
+            }
+            ui.add_space(6.0);
+            if key {
+                egui::Frame::new()
+                    .fill(pal.bg)
+                    .stroke(Stroke::new(1.0, pal.line))
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if changed {
+                            ui.label(RichText::new("Сохранённый ключ").size(13.0).color(pal.dim));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&request.old_fingerprint)
+                                        .monospace()
+                                        .strikethrough()
+                                        .color(pal.dim),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        ui.label(RichText::new("Полученный ключ").size(13.0).color(pal.dim));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&request.new_fingerprint)
+                                    .monospace()
+                                    .color(pal.warn),
+                            )
+                            .wrap(),
+                        );
+                    });
+                ui.label(
+                    RichText::new("Сверьте отпечаток с администратором по независимому каналу.")
+                        .color(pal.dim),
+                );
+                if changed {
+                    ui.checkbox(&mut prompt.verified, "Я проверил новый отпечаток");
+                }
+            } else {
+                ui.label(
+                    RichText::new(if request.kind == "passphrase" {
+                        "Пароль ключа"
+                    } else {
+                        "Пароль SSH"
+                    })
+                    .size(13.0)
+                    .color(pal.dim),
+                );
+                let mut edit = egui::TextEdit::singleline(&mut prompt.secret)
+                    .password(true)
+                    .margin(egui::vec2(10.0, 10.0))
+                    .desired_width(f32::INFINITY)
+                    .show(ui);
+                // Passwords must not remain in the widget's undo history.
+                edit.state.clear_undoer();
+                edit.state.store(ctx, edit.response.id);
+                if !edit.response.has_focus() && ui.memory(|memory| memory.focused().is_none()) {
+                    edit.response.request_focus();
+                }
+                ui.label(
+                    RichText::new("Секрет используется для подключения и не сохраняется.")
+                        .color(pal.dim),
+                );
+                if (edit.response.has_focus() || edit.response.lost_focus())
+                    && ctx.input(|input| input.key_pressed(Key::Enter))
+                    && prompt.may_accept()
+                {
+                    action = DialogAction::Answer;
+                }
+            }
+        });
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        if ui.add(style::secondary("Позже", pal)).clicked() {
+            action = DialogAction::Close;
+        }
+        if ui
+            .add(style::secondary("Отменить подключение", pal))
+            .clicked()
+        {
+            action = DialogAction::CancelPrompt;
+        }
+        let accept = if changed {
+            style::alarm("Заменить ключ и подключиться", pal)
+        } else {
+            style::primary("Продолжить", pal)
+        };
+        if ui.add_enabled(prompt.may_accept(), accept).clicked() {
+            action = DialogAction::Answer;
+        }
+    });
+    action
+}
+
+const HELP_KEYS: [(&str, &str); 10] = [
+    ("1 / 2", "Вкладки «Туннели» и «Приложения»"),
+    ("↑ / ↓", "Выбрать туннель или правило"),
+    ("Space", "Запуск / остановка / отмена подключения"),
+    ("Enter", "Открыть запрос ожидающего туннеля"),
+    ("N / E", "Создать / изменить"),
+    ("L", "Журнал"),
+    ("Delete", "Удалить"),
+    ("S", "Настройки"),
+    ("? / F1", "Справка"),
+    ("Q", "Меню выхода"),
+];
+const HELP_FORM_KEYS: [(&str, &str); 3] = [
+    ("Tab / Shift+Tab", "Следующее / предыдущее поле"),
+    ("Ctrl+S / Ctrl+Enter", "Сохранить"),
+    ("Esc", "Назад / отмена"),
+];
+const HELP_MODES: [(&str, &str); 3] = [
+    ("L", "Локальный порт → сервис со стороны SSH-сервера."),
+    (
+        "R",
+        "Порт на SSH-сервере → сервис со стороны вашего устройства.",
+    ),
+    ("D", "Локальный SOCKS5-прокси → сеть SSH-сервера."),
+];
+const HELP_NOTES: [&str; 6] = [
+    "Приложения: правило направляет трафик выбранного исполняемого файла через туннель типа D. UDP идёт через туннель, если в карточке туннеля включён «UDP через сервер» (на сервер загружается помощник КРОТа); иначе UDP блокируется. QUIC (UDP 443) блокируется, пока в карточке правила не включено его туннелирование. Если туннель не работает, сеть приложения закрыта, пока в правиле не выбрано «Пускать напрямую»: тогда напрямую идёт весь трафик, включая UDP.",
+    "Jump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.",
+    "Пароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.",
+    "Крестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее или повторным запуском КРОТа. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.",
+    "В настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.",
+    "На заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.",
+];
+
+/// Help: keys as a table, modes and notes, and the update check.
+fn help_view(ui: &mut egui::Ui, check: &UpdateCheck, max_height: f32, pal: &Pal) -> DialogAction {
+    let mut action = DialogAction::None;
+    ui.heading("Справка");
+    let keys = |ui: &mut egui::Ui, id: &str, rows: &[(&str, &str)]| {
+        egui::Grid::new(id)
+            .num_columns(2)
+            .spacing([14.0, 8.0])
+            .show(ui, |ui| {
+                for (key, text) in rows {
+                    ui.horizontal(|ui| {
+                        for (index, part) in key.split(" / ").enumerate() {
+                            if index > 0 {
+                                ui.label(RichText::new("/").color(pal.dim));
+                            }
+                            style::kbd(ui, part, pal);
+                        }
+                    });
+                    ui.label(*text);
+                    ui.end_row();
+                }
+            });
+    };
+    let left = |ui: &mut egui::Ui| {
+        style::caps(ui, "Диспетчерская", pal.dim);
+        keys(ui, "help_keys", &HELP_KEYS);
+        ui.add_space(8.0);
+        style::caps(ui, "В формах", pal.dim);
+        keys(ui, "help_form_keys", &HELP_FORM_KEYS);
+    };
+    let right = |ui: &mut egui::Ui| {
+        style::caps(ui, "Режимы", pal.dim);
+        for (mode, text) in HELP_MODES {
+            ui.horizontal_top(|ui| {
+                ui.add_sized(
+                    [22.0, 22.0],
+                    egui::Label::new(
+                        RichText::new(mode)
+                            .family(style::bold())
+                            .size(17.0)
+                            .color(pal.accent),
+                    ),
+                );
+                ui.add(egui::Label::new(text).wrap());
+            });
+        }
+        ui.add_space(8.0);
+        style::caps(ui, "Важно знать", pal.dim);
+        for note in HELP_NOTES {
+            ui.add(egui::Label::new(note).wrap());
+        }
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("help_scroll")
+        .max_height((max_height - 110.0).max(80.0))
+        .show(ui, |ui| {
+            if ui.available_width() >= 760.0 {
+                ui.columns(2, |columns| {
+                    // Columns justify their layout, which would stretch the notes word by word.
+                    let plain = egui::Layout::top_down(egui::Align::Min);
+                    columns[0].with_layout(plain, left);
+                    columns[1].with_layout(plain, right);
+                });
+            } else {
+                left(ui);
+                ui.add_space(8.0);
+                right(ui);
+            }
+        });
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        let checking = matches!(check, UpdateCheck::Checking);
+        if ui
+            .add_enabled(!checking, style::secondary("Проверить обновление", pal))
+            .clicked()
+        {
+            action = DialogAction::CheckUpdates;
+        }
+        if checking {
+            ui.spinner();
+            ui.label("Проверяем обновления…");
+        }
+        match check {
+            UpdateCheck::Current => {
+                ui.label("Обновлений нет.");
+            }
+            UpdateCheck::Failed => {
+                ui.colored_label(
+                    pal.error,
+                    "Не удалось проверить обновления. Проверьте подключение к сети и повторите попытку.",
+                );
+            }
+            _ => {}
+        }
+    });
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.add(style::primary("Назад", pal)).clicked() {
+            action = DialogAction::Close;
+        }
+    });
+    action
+}
+
 enum DialogAction {
     None,
     BrowseKey(KeyTarget),
@@ -2781,8 +3814,8 @@ enum DialogAction {
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.label(label);
-    ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+    let pal = style::pal(ui.ctx());
+    style::field(ui, label, value, &pal);
 }
 fn auth_label(auth: &str) -> &str {
     match auth {
@@ -2818,32 +3851,59 @@ fn endpoint_view(
     id: &str,
     title: &str,
 ) -> bool {
+    let pal = style::pal(ui.ctx());
     let mut browse = false;
     ui.push_id(id, |ui| {
-        ui.separator();
-        ui.label(RichText::new(title).color(tone(ui, Tone::Accent)));
-        field(ui, "SSH-хост", &mut endpoint.host);
-        ui.columns(2, |columns| {
-            field(&mut columns[0], "SSH-порт", port);
-            field(&mut columns[1], "Пользователь", &mut endpoint.user);
-        });
-        ui.label("Авторизация");
-        egui::ComboBox::from_id_salt("auth")
-            .selected_text(auth_label(&endpoint.auth))
-            .show_ui(ui, |ui| {
-                for auth in ["agent", "key", "password"] {
-                    ui.selectable_value(&mut endpoint.auth, auth.into(), auth_label(auth));
+        style::group(ui, title, pal.ink, &pal, |ui| {
+            ui.columns(3, |columns| {
+                field(&mut columns[0], "SSH-хост", &mut endpoint.host);
+                field(&mut columns[1], "SSH-порт", port);
+                field(&mut columns[2], "Пользователь", &mut endpoint.user);
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Авторизация").size(13.0).color(pal.dim));
+                for auth in ["agent", "password", "key"] {
+                    if ui
+                        .add(style::choice(auth_label(auth), endpoint.auth == auth, &pal))
+                        .clicked()
+                    {
+                        endpoint.auth = auth.into();
+                    }
                 }
             });
-        ui.add_enabled_ui(endpoint.auth == "key", |ui| {
-            ui.label("Файл приватного ключа");
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    browse = ui.button("Обзор…").clicked();
-                    ui.add(
-                        egui::TextEdit::singleline(&mut endpoint.key)
-                            .desired_width(ui.available_width()),
+            match endpoint.auth.as_str() {
+                "agent" => {
+                    ui.label(
+                        RichText::new("Нужен работающий SSH-agent с добавленным ключом.")
+                            .size(13.0)
+                            .color(pal.dim),
                     );
+                }
+                "password" => {
+                    ui.label(
+                        RichText::new("Пароль спросим при подключении. Он не сохраняется.")
+                            .size(13.0)
+                            .color(pal.dim),
+                    );
+                }
+                _ => {}
+            }
+            ui.add_enabled_ui(endpoint.auth == "key", |ui| {
+                ui.label(
+                    RichText::new("Файл приватного ключа")
+                        .size(13.0)
+                        .color(pal.dim),
+                );
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        browse = ui.add(style::secondary("Обзор…", &pal)).clicked();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut endpoint.key)
+                                .font(egui::TextStyle::Monospace)
+                                .margin(egui::vec2(10.0, 9.0))
+                                .desired_width(ui.available_width()),
+                        );
+                    });
                 });
             });
         });
@@ -2851,6 +3911,7 @@ fn endpoint_view(
     browse
 }
 fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> DialogAction {
+    let pal = style::pal(ui.ctx());
     let mut action = DialogAction::None;
     ui.heading(if form.editing {
         "Редактирование туннеля"
@@ -2858,90 +3919,171 @@ fn form_view(ui: &mut egui::Ui, form: &mut TunnelForm, max_height: f32) -> Dialo
         "Новый туннель"
     });
     if !form.error.is_empty() {
-        ui.colored_label(tone(ui, Tone::Error), &form.error);
+        ui.colored_label(pal.error, &form.error);
     }
     let content_height = max_height - if form.error.is_empty() { 0.0 } else { 45.0 };
     ui.add_enabled_ui(!form.busy && !form.picking(), |ui| {
-        egui::ScrollArea::vertical().id_salt("form_scroll").max_height(content_height).show(ui, |ui| {
-            field(ui, "Название туннеля", &mut form.draft.name);
-            ui.label("Тип туннеля");
-            egui::ComboBox::from_id_salt("kind").selected_text(match form.draft.kind.as_str() { "R" => "Обратный · -R", "D" => "SOCKS5 · -D", _ => "Локальный · -L" }).show_ui(ui, |ui| {
-                for (value, label) in [("L", "Локальный · -L"), ("R", "Обратный · -R"), ("D", "SOCKS5 · -D")] {
-                    ui.selectable_value(&mut form.draft.kind, value.into(), label);
-                }
-            });
-            if endpoint_view(ui, &mut form.draft.server, &mut form.server_port, "server", "Конечный SSH-сервер") {
-                action = DialogAction::BrowseKey(KeyTarget::Server);
-            }
-            ui.separator();
-            ui.label(RichText::new("Переадресация").color(tone(ui, Tone::Accent)));
-            ui.weak(match form.draft.kind.as_str() {
-                "R" => "Порт на SSH-сервере → сервис на вашем устройстве.",
-                "D" => "Локальный SOCKS5-прокси → сеть SSH-сервера.",
-                _ => "Локальный порт → сервис со стороны SSH-сервера.",
-            });
-            ui.columns(2, |columns| {
-                field(&mut columns[0], "Адрес прослушивания", &mut form.draft.bind);
-                field(&mut columns[1], "Порт прослушивания", &mut form.port);
-            });
-            if form.draft.kind != "D" {
-                ui.columns(2, |columns| {
-                    field(&mut columns[0], "Адрес назначения", &mut form.draft.target);
-                    field(&mut columns[1], "Порт назначения", &mut form.target_port);
-                });
-            }
-            ui.checkbox(&mut form.draft.reconnect, "Восстанавливать после разрыва");
-            if ui.checkbox(&mut form.draft.jumps_enabled, "Подключаться через jump-хосты").changed() && form.draft.jumps_enabled && form.draft.jumps.is_empty() {
-                form.draft.jumps.push(Endpoint::default()); form.jump_ports.push("22".into());
-            }
-            if form.draft.jumps_enabled {
-                ui.weak("Соединение проходит через узлы сверху вниз, затем к конечному SSH-серверу.");
-                let mut jump_action = None;
-                let count = form.draft.jumps.len();
-                for index in 0..count {
-                    if endpoint_view(ui, &mut form.draft.jumps[index], &mut form.jump_ports[index], &format!("jump_{index}"), &format!("Jump-хост {}", index + 1)) {
-                        action = DialogAction::BrowseKey(KeyTarget::Jump(index));
+        egui::ScrollArea::vertical()
+            .id_salt("form_scroll")
+            .max_height(content_height)
+            .show(ui, |ui| {
+                field(ui, "Название туннеля", &mut form.draft.name);
+                ui.add_space(4.0);
+                ui.label(RichText::new("Тип туннеля").size(13.0).color(pal.dim));
+                ui.columns(3, |columns| {
+                    for (column, (value, name, flag)) in columns.iter_mut().zip([
+                        ("L", "Локальный", "-L"),
+                        ("R", "Обратный", "-R"),
+                        ("D", "SOCKS5", "-D"),
+                    ]) {
+                        let selected = form.draft.kind == value;
+                        if column
+                            .add_sized(
+                                [column.available_width(), 44.0],
+                                style::choice(&format!("{value}   {name} · {flag}"), selected, &pal),
+                            )
+                            .clicked()
+                        {
+                            form.draft.kind = value.into();
+                        }
                     }
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(index > 0, egui::Button::new("↑ Выше")).clicked() { jump_action = Some((index, -1)); }
-                        if ui.add_enabled(index + 1 < count, egui::Button::new("↓ Ниже")).clicked() { jump_action = Some((index, 1)); }
-                        if ui.button("Удалить узел").clicked() { jump_action = Some((index, 0)); }
+                });
+                ui.add_space(6.0);
+                if endpoint_view(
+                    ui,
+                    &mut form.draft.server,
+                    &mut form.server_port,
+                    "server",
+                    "Конечный SSH-сервер",
+                ) {
+                    action = DialogAction::BrowseKey(KeyTarget::Server);
+                }
+                ui.add_space(6.0);
+                style::group(ui, "Переадресация", pal.accent, &pal, |ui| {
+                    ui.label(
+                        RichText::new(match form.draft.kind.as_str() {
+                            "R" => "Порт на SSH-сервере → сервис на вашем устройстве.",
+                            "D" => "Локальный SOCKS5-прокси → сеть SSH-сервера.",
+                            _ => "Локальный порт → сервис со стороны SSH-сервера.",
+                        })
+                        .color(pal.dim),
+                    );
+                    let target = form.draft.kind != "D";
+                    ui.columns(if target { 4 } else { 2 }, |columns| {
+                        field(&mut columns[0], "Адрес прослушивания", &mut form.draft.bind);
+                        field(&mut columns[1], "Порт прослушивания", &mut form.port);
+                        if target {
+                            field(&mut columns[2], "Адрес назначения", &mut form.draft.target);
+                            field(&mut columns[3], "Порт назначения", &mut form.target_port);
+                        }
                     });
-                }
-                if let Some((index, delta)) = jump_action {
-                    if delta == 0 {
-                        form.draft.jumps.remove(index); form.jump_ports.remove(index);
-                        if form.draft.jumps.is_empty() { form.draft.jumps_enabled = false; }
-                    } else { form.swap_jump(index, index.saturating_add_signed(delta)); }
-                }
-                if ui.button("+ Добавить jump-хост").clicked() {
-                    form.draft.jumps.push(Endpoint::default()); form.jump_ports.push("22".into());
-                }
-            }
-        });
+                    let mut jumps_changed = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut form.draft.reconnect, "Восстанавливать после разрыва");
+                        jumps_changed = ui
+                            .checkbox(&mut form.draft.jumps_enabled, "Подключаться через jump-хосты")
+                            .changed();
+                    });
+                    if jumps_changed && form.draft.jumps_enabled && form.draft.jumps.is_empty() {
+                        form.draft.jumps.push(Endpoint::default());
+                        form.jump_ports.push("22".into());
+                    }
+                    if form.draft.jumps_enabled {
+                        ui.label(
+                            RichText::new(
+                                "Соединение проходит через узлы сверху вниз, затем к конечному SSH-серверу.",
+                            )
+                            .color(pal.dim),
+                        );
+                        let mut jump_action = None;
+                        let count = form.draft.jumps.len();
+                        for index in 0..count {
+                            if endpoint_view(
+                                ui,
+                                &mut form.draft.jumps[index],
+                                &mut form.jump_ports[index],
+                                &format!("jump_{index}"),
+                                &format!("Jump-хост {}", index + 1),
+                            ) {
+                                action = DialogAction::BrowseKey(KeyTarget::Jump(index));
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add_enabled(index > 0, style::secondary("↑ Выше", &pal))
+                                    .clicked()
+                                {
+                                    jump_action = Some((index, -1));
+                                }
+                                if ui
+                                    .add_enabled(index + 1 < count, style::secondary("↓ Ниже", &pal))
+                                    .clicked()
+                                {
+                                    jump_action = Some((index, 1));
+                                }
+                                if ui.add(style::secondary("Удалить узел", &pal)).clicked() {
+                                    jump_action = Some((index, 0));
+                                }
+                            });
+                        }
+                        if let Some((index, delta)) = jump_action {
+                            if delta == 0 {
+                                form.draft.jumps.remove(index);
+                                form.jump_ports.remove(index);
+                                if form.draft.jumps.is_empty() {
+                                    form.draft.jumps_enabled = false;
+                                }
+                            } else {
+                                form.swap_jump(index, index.saturating_add_signed(delta));
+                            }
+                        }
+                        if ui
+                            .add(style::choice("+ Добавить jump-хост", false, &pal))
+                            .clicked()
+                        {
+                            form.draft.jumps.push(Endpoint::default());
+                            form.jump_ports.push("22".into());
+                        }
+                    }
+                });
+            });
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Отмена").clicked() { action = DialogAction::Close; }
-            if ui.button("Сохранить").clicked() { action = DialogAction::SaveForm(false); }
-            if form.editing && form.draft.enabled && ui.button("Сохранить выключенным").clicked() { action = DialogAction::SaveForm(true); }
+            ui.label(
+                RichText::new("Ctrl+S — сохранить · Esc — отмена")
+                    .monospace()
+                    .size(13.0)
+                    .color(pal.dim),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(style::primary("Сохранить", &pal)).clicked() {
+                    action = DialogAction::SaveForm(false);
+                }
+                if form.editing
+                    && form.draft.enabled
+                    && ui.add(style::secondary("Сохранить выключенным", &pal)).clicked()
+                {
+                    action = DialogAction::SaveForm(true);
+                }
+                if ui.add(style::secondary("Отмена", &pal)).clicked() {
+                    action = DialogAction::Close;
+                }
+            });
         });
     });
     if form.busy {
-        ui.weak("Сохраняем…");
+        ui.label(RichText::new("Сохраняем…").color(pal.dim));
     }
     #[cfg(target_os = "linux")]
     if form.picking.is_some() {
         ui.horizontal_wrapped(|ui| {
-            ui.weak("Выберите файл ключа в открывшемся диалоге…");
-            if ui.button("Отменить выбор").clicked() {
+            ui.label(RichText::new("Выберите файл ключа в открывшемся диалоге…").color(pal.dim));
+            if ui.add(style::secondary("Отменить выбор", &pal)).clicked() {
                 form.picking = None;
             }
         });
     }
     action
 }
-
-const HELP: &str = "Диспетчерская\n1 / 2  Вкладки «Туннели» и «Приложения»\n↑ / ↓  Выбрать туннель или правило\nSpace  Запуск / остановка / отмена подключения\nEnter  Открыть запрос ожидающего туннеля\nN / E  Создать / изменить\nL      Журнал\nDelete Удалить\nS      Настройки\n? / F1 Справка\nQ      Меню выхода\n\nВ формах\nTab / Shift+Tab  Следующее / предыдущее поле\nCtrl+S / Ctrl+Enter  Сохранить\nEsc  Назад / отмена\n\nL: локальный порт → сервис со стороны SSH-сервера.\nR: порт на SSH-сервере → сервис со стороны вашего устройства.\nD: локальный SOCKS5-прокси → сеть SSH-сервера.\n\nПриложения: правило направляет трафик выбранного исполняемого файла через туннель типа D. UDP идёт через туннель, если в карточке туннеля включён «UDP через сервер» (на сервер загружается помощник КРОТа); иначе UDP блокируется. QUIC (UDP 443) блокируется, пока в карточке правила не включено его туннелирование. Если туннель не работает, сеть приложения закрыта, пока в правиле не выбрано «Пускать напрямую»: тогда напрямую идёт весь трафик, включая UDP.\n\nJump-хосты используются по порядку сверху вниз. У каждого собственные параметры входа.\n\nПароли не сохраняются. Новые и изменённые ключи узлов требуют проверки. «Позже» оставляет запрос на туннеле: откройте его кнопкой «Разобраться». Остальные туннели продолжают работать.\n\nКрестик закрывает диспетчерскую, а КРОТ и туннели продолжают работать в фоне. Открыть окно снова можно через значок в трее или повторным запуском КРОТа. Q или «Выход» открывают меню: оставить туннели в фоне или остановить КРОТа. Включённые туннели восстановятся после нового запуска. Ручная остановка выключает восстановление этого туннеля. Ошибка подключения не сбрасывает выбор.\n\nВ настройках можно включить запуск в фоне после входа в систему. Если требуется пароль или проверка узла, туннель ждёт открытия диспетчерской.\n\nНа заставке «В диспетчерскую» и Enter / Esc открывают список, подключение продолжается.";
 
 #[cfg(test)]
 mod tests {
@@ -3067,7 +4209,10 @@ mod tests {
     fn text_rect(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
         fn find(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
             match shape {
-                egui::Shape::Text(text) if text.galley.text() == label => {
+                // Main buttons are drawn in capitals, so labels are found regardless of case.
+                egui::Shape::Text(text)
+                    if text.galley.text().to_uppercase() == label.to_uppercase() =>
+                {
                     Some(text.galley.rect.translate(text.pos.to_vec2()))
                 }
                 egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
@@ -3437,6 +4582,7 @@ mod tests {
         assert_eq!(form.signature(), before);
         assert!(!form.error.is_empty());
     }
+
     #[test]
     fn version_opens_about_with_current_build_and_public_repository() {
         let ctx = egui::Context::default();
@@ -3588,7 +4734,7 @@ mod tests {
                 render(&mut app, &ctx, size);
                 app.started = Instant::now() - Duration::from_millis(200);
                 let output = render(&mut app, &ctx, size);
-                assert!(text_rect(&output, &mascot("head", 1)).is_some());
+                assert!(app.anim_ms().is_some_and(|ms| ms >= 200));
                 for label in ["Ещё фраза", "github.com/Dudod1n/KPOT", "В диспетчерскую"]
                 {
                     assert!(
@@ -3598,8 +4744,9 @@ mod tests {
                     );
                 }
                 app.snapshot.as_mut().unwrap().config.settings.motion = false;
-                let output = render(&mut app, &ctx, size);
-                assert!(text_rect(&output, &mascot("head", 0)).is_some());
+                render(&mut app, &ctx, size);
+                assert!(app.anim_ms().is_none());
+                assert_eq!(style::Pose::at(app.anim_ms(), true).look, 0);
             }
         }
     }
@@ -4193,19 +5340,29 @@ mod tests {
         }
     }
     #[test]
-    fn animation_has_four_positions_and_180ms_cadence() {
+    fn mole_looks_left_right_centre_and_stays_still_without_motion() {
         assert_eq!(FRAME_TIME, Duration::from_millis(180));
-        assert_eq!(mascot("running", 0), mascot("running", 2));
-        assert_eq!(mascot("running", 0), mascot("running", 4));
-        assert_ne!(mascot("running", 0), mascot("running", 1));
-        assert_ne!(mascot("running", 1), mascot("running", 3));
-        assert!(mascot("running", 3).contains("(__)\\___/ /"));
-        assert_eq!(mascot("running", 1).lines().count(), 6);
+        let looks: Vec<i8> = [0, 1499, 1500, 3000, 4500]
+            .map(|ms| style::Pose::at(Some(ms), false).look)
+            .to_vec();
+        assert_eq!(looks, [-1, -1, 1, 0, -1]);
+        assert_ne!(
+            style::Pose::at(Some(0), true).rays,
+            style::Pose::at(Some(800), true).rays
+        );
+        assert!(style::Pose::at(Some(0), false).rays.is_none());
+        let still = style::Pose::at(None, true);
+        assert_eq!(
+            (still.look, still.lamp_dim, still.rays),
+            (0, false, Some(true))
+        );
         let mut app = Desktop::new(None, true);
         app.snapshot = Some(snapshot());
         app.snapshot.as_mut().unwrap().config.settings.motion = false;
         app.started = Instant::now() - Duration::from_millis(550);
-        assert_eq!(app.frame(), 0);
+        assert!(app.anim_ms().is_none());
+        app.snapshot.as_mut().unwrap().config.settings.motion = true;
+        assert!(app.anim_ms().is_some());
     }
     #[test]
     fn invalid_ports_survive_validation_and_jump_reordering() {
@@ -4289,7 +5446,7 @@ mod tests {
                 let rect = text_rect(&output, label).unwrap_or_else(|| panic!("Missing {label}"));
                 assert!(
                     output.shapes.iter().any(|shape| {
-                        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+                        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().to_uppercase() == label.to_uppercase())
                             && shape.clip_rect.contains_rect(rect)
                     }),
                     "{label} is clipped at the default window size: {rect:?}"
@@ -4368,9 +5525,15 @@ mod tests {
         configure(&ctx, "dark");
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             ctx.fonts_mut(|fonts| {
-                let text = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя_()[]/#\\.<>-↟◷◌○→↑↓┌─┐│└┬┘";
-                for character in text.chars() {
-                    assert!(fonts.has_glyph(&FontId::monospace(14.0), character), "Missing bundled glyph {character}");
+                let text = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя_()[]/#\\.<>-↟◷◌○●◐!→←↑↓«»·…—×┌─┐│└┬┘";
+                for font in [
+                    egui::FontId::monospace(14.0),
+                    egui::FontId::proportional(15.0),
+                    egui::FontId::new(23.0, style::bold_family()),
+                ] {
+                    for character in text.chars() {
+                        assert!(fonts.has_glyph(&font, character), "Missing bundled glyph {character} in {font:?}");
+                    }
                 }
             });
         });
@@ -4707,20 +5870,37 @@ mod tests {
         }
     }
     #[test]
-    fn theme_switches_preserve_terminal_typography_and_palette() {
+    fn theme_switches_preserve_medeo_typography_and_palette() {
         let ctx = egui::Context::default();
-        for theme in ["dark", "light", "dark", "system"] {
+        for theme in ["dark", "light", "build", "dark", "system"] {
             configure(&ctx, theme);
             for mode in [egui::Theme::Dark, egui::Theme::Light] {
+                let style = ctx.style_of(mode);
+                assert!(style.override_font_id.is_none());
+                let family = |text: egui::TextStyle| style.text_styles[&text].family.clone();
                 assert_eq!(
-                    ctx.style_of(mode).override_font_id.as_ref().unwrap().family,
-                    FontFamily::Monospace
+                    family(egui::TextStyle::Body),
+                    egui::FontFamily::Proportional
                 );
                 assert_eq!(
-                    ctx.style_of(mode).visuals.dark_mode,
-                    mode == egui::Theme::Dark
+                    family(egui::TextStyle::Monospace),
+                    egui::FontFamily::Monospace
                 );
+                assert_eq!(style.visuals.dark_mode, mode == egui::Theme::Dark);
             }
+        }
+        let fonts = style::fonts();
+        for (family, first) in [
+            (egui::FontFamily::Proportional, "MedeoSans-Regular"),
+            (style::bold_family(), "MedeoSans-Bold"),
+            (egui::FontFamily::Monospace, "MedeoMono-Regular"),
+        ] {
+            let chain = &fonts.families[&family];
+            assert_eq!(chain[0], first);
+            assert!(
+                chain.iter().any(|name| name == "Hack"),
+                "{family:?} keeps the fallback"
+            );
         }
         assert_eq!(
             ctx.style_of(egui::Theme::Dark).visuals.panel_fill,
@@ -4734,9 +5914,8 @@ mod tests {
             let mut colors = Vec::new();
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    colors = [Tone::Accent, Tone::Ok, Tone::Warn, Tone::Error]
-                        .map(|color| tone(ui, color))
-                        .to_vec();
+                    let pal = style::pal(ui.ctx());
+                    colors = [pal.accent, pal.ok, pal.warn, pal.error].to_vec();
                 });
             });
             colors
@@ -4855,6 +6034,7 @@ mod tests {
         });
         assert!(!render(&mut app, &ctx, [700.0, 500.0]).shapes.is_empty());
     }
+
     #[test]
     fn udp_is_offered_only_with_consent_and_its_state_shows_on_tunnel_and_rule() {
         let ctx = egui::Context::default();
@@ -4917,6 +6097,8 @@ mod tests {
             .udp_helper
             .insert("rule".into(), Default::default());
         app.snapshot = Some(snapshot.clone());
+        // The first frame at a new size still applies the offset scrolled in the small window.
+        render(&mut app, &ctx, [1000.0, 720.0]);
         let output = render(&mut app, &ctx, [1000.0, 720.0]);
         assert!(text_rect(&output, "UDP через сервер: работает, уровень 1").is_some());
         assert!(text_rect(&output, "Выключить UDP").is_some());
