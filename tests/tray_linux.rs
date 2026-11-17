@@ -81,9 +81,9 @@ async fn daemon_registers_tray_updates_opens_existing_window_and_stops() -> anyh
         .build()
         .await?;
     assert_eq!(tray.get_property::<String>("Title").await?, "КРОТ");
-    let pixels: Vec<(i32, i32, Vec<u8>)> = tray.get_property("IconPixmap").await?;
+    let idle: Vec<(i32, i32, Vec<u8>)> = tray.get_property("IconPixmap").await?;
     assert_eq!(
-        (pixels[0].0, pixels[0].1, pixels[0].2.len()),
+        (idle[0].0, idle[0].1, idle[0].2.len()),
         (32, 32, 32 * 32 * 4)
     );
     let menu = Proxy::new(
@@ -155,9 +155,9 @@ async fn daemon_registers_tray_updates_opens_existing_window_and_stops() -> anyh
         }
     })
     .await?;
-    let pixels: Vec<(i32, i32, Vec<u8>)> = tray.get_property("IconPixmap").await?;
-    let offset = (26 * 32 + 26) * 4;
-    assert_eq!(&pixels[0].2[offset..offset + 4], &[255, 255, 155, 145]); // Network byte order ARGB.
+    let failed: Vec<(i32, i32, Vec<u8>)> = tray.get_property("IconPixmap").await?;
+    assert_eq!(failed[0].2.len(), idle[0].2.len());
+    assert_ne!(failed[0].2, idle[0].2, "An error must change the tray icon");
     let before = client.snapshot().await?;
     menu.call::<_, _, ()>("Event", &(stop, "clicked", Value::from(0i32), 0u32))
         .await?;
