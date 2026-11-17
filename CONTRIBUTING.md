@@ -72,7 +72,7 @@ SSH и обращения к фоновому процессу выполняю�
 
 | Модуль | Назначение |
 | --- | --- |
-| `src/app.rs`, `src/bin/krot-cli.rs` | Аргументы и команды окна и CLI |
+| `src/main.rs`, `src/bin/krot-cli.rs`, `src/app.rs` | Точки входа окна и CLI, общие аргументы и команды |
 | `src/desktop.rs`, `src/desktop/`, `src/launcher.rs` | Окно, экраны и решения при запуске |
 | `src/background.rs`, `src/tray.rs` | Фоновый процесс, локальный протокол с проверкой HMAC, трей |
 | `src/config.rs` | Конфигурация JSON и атомарная запись |
