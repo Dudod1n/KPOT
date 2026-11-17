@@ -58,25 +58,26 @@ pub fn program() -> std::io::Result<PathBuf> {
     Ok(current)
 }
 
-fn refusal(config: &Path) -> anyhow::Result<PathBuf> {
-    Ok(crate::config::Store::new(config)?.sidecar(".elevation-off"))
+fn choice(config: &Path) -> anyhow::Result<PathBuf> {
+    Ok(crate::config::Store::new(config)?.sidecar(".elevation-on"))
 }
 
-/// The user has not turned remembering off with `krot-cli elevation disable`.
+/// The user has turned remembering on with `krot-cli elevation enable`. It is off unless
+/// asked for: the task runs КРОТ from its directory with administrator rights and no question.
 pub fn remembering(config: &Path) -> bool {
-    refusal(config).is_ok_and(|path| !path.exists())
+    choice(config).is_ok_and(|path| path.exists())
 }
 
-/// Turning remembering off survives later consents until it is turned on again.
+/// The choice survives later consents until it is changed again.
 pub fn set_remembering(config: &Path, enabled: bool) -> anyhow::Result<()> {
-    let path = refusal(config)?;
+    let path = choice(config)?;
     if enabled {
+        std::fs::write(&path, b"")?;
+    } else {
         match std::fs::remove_file(&path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error)?,
             _ => {}
         }
-    } else {
-        std::fs::write(&path, b"")?;
     }
     Ok(())
 }
@@ -550,16 +551,17 @@ mod tests {
     }
 
     #[test]
-    fn refusal_to_remember_persists_per_configuration() {
+    fn remembering_is_off_until_asked_for_and_persists_per_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("config.json");
+        assert!(!remembering(&config));
+        set_remembering(&config, true).unwrap();
+        set_remembering(&config, true).unwrap();
         assert!(remembering(&config));
+        assert!(!remembering(&directory.path().join("other.json")));
+        set_remembering(&config, false).unwrap();
         set_remembering(&config, false).unwrap();
         assert!(!remembering(&config));
-        assert!(remembering(&directory.path().join("other.json")));
-        set_remembering(&config, true).unwrap();
-        set_remembering(&config, true).unwrap();
-        assert!(remembering(&config));
     }
 
     #[test]
