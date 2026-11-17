@@ -59,15 +59,28 @@ KROT_RELAY_DIR="$PWD/relay-bin" KROT_REQUIRE_RELAY=1 cargo build --locked --bins
 
 Тесты помощника под `aarch64` запускаются через `qemu-user`: задайте `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64` и `KROT_RELAY_RUNNER=qemu-aarch64`.
 
-Linux-тест трея запускается отдельно на изолированной D-Bus шине:
+Linux-тесты трея и диалога выбора ключа через XDG Desktop Portal запускаются отдельно на изолированной D-Bus шине:
 
 ```sh
 dbus-run-session -- cargo test --locked --test tray_linux -- --ignored
+dbus-run-session -- cargo test --locked --lib key_portal -- --ignored
 ```
 
 ## Устройство кода
 
 SSH и обращения к фоновому процессу выполняются вне потока окна. Формат конфигурации и локальный протокол требуют совместимости между окном, CLI и фоновым процессом.
+
+| Модуль | Назначение |
+| --- | --- |
+| `src/app.rs`, `src/bin/krot-cli.rs` | Аргументы и команды окна и CLI |
+| `src/desktop.rs`, `src/desktop/`, `src/launcher.rs` | Окно, экраны и решения при запуске |
+| `src/background.rs`, `src/tray.rs` | Фоновый процесс, локальный протокол с проверкой HMAC, трей |
+| `src/config.rs` | Конфигурация JSON и атомарная запись |
+| `src/ssh.rs` | SSH-подключения, jump-хосты и перенаправления L/R/D |
+| `src/apps.rs`, `src/divert.rs`, `src/divert/`, `src/proxy.rs` | Правила приложений и перехват WinDivert в Windows |
+| `src/udp/`, `src/relay.rs`, `proto/`, `relay/` | UDP через сервер: клиентская часть, встроенный помощник, формат кадров, `krot-relay` |
+| `src/autostart.rs`, `src/tasks.rs` | Автозапуск и задания планировщика Windows |
+| `src/update.rs` | Проверка и установка обновлений |
 
 ## Изменения и pull request
 
