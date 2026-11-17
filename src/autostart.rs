@@ -480,7 +480,10 @@ pub fn is_enabled(path: &Path) -> Result<bool> {
     {
         Ok(
             registry::value(&name)?.is_some_and(|value| windows_owned(&value, &path))
-                || crate::tasks::registered(&path, crate::tasks::Kind::Logon, false)?,
+                // Without the Task Scheduler autostart falls back to the `Run` key, so its
+                // failure means no task, not an unknown state.
+                || crate::tasks::registered(&path, crate::tasks::Kind::Logon, false)
+                    .unwrap_or(false),
         )
     }
     #[cfg(target_os = "linux")]
