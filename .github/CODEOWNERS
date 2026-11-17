@@ -11,6 +11,9 @@
 /Cargo.lock @Dudod1n
 /build.rs @Dudod1n
 /src/relay.rs @Dudod1n
+/src/tasks.rs @Dudod1n
+/src/launcher.rs @Dudod1n
+/src/udp/ @Dudod1n
 /proto/ @Dudod1n
 /relay/ @Dudod1n
 /licenses/musl/ @Dudod1n

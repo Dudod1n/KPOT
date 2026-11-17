@@ -50,7 +50,7 @@ def package(tag, builds, output, notes_path):
               'В Windows файлы WinDivert должны лежать рядом с krot.exe: они нужны вкладке «Приложения».\n\n'
               'Код КРОТа распространяется по GNU GPL версии 3: см. LICENSE.\n'
               'Лицензии зависимостей: THIRD_PARTY_NOTICES.txt.\n'
-              'WinDivert (Windows) распространяется по LGPL версии 3: см. WinDivert-LICENSE.txt.\n'
+              'WinDivert (Windows) распространяется по LGPL версии 3 или новее либо GPL версии 2 или новее: см. WinDivert-LICENSE.txt.\n'
               f'Руководство и соответствующие исходники: https://github.com/Dudod1n/KPOT/tree/{tag}\n')
     for platform, runner, suffix in platforms:
         source = builds / f'krot-rust-{runner}-X64'
