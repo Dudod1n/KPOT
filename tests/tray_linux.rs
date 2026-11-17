@@ -156,8 +156,20 @@ async fn daemon_registers_tray_updates_opens_existing_window_and_stops() -> anyh
     })
     .await?;
     let failed: Vec<(i32, i32, Vec<u8>)> = tray.get_property("IconPixmap").await?;
-    assert_eq!(failed[0].2.len(), idle[0].2.len());
+    // StatusNotifierItem pixmaps are ARGB in network byte order; the icon source is RGBA.
+    let argb = |badge| {
+        krot::icons::tray_icon(Some(badge))
+            .rgba
+            .chunks_exact(4)
+            .flat_map(|p| [p[3], p[0], p[1], p[2]])
+            .collect::<Vec<u8>>()
+    };
     assert_ne!(failed[0].2, idle[0].2, "An error must change the tray icon");
+    assert_eq!(
+        failed[0].2,
+        argb(krot::tray::ERROR_BADGE),
+        "The error badge is shown"
+    );
     let before = client.snapshot().await?;
     menu.call::<_, _, ()>("Event", &(stop, "clicked", Value::from(0i32), 0u32))
         .await?;

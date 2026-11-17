@@ -684,8 +684,12 @@ fn rename_file(source: &Path, target: &Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     fs::rename(source, target)
 }
-/// Tests keep the locks beside the locked directory, so a test's temporary directory takes
-/// them away; the same directory still maps to the same lock.
+/// Root for the installation locks of `locked`.
+///
+/// A release build has one root for every directory, beside the default configuration;
+/// `locked` is not used there, and the lock file itself is told apart by `install_guard`.
+/// Tests keep the root beside the locked directory instead, so a test's temporary directory
+/// takes its locks away; one directory still maps to one lock in both builds.
 fn lock_directory(#[cfg_attr(not(test), allow(unused_variables))] locked: &Path) -> PathBuf {
     #[cfg(test)]
     {

@@ -5468,11 +5468,25 @@ mod tests {
     }
     #[test]
     fn mole_looks_left_right_centre_and_stays_still_without_motion() {
-        let looks: HashSet<i8> = (0..10_000)
-            .step_by(100)
-            .map(|ms| style::Pose::at(Some(ms), false).look)
-            .collect();
-        assert_eq!(looks, HashSet::from([-1, 0, 1]));
+        // A redraw at least every half second, but not a busy loop.
+        assert!((Duration::from_millis(50)..=Duration::from_millis(500)).contains(&FRAME_TIME));
+        // Runs of one look over ten seconds: left, right, centre in turn, each held for a
+        // second or more, so the pupils never flicker between frames.
+        let mut runs: Vec<(i8, u128)> = Vec::new();
+        for ms in (0..10_000).step_by(10) {
+            let look = style::Pose::at(Some(ms), false).look;
+            match runs.last_mut() {
+                Some((last, length)) if *last == look => *length += 10,
+                _ => runs.push((look, 10)),
+            }
+        }
+        let order: Vec<i8> = runs.iter().map(|(look, _)| *look).collect();
+        assert_eq!(&order[..3], &[-1, 1, 0]);
+        assert!(order.windows(3).all(|w| w[0] != w[1] && w[0] != w[2]));
+        assert!(
+            runs[..runs.len() - 1].iter().all(|(_, held)| *held >= 1000),
+            "{runs:?}"
+        );
         assert_ne!(
             style::Pose::at(Some(0), true).rays,
             style::Pose::at(Some(800), true).rays

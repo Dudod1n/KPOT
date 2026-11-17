@@ -13,6 +13,11 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
+/// Tray badge colours (RGBA): any error, then waiting or connecting, then running.
+pub const ERROR_BADGE: [u8; 4] = [255, 155, 145, 255];
+pub const WAITING_BADGE: [u8; 4] = [227, 188, 124, 255];
+pub const RUNNING_BADGE: [u8; 4] = [172, 208, 148, 255];
+
 #[derive(Debug)]
 pub enum Action {
     Open,
@@ -70,11 +75,11 @@ impl Status {
 
     fn badge(&self) -> Option<[u8; 4]> {
         if self.errors > 0 {
-            Some([255, 155, 145, 255])
+            Some(ERROR_BADGE)
         } else if self.waiting > 0 || self.connecting > 0 {
-            Some([227, 188, 124, 255])
+            Some(WAITING_BADGE)
         } else if self.running > 0 {
-            Some([172, 208, 148, 255])
+            Some(RUNNING_BADGE)
         } else {
             None
         }
@@ -311,7 +316,7 @@ mod tests {
         );
         let status = Status::from_snapshot(&snapshot);
         assert_eq!(status.label(), "Работает 1 из 2");
-        assert_eq!(status.badge(), Some([172, 208, 148, 255]));
+        assert_eq!(status.badge(), Some(RUNNING_BADGE));
         snapshot.runtimes.insert(
             "second".into(),
             Runtime {
@@ -321,13 +326,10 @@ mod tests {
         );
         assert_eq!(
             Status::from_snapshot(&snapshot).badge(),
-            Some([227, 188, 124, 255])
+            Some(WAITING_BADGE)
         );
         snapshot.runtimes.get_mut("second").unwrap().state = "error".into();
-        assert_eq!(
-            Status::from_snapshot(&snapshot).badge(),
-            Some([255, 155, 145, 255])
-        );
+        assert_eq!(Status::from_snapshot(&snapshot).badge(), Some(ERROR_BADGE));
         snapshot.prompts.insert(
             "second".into(),
             PendingPrompt {
@@ -347,7 +349,15 @@ mod tests {
         let status = Status::from_snapshot(&snapshot);
         assert_eq!((status.errors, status.waiting), (0, 1));
         assert!(status.label().contains("ожидают ответа: 1"));
-        assert_eq!(status.badge(), Some([227, 188, 124, 255]));
+        assert_eq!(status.badge(), Some(WAITING_BADGE));
         assert_eq!(Status::default().badge(), None);
+        let badges = [ERROR_BADGE, WAITING_BADGE, RUNNING_BADGE];
+        assert!(
+            badges
+                .iter()
+                .enumerate()
+                .all(|(i, a)| badges[i + 1..].iter().all(|b| a != b)),
+            "Every state has its own badge colour"
+        );
     }
 }
