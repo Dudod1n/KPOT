@@ -1,56 +1,33 @@
 # Инструкции проекта
 
+## Порядок работы
+
+GitHub Flow: ветка от `dev` → коммиты и push → PR в `dev` → ревью и проверки → слияние.
+`main` обновляется только PR `dev → main`, см. [docs/RELEASING.md](docs/RELEASING.md).
+
+- Ветка: `<тип>/<кратко-латиницей>`, с задачей — `<тип>/<номер>-<кратко>`, например `fix/42-ipv6-reject`.
+- Коммит и заголовок PR: `<тип>(<область>): <описание>`. Типы: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `build`, `ci`, `chore`, `release`. Область можно опустить. Описание на русском, со строчной буквы, без точки, о результате.
+- Связанные правки — в одном PR. Описание PR заполняй по шаблону; задачу указывай строкой `Closes #N`.
+- Задаче, созданной через API или MCP, ставь метку типа явно: `bug`, `enhancement` или `documentation`.
+- Перед push изменения кода выполни проверки из [CONTRIBUTING.md](CONTRIBUTING.md#проверки).
+- Ревью идёт по [REVIEW.md](REVIEW.md).
+
 ## Авторство коммитов Git
 
-При создании коммита самостоятельно подставляй имя и email своего агента для автора и коммитера. Передавай данные только на время вызова `git commit`. В Bash выбери свою команду и подставь сообщение коммита.
+Автора и коммитера задавай переменными окружения только на время вызова `git commit`. Codex — `Codex` и `codex@kpot.invalid`, Claude Code — `Claude` и `noreply@anthropic.com`.
 
 ```bash
-# Codex использует служебный адрес проекта.
-GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=codex@kpot.invalid \
-  GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=codex@kpot.invalid \
-  git commit -m "<commit message>"
-
-# Claude Code
-GIT_AUTHOR_NAME=Claude GIT_AUTHOR_EMAIL=noreply@anthropic.com \
-  GIT_COMMITTER_NAME=Claude GIT_COMMITTER_EMAIL=noreply@anthropic.com \
-  git commit -m "<commit message>"
+GIT_AUTHOR_NAME=<имя> GIT_AUTHOR_EMAIL=<адрес> \
+  GIT_COMMITTER_NAME=<имя> GIT_COMMITTER_EMAIL=<адрес> \
+  git commit -m "<сообщение>"
 ```
 
-Авторство задаётся только этими переменными. Не добавляй в сообщение коммита служебные строки вроде `Co-Authored-By:` или `Claude-Session:`.
+Не добавляй в сообщение коммита служебные строки вроде `Co-Authored-By:` или `Claude-Session:`.
 
-## GitHub MCP и локальный Git
+## Git и GitHub
 
-Всё, что меняет код и историю, делай локальным `git`, а работу с GitHub как с платформой — через GitHub MCP. Если GitHub MCP недоступен, используй `gh`.
+Код и историю меняй только локальным `git`: ветки, коммиты, `rebase`, `push` в свою ветку. Не создавай коммиты и ветки на стороне GitHub (`push_files`, `create_or_update_file`, `create_branch`, запись через `gh api`): они записываются от владельца токена в обход правил авторства.
 
-Правила ниже описывают действия и одинаково действуют для GitHub MCP, `gh` и прямых вызовов API. Названия инструментов и команд приведены как примеры.
+С GitHub как с платформой работай через GitHub MCP, а если он недоступен — через `gh`. Без спроса можно создавать и обновлять PR, комментарии и задачи, ставить существующие метки и читать Actions. Любое другое изменяющее действие — только с явного согласия пользователя: слияние PR и обновление его ветки, закрытие задачи или PR, запуск и отмена workflow, изменение меток и настроек репозитория.
 
-Локально через `git`:
-
-- чтение кода, `diff`, `log`, `blame`, поиск по репозиторию;
-- создание веток, коммиты, `rebase`, разрешение конфликтов;
-- `push` в свою ветку.
-
-Через GitHub MCP:
-
-- PR: создание, чтение, обновление описания, ревью и комментарии;
-- issues и sub-issues, назначение и снятие существующих меток;
-- GitHub Actions: статус запусков и логи заданий;
-- релизы и теги: только чтение;
-- чтение других репозиториев без клонирования: `get_file_contents`, `get_repository_tree`, `search_code`.
-
-Не создавай коммиты и ветки на стороне GitHub в обход локального `git`: `push_files`, `create_or_update_file`, `delete_file`, `create_branch`, запись файлов через `gh api`. Такой коммит записывается от владельца токена и обходит правила авторства выше.
-
-Только с явного согласия пользователя:
-
-- слияние PR и обновление его ветки: `merge_pull_request`, `update_pull_request_branch`, `gh pr merge`;
-- запуск, перезапуск и отмена workflow, удаление запусков и их журналов: `actions_run_trigger`, `gh workflow run`, `gh run rerun`, `gh run cancel`;
-- создание, форк и удаление репозиториев, изменение их настроек и правил: `create_repository`, `fork_repository`, `delete_repository`, `create_repository_ruleset`;
-- создание, изменение и удаление меток репозитория: `label_write`, `gh label`;
-- передача работы Copilot: `assign_copilot_to_issue`, `create_pull_request_with_copilot`;
-- публикация вне репозитория, например `create_gist`;
-- закрытие issue или PR;
-- любое другое изменяющее действие на GitHub, которого нет в списках выше.
-
-## Ссылки на сессии агентов
-
-Не публикуй ссылки на сессии и задачи агентов (например, `https://claude.ai/code/session_…`) нигде: в коммитах, описаниях PR, комментариях, issue и файлах репозитория.
+Не публикуй ссылки на сессии и задачи агентов (например, `https://claude.ai/code/session_…`) нигде: в коммитах, PR, комментариях, задачах и файлах репозитория.

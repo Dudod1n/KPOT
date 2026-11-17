@@ -19,8 +19,16 @@ files, and fails when a dependency has no usable license text. Standard license
 texts for reviewed crate versions whose published archives omit them are in
 `licenses/standard`.
 
+The interface uses the Medeo fonts (Medeo Sans Regular and Bold, Medeo Mono
+Regular) by DNF Studio and the Medeo Project Authors, release v1.1.0 from
+<https://github.com/DNFDEVS/medeo-font>, embedded unmodified in the executable.
+They are licensed under the SIL Open Font License 1.1; the license text, the
+copyright notices and the list of authors are in `licenses/fonts/medeo`, and
+`THIRD_PARTY_NOTICES.txt` in release archives includes them.
+
 The default egui fonts are Hack, Noto Emoji, Ubuntu Light, and emoji-icon-font.
-Their original license texts and copyright notices are in `licenses/fonts`.
+They remain as fallbacks for symbols the Medeo fonts lack. Their original
+license texts and copyright notices are in `licenses/fonts`.
 These fonts remain under their respective licenses; GPL-3.0-only does not
 replace their licensing terms.
 

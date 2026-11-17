@@ -4,8 +4,12 @@
 //! oldest datagram when full, a datagram older than `DATAGRAM_EXPIRY` is dropped instead of
 //! being sent, and datagrams towards the client stop once `IN_FLIGHT_WINDOW` bytes are
 //! unacknowledged, so they wait here, where expiry applies, and not in SSH or TCP buffers.
+//!
+//! Answers wait for the client in one queue per flow. The flows are served in turn and a full
+//! queue drops from the flow that holds most, so a flood into the port of one flow, which
+//! needs no credentials, costs the other flows neither their place nor their turn.
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     ops::Range,
@@ -33,8 +37,14 @@ const READS_PER_ROUND: usize = 64;
 const MAX_CONTROL: usize = 8192;
 /// Peers a flow remembers having sent to; answers from them keep the flow alive.
 const MAX_PEERS: usize = 32;
-/// Refused flow ids remembered so that each is answered by one `CLOSE` only.
+/// Flow ids the relay closed itself, remembered so that each is answered by one `CLOSE` only.
 const MAX_REFUSED: usize = 65_536;
+/// How long a closed id stays refused. The client does not answer a `CLOSE` of the relay and
+/// may give the id to a new flow later, so the id is held only while datagrams sent before the
+/// client read the `CLOSE` can still arrive.
+const REFUSED_HOLD: Duration = Duration::from_secs(10);
+/// Bytes a flow may write to the client before the next flow with answers takes its turn.
+const TURN_BYTES: usize = 2048;
 
 enum Exit {
     /// stdin closed: the SSH channel is gone.
@@ -82,6 +92,14 @@ struct Pending {
     at: Instant,
 }
 
+/// Answers of one flow waiting for the client.
+struct Replies {
+    queue: VecDeque<Pending>,
+    bytes: usize,
+    /// Bytes the flow may still write in its turn.
+    credit: usize,
+}
+
 /// The position and original enqueue time of a datagram in the stdout batch.
 struct OutputDatagram {
     bytes: Range<usize>,
@@ -105,7 +123,11 @@ struct Relay {
     input_start: usize,
     flows: HashMap<u32, Flow>,
     control: VecDeque<Control>,
-    data: VecDeque<Pending>,
+    /// Answers for the client by flow; no entry is empty.
+    data: HashMap<u32, Replies>,
+    /// The flows in `data`, each once, in the order of their turns.
+    turns: VecDeque<u32>,
+    data_count: usize,
     data_bytes: usize,
     /// The batch being written to stdout and how much of it is written.
     output: Vec<u8>,
@@ -122,8 +144,9 @@ struct Relay {
     stats: RelayStats,
     scratch: Vec<u8>,
     chunk: Vec<u8>,
-    /// Flows refused with `CLOSE`: further datagrams of them are dropped quietly.
-    refused: HashSet<u32>,
+    /// Flows refused with `CLOSE` and when: their datagrams are dropped quietly for
+    /// `REFUSED_HOLD`.
+    refused: HashMap<u32, Instant>,
     /// Bytes waiting in all flow queues together.
     flow_bytes: usize,
     /// Flows the descriptor limit allows, besides the relay's own descriptors.
@@ -224,6 +247,8 @@ fn descriptor_flows() -> u16 {
             limit = raised;
         }
     }
+    // `rlim_t` is narrower than `u64` on some 32-bit targets.
+    #[allow(clippy::unnecessary_cast)]
     let usable = (limit.rlim_cur as u64).saturating_sub(RELAY_RESERVED_DESCRIPTORS);
     usable.min(u64::from(RELAY_MAX_FLOWS)) as u16
 }
@@ -260,7 +285,9 @@ impl Relay {
             input_start: 0,
             flows: HashMap::new(),
             control: VecDeque::new(),
-            data: VecDeque::new(),
+            data: HashMap::new(),
+            turns: VecDeque::new(),
+            data_count: 0,
             data_bytes: 0,
             output: Vec::with_capacity(WRITE_BATCH + proto::MAX_FRAME),
             written: 0,
@@ -274,7 +301,7 @@ impl Relay {
             stats: RelayStats::default(),
             scratch: vec![0; 65_536],
             chunk: vec![0; READ_CHUNK],
-            refused: HashSet::new(),
+            refused: HashMap::new(),
             flow_bytes: 0,
             descriptor_flows: RELAY_MAX_FLOWS,
         }
@@ -355,13 +382,14 @@ impl Relay {
         }
     }
 
-    /// Milliseconds until the next timed duty, at most one report interval.
+    /// Milliseconds until the next timed duty, at most one report interval. Rounded up: a
+    /// wait rounded down to zero would spin the loop until the duty is due.
     fn timeout(&self, now: Instant) -> libc::c_int {
         let mut until = self.report_at.saturating_duration_since(now);
         if self.received_bytes != self.acknowledged {
             until = until.min((self.ack_at + ACK_INTERVAL).saturating_duration_since(now));
         }
-        until.as_millis().min(1000) as libc::c_int
+        until.as_micros().div_ceil(1000).min(1000) as libc::c_int
     }
 
     fn tick(&mut self, now: Instant) {
@@ -411,12 +439,11 @@ impl Relay {
             for _ in 0..stale {
                 self.stats.drops.add(DropReason::Expired);
             }
+            // A datagram of the client that crosses this `CLOSE` must not open the flow again:
+            // the client forgets the id once it reads the `CLOSE`.
             for flow in expired {
                 self.remove_flow(flow);
-                self.push_control(&Frame::Close {
-                    flow,
-                    reason: CloseReason::Idle,
-                });
+                self.refuse(flow, CloseReason::Idle, now);
             }
             self.stats.flows_active = self.flows.len() as u32;
             let stats = self.stats.clone();
@@ -436,6 +463,19 @@ impl Relay {
         let mut encoded = Vec::new();
         proto::encode(frame, &mut encoded);
         self.control.push_back(Control::Frame(encoded));
+    }
+
+    /// Closes a flow from this side; further datagrams of it are dropped quietly.
+    fn refuse(&mut self, flow: u32, reason: CloseReason, now: Instant) {
+        if self.refused.len() >= MAX_REFUSED {
+            self.refused
+                .retain(|_, at| now.saturating_duration_since(*at) < REFUSED_HOLD);
+            if self.refused.len() >= MAX_REFUSED {
+                self.refused.clear();
+            }
+        }
+        self.refused.insert(flow, now);
+        self.push_control(&Frame::Close { flow, reason });
     }
 
     fn read_input(&mut self) -> Result<(), Exit> {
@@ -526,31 +566,27 @@ impl Relay {
 
     fn send(&mut self, settings: Settings, id: u32, peer: SocketAddr, data: &[u8], now: Instant) {
         if !self.flows.contains_key(&id) {
-            // One `CLOSE` per refused flow, not one per datagram: datagrams that were already
+            // One `CLOSE` per closed flow, not one per datagram: datagrams that were already
             // on their way are dropped quietly.
-            if self.refused.contains(&id) {
-                self.stats.drops.add(DropReason::Channel);
-                return;
-            }
-            if self.refused.len() >= MAX_REFUSED {
-                self.refused.clear();
+            match self.refused.get(&id) {
+                Some(at) if now.saturating_duration_since(*at) < REFUSED_HOLD => {
+                    self.stats.drops.add(DropReason::Channel);
+                    return;
+                }
+                // The hold is over: the client may have given the id to a new flow.
+                Some(_) => {
+                    self.refused.remove(&id);
+                }
+                None => {}
             }
             if self.flows.len() >= usize::from(settings.max_flows) {
                 self.stats.flows_refused += 1;
-                self.refused.insert(id);
-                self.push_control(&Frame::Close {
-                    flow: id,
-                    reason: CloseReason::Limit,
-                });
+                self.refuse(id, CloseReason::Limit, now);
                 return;
             }
             let Ok((socket, dual)) = open_socket() else {
                 self.stats.drops.add(DropReason::Channel);
-                self.refused.insert(id);
-                self.push_control(&Frame::Close {
-                    flow: id,
-                    reason: CloseReason::Socket,
-                });
+                self.refuse(id, CloseReason::Socket, now);
                 return;
             };
             self.stats.flows_opened += 1;
@@ -688,21 +724,79 @@ impl Relay {
                 },
                 &mut frame,
             );
-            while self.data.len() >= CHANNEL_QUEUE_DATAGRAMS
-                || self.data_bytes + frame.len() > CHANNEL_QUEUE_BYTES
-            {
-                let Some(old) = self.data.pop_front() else {
-                    break;
-                };
-                self.data_bytes -= old.frame.len();
-                self.stats.drops.add(DropReason::Overflow);
-            }
-            self.data_bytes += frame.len();
-            self.data.push_back(Pending { frame, at: now });
+            self.queue_reply(id, Pending { frame, at: now });
         }
     }
 
-    /// Fills the next batch: control frames first, then datagrams the window allows.
+    /// Queues an answer of `flow` for the client, making room when the queue is full.
+    fn queue_reply(&mut self, flow: u32, pending: Pending) {
+        while self.data_count >= CHANNEL_QUEUE_DATAGRAMS
+            || self.data_bytes + pending.frame.len() > CHANNEL_QUEUE_BYTES
+        {
+            let by_count = self.data_count >= CHANNEL_QUEUE_DATAGRAMS;
+            if !self.drop_reply(flow, by_count) {
+                break;
+            }
+        }
+        self.data_count += 1;
+        self.data_bytes += pending.frame.len();
+        let replies = self.data.entry(flow).or_insert_with(|| {
+            self.turns.push_back(flow);
+            Replies {
+                queue: VecDeque::new(),
+                bytes: 0,
+                credit: TURN_BYTES,
+            }
+        });
+        replies.bytes += pending.frame.len();
+        replies.queue.push_back(pending);
+    }
+
+    /// Drops the oldest answer of the flow that holds most of what ran out: datagrams with
+    /// `by_count`, bytes otherwise, so a flood of small datagrams pays for the places it takes.
+    /// `false` when none waits.
+    fn drop_reply(&mut self, arriving: u32, by_count: bool) -> bool {
+        let size = |replies: &Replies| {
+            if by_count {
+                replies.queue.len()
+            } else {
+                replies.bytes
+            }
+        };
+        let total = if by_count {
+            self.data_count
+        } else {
+            self.data_bytes
+        };
+        // A flow that holds half of everything holds most: no search while it floods.
+        let held = self.data.get(&arriving).map_or(0, size);
+        let largest = if held * 2 >= total && held > 0 {
+            arriving
+        } else {
+            let Some((flow, _)) = self.data.iter().max_by_key(|(_, replies)| size(replies)) else {
+                return false;
+            };
+            *flow
+        };
+        let Some(replies) = self.data.get_mut(&largest) else {
+            return false;
+        };
+        let Some(old) = replies.queue.pop_front() else {
+            return false;
+        };
+        replies.bytes -= old.frame.len();
+        self.data_count -= 1;
+        self.data_bytes -= old.frame.len();
+        self.stats.drops.add(DropReason::Overflow);
+        if replies.queue.is_empty() {
+            self.data.remove(&largest);
+            self.turns.retain(|flow| *flow != largest);
+        }
+        true
+    }
+
+    /// Fills the next batch: control frames first, then datagrams the window allows, taken
+    /// from the flows in turn.
     fn fill(&mut self, now: Instant) {
         self.output.clear();
         self.written = 0;
@@ -725,21 +819,50 @@ impl Relay {
         }
         let mut in_flight = self.sent_bytes - self.acked_bytes;
         while self.output.len() < WRITE_BATCH {
-            let Some(pending) = self.data.front() else {
+            let Some(&flow) = self.turns.front() else {
                 break;
             };
-            let waited = now.duration_since(pending.at);
-            let size = pending.frame.len() as u64;
-            if waited <= DATAGRAM_EXPIRY && in_flight + size > IN_FLIGHT_WINDOW {
+            let Some(replies) = self.data.get_mut(&flow) else {
+                self.turns.pop_front();
+                continue;
+            };
+            while replies
+                .queue
+                .front()
+                .is_some_and(|old| now.duration_since(old.at) > DATAGRAM_EXPIRY)
+            {
+                let Some(old) = replies.queue.pop_front() else {
+                    break;
+                };
+                replies.bytes -= old.frame.len();
+                self.data_count -= 1;
+                self.data_bytes -= old.frame.len();
+                self.stats.drops.add(DropReason::Expired);
+            }
+            let Some(size) = replies.queue.front().map(|pending| pending.frame.len()) else {
+                self.data.remove(&flow);
+                self.turns.pop_front();
+                continue;
+            };
+            if in_flight + size as u64 > IN_FLIGHT_WINDOW {
                 break;
             }
-            let Some(pending) = self.data.pop_front() else {
+            // The turn ends; the credit grows until it covers a datagram of any size.
+            if replies.credit < size {
+                replies.credit += TURN_BYTES;
+                self.turns.rotate_left(1);
+                continue;
+            }
+            let Some(pending) = replies.queue.pop_front() else {
                 break;
             };
-            self.data_bytes -= pending.frame.len();
-            if waited > DATAGRAM_EXPIRY {
-                self.stats.drops.add(DropReason::Expired);
-                continue;
+            replies.credit -= size;
+            replies.bytes -= size;
+            self.data_count -= 1;
+            self.data_bytes -= size;
+            if replies.queue.is_empty() {
+                self.data.remove(&flow);
+                self.turns.pop_front();
             }
             let start = self.output.len();
             self.output.extend_from_slice(&pending.frame);
@@ -747,7 +870,7 @@ impl Relay {
                 bytes: start..self.output.len(),
                 at: pending.at,
             });
-            in_flight += size;
+            in_flight += size as u64;
         }
     }
 
@@ -846,21 +969,139 @@ mod tests {
     use std::io::Read;
 
     fn queue_reply(relay: &mut Relay, data: &[u8], at: Instant) -> Vec<u8> {
+        queue_flow_reply(relay, 1, data, at)
+    }
+
+    fn queue_flow_reply(relay: &mut Relay, flow: u32, data: &[u8], at: Instant) -> Vec<u8> {
         let mut frame = Vec::new();
         proto::encode(
             &Frame::Recv {
-                flow: 1,
+                flow,
                 peer: "127.0.0.1:9".parse().unwrap(),
                 data,
             },
             &mut frame,
         );
-        relay.data_bytes += frame.len();
-        relay.data.push_back(Pending {
-            frame: frame.clone(),
-            at,
-        });
+        relay.queue_reply(
+            flow,
+            Pending {
+                frame: frame.clone(),
+                at,
+            },
+        );
         frame
+    }
+
+    /// The flows of the `RECV` frames in the batch, in order.
+    fn batch_flows(relay: &Relay) -> Vec<u32> {
+        let mut flows = Vec::new();
+        let mut rest = &relay.output[..];
+        while let Some((frame, used)) = proto::parse(rest).unwrap() {
+            if let Frame::Recv { flow, .. } = frame {
+                flows.push(flow);
+            }
+            rest = &rest[used..];
+        }
+        flows
+    }
+
+    #[test]
+    fn a_flood_into_one_flow_keeps_the_answers_of_another() {
+        let mut relay = Relay::new();
+        let now = Instant::now();
+        let junk = [0u8; 1200];
+        for _ in 0..CHANNEL_QUEUE_DATAGRAMS {
+            queue_flow_reply(&mut relay, 2, &junk, now);
+        }
+        let voice = queue_flow_reply(&mut relay, 1, b"voice", now);
+        // The flood goes on: room is made at its own expense.
+        for _ in 0..CHANNEL_QUEUE_DATAGRAMS {
+            queue_flow_reply(&mut relay, 2, &junk, now);
+        }
+        assert!(relay.data_count <= CHANNEL_QUEUE_DATAGRAMS);
+        assert!(relay.data_bytes <= CHANNEL_QUEUE_BYTES);
+        assert_eq!(relay.data[&1].queue.len(), 1);
+        assert_eq!(
+            relay.stats.drops.get(DropReason::Overflow) as usize,
+            2 * CHANNEL_QUEUE_DATAGRAMS + 1 - relay.data_count
+        );
+
+        // The answer does not wait behind the flood either.
+        relay.fill(now);
+        let flows = batch_flows(&relay);
+        let place = flows.iter().position(|flow| *flow == 1).unwrap();
+        assert!(place <= 2, "after {place} datagrams of the flood");
+        assert!(relay.output.windows(voice.len()).any(|part| part == voice));
+        assert!(!relay.data.contains_key(&1));
+        assert_eq!(relay.turns, [2]);
+    }
+
+    #[test]
+    fn a_flood_of_small_datagrams_pays_for_the_places_it_takes() {
+        let mut relay = Relay::new();
+        let now = Instant::now();
+        // Fewer datagrams, but more bytes than the whole flood.
+        for _ in 0..200 {
+            queue_flow_reply(&mut relay, 1, &[0u8; 1200], now);
+        }
+        for _ in 0..2 * CHANNEL_QUEUE_DATAGRAMS {
+            queue_flow_reply(&mut relay, 2, &[0u8; 1], now);
+        }
+        assert_eq!(relay.data_count, CHANNEL_QUEUE_DATAGRAMS);
+        assert_eq!(relay.data[&1].queue.len(), 200);
+    }
+
+    #[test]
+    fn flows_take_turns_by_bytes_and_keep_their_order() {
+        let mut relay = Relay::new();
+        let now = Instant::now();
+        let large = [0u8; 1500];
+        for _ in 0..4 {
+            queue_flow_reply(&mut relay, 1, &large, now);
+        }
+        for _ in 0..12 {
+            queue_flow_reply(&mut relay, 2, &[0u8; 100], now);
+        }
+        relay.fill(now);
+        let flows = batch_flows(&relay);
+        assert_eq!(flows.len(), 16);
+        // Twelve small datagrams take about as many bytes as one large one.
+        let small_before_second_large = flows
+            .iter()
+            .scan(0, |large, flow| {
+                *large += usize::from(*flow == 1);
+                Some(*large)
+            })
+            .zip(&flows)
+            .filter(|(large, flow)| *large < 2 && **flow == 2)
+            .count();
+        assert_eq!(small_before_second_large, 12);
+        assert!(relay.data.is_empty() && relay.turns.is_empty());
+        assert_eq!((relay.data_count, relay.data_bytes), (0, 0));
+    }
+
+    #[test]
+    fn an_id_closed_by_the_relay_opens_a_new_flow_after_the_hold() {
+        let mut relay = Relay::new();
+        let settings = Settings {
+            max_flows: 4,
+            idle_ms: 1000,
+            idle_bidirectional_ms: 1000,
+        };
+        let peer = "127.0.0.1:9".parse().unwrap();
+        let closed = Instant::now();
+        relay.refuse(7, CloseReason::Idle, closed);
+
+        // A datagram that crossed the `CLOSE` is dropped.
+        relay.send(settings, 7, peer, b"late", closed + REFUSED_HOLD / 2);
+        assert!(!relay.flows.contains_key(&7));
+        assert_eq!(relay.stats.drops.get(DropReason::Channel), 1);
+
+        // The client never answers the `CLOSE`; a later flow with the same id still opens.
+        relay.send(settings, 7, peer, b"new", closed + REFUSED_HOLD);
+        assert!(relay.flows.contains_key(&7));
+        assert!(!relay.refused.contains_key(&7));
+        assert_eq!(relay.stats.flows_opened, 1);
     }
 
     #[test]

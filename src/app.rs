@@ -61,7 +61,16 @@ enum Command {
     Serve,
     /// Перехват трафика приложений; запускается с правами администратора
     #[command(hide = true)]
-    Divert,
+    Divert {
+        /// SID пользователя, для которого запомнить права в планировщике Windows
+        #[arg(long)]
+        remember: Option<String>,
+    },
+    /// Перехват приложений без запроса прав администратора при каждом запуске (Windows)
+    Elevation {
+        #[arg(default_value="status",value_parser=["enable","disable","status"])]
+        action: String,
+    },
     #[command(hide = true)]
     ApplyUpdate { manifest: PathBuf },
 }
@@ -118,7 +127,34 @@ pub fn run() -> Result<()> {
             Some(Command::Check) => { let config = store.load()?; println!("Конфигурация корректна. Туннелей: {}. SSH не запускается.",config.tunnels.len()); Ok(()) }
             Some(Command::Path) => { println!("{}",store.path.display()); Ok(()) }
             Some(Command::Serve) => runtime.block_on(background::serve(store)),
-            Some(Command::Divert) => crate::divert::run(store),
+            Some(Command::Divert { remember }) => crate::divert::run(store, remember),
+            Some(Command::Elevation { action }) => {
+                use crate::tasks::{Kind, registered, remembering, set_remembering};
+                #[cfg(not(windows))]
+                anyhow::ensure!(action == "status", "Перехват трафика приложений работает только в Windows.");
+                match action.as_str() {
+                    "enable" => {
+                        set_remembering(&store.path, true)?;
+                        #[cfg(windows)]
+                        if crate::tasks::elevated() { crate::tasks::register(&store.path, Kind::Divert)?; }
+                        else { println!("Права запомнятся при следующем подтверждении запроса Windows («Предоставить права…»)."); }
+                    }
+                    "disable" => {
+                        // The task goes first: if Windows refuses to delete it, remembering stays
+                        // on and the status keeps telling that the task still gives the rights.
+                        #[cfg(windows)]
+                        crate::tasks::unregister(&store.path, Kind::Divert)?;
+                        set_remembering(&store.path, false)?;
+                    }
+                    _ => {}
+                }
+                let enabled = remembering(&store.path) && registered(&store.path, Kind::Divert, false)?;
+                println!("Перехват без запроса прав: {}.", if enabled {"включён"} else {"выключен"});
+                if !enabled && registered(&store.path, Kind::Divert, true)? {
+                    println!("Задание планировщика с правами администратора осталось. Удалите его: krot-cli elevation disable.");
+                }
+                Ok(())
+            }
             Some(Command::ApplyUpdate { manifest }) => runtime.block_on(crate::update::apply_install(&manifest)),
             Some(Command::Autostart {action}) => {
                 if action != "status" { store.load()?; autostart::set_enabled(&store.path,action == "enable")?; }

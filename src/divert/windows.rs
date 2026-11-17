@@ -37,14 +37,11 @@ use windows_sys::Win32::{
             QueryFullProcessImageNameW,
         },
     },
-    UI::{
-        Shell::{SHELLEXECUTEINFOW, ShellExecuteExW},
-        WindowsAndMessaging::SW_HIDE,
-    },
 };
 
 use super::{
-    DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict, handle,
+    BlockedLog, DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict,
+    blocked_reason, handle,
     link::{INBOUND_QUEUE, Inbound, Link},
     owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
     reset, tcp_table_owner,
@@ -362,6 +359,7 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
     let mut generation = u64::MAX;
     let mut policy: HashMap<String, (Policy, Policy)> = HashMap::new();
     let mut quic_logged: HashSet<String> = HashSet::new();
+    let mut blocked_log = BlockedLog::default();
     // Rules whose application goes around its tunnel right now, because the tunnel is down.
     let mut bypassing: HashSet<String> = HashSet::new();
     let mut udp_owners = UdpOwners::default();
@@ -416,6 +414,7 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
         }
         let data = &mut buffer[..length as usize];
         let linked = shared.link.up();
+        blocked_log.update(generation, linked);
         let verdict = {
             let mut nat = shared.nat.lock().unwrap();
             if now.duration_since(purged) > Duration::from_secs(10) {
@@ -447,13 +446,15 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                     }
                     // The rule as it is; `handle` applies whether it bypasses its tunnel.
                     udp_owners.decide(local, now, &|rule| bypassing.contains(rule), || {
-                        let pids = udp_snapshot.owners(now, local, |v6| {
-                            read_port_table(false, v6, &mut udp_table).map(<[u8]>::to_vec)
-                        })?;
-                        Some(
-                            pids.into_iter()
-                                .filter_map(|pid| matcher.decide(pid, now, &system))
-                                .collect(),
+                        udp_snapshot.rules(
+                            now,
+                            local,
+                            |v6| read_port_table(false, v6, &mut udp_table).map(<[u8]>::to_vec),
+                            |pids| {
+                                pids.iter()
+                                    .filter_map(|&pid| matcher.decide(pid, now, &system))
+                                    .collect()
+                            },
                         )
                     })
                 },
@@ -483,6 +484,15 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                     shared
                         .link
                         .send(&rule, flow.id, flow.opened, remote, payload);
+                }
+                continue;
+            }
+            Verdict::Blocked { rule } => {
+                if blocked_log.first(&rule) {
+                    let rules = shared.rules.lock().unwrap();
+                    let reason = blocked_reason(rules.iter().find(|r| r.id == rule), linked);
+                    drop(rules);
+                    shared.log(&rule, reason.into());
                 }
                 continue;
             }
@@ -885,31 +895,48 @@ pub(super) fn run(store: Store) -> Result<()> {
     std::process::exit(if result.is_ok() { 0 } else { 1 })
 }
 
-pub(super) fn launch(config: &Path) -> Result<()> {
-    let executable = std::env::current_exe()?;
+pub(super) fn launch(config: &Path, prompt: super::Prompt) -> Result<()> {
+    use crate::tasks::{self, Kind};
+    let program = tasks::program()?;
+    let path = config;
     let config = config
         .to_str()
         .filter(|path| !path.contains('"'))
         .context("Путь к конфигурации нельзя передать помощнику.")?;
-    let (verb, file, parameters) = (
-        wide("runas".as_ref()),
-        wide(executable.as_os_str()),
-        wide(format!("--config \"{config}\" divert").as_ref()),
-    );
-    // SAFETY: an all-zero structure is the documented starting point; every string is
-    // NUL-terminated and outlives the call.
-    let started = unsafe {
-        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        info.lpVerb = verb.as_ptr();
-        info.lpFile = file.as_ptr();
-        info.lpParameters = parameters.as_ptr();
-        info.nShow = SW_HIDE;
-        ShellExecuteExW(&mut info) != 0
-    };
+    // The SID is needed only to remember the rights: without it consent still works.
+    let sid = tasks::remembering(path).then(tasks::user_sid).transpose()?;
+    let remember = sid.is_some();
+    let mut arguments = vec!["--config", config, "divert"];
+    if let Some(sid) = &sid {
+        arguments.extend(["--remember", sid.as_str()]);
+    }
+    if tasks::elevated() {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new(&program)
+            .args(&arguments)
+            .creation_flags(0x0800_0000 | 0x0000_0200)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Не удалось запустить помощник перехвата.")?;
+        return Ok(());
+    }
+    if remember
+        && prompt != super::Prompt::Always
+        && tasks::registered(path, Kind::Divert, false).unwrap_or(false)
+        && tasks::run(path, Kind::Divert).is_ok()
+    {
+        return Ok(());
+    }
     ensure!(
-        started,
-        "Права администратора не предоставлены: перехват не запущен."
+        prompt != super::Prompt::Never,
+        "Права администратора для перехвата не сохранены: нажмите «Предоставить права…»."
     );
-    Ok(())
+    let mut parameters = format!("--config \"{config}\" divert");
+    if let Some(sid) = &sid {
+        parameters.push_str(&format!(" --remember {sid}"));
+    }
+    tasks::runas(program.as_os_str(), &parameters, false)
+        .context("Права администратора не предоставлены: перехват не запущен.")
 }

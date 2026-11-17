@@ -123,9 +123,11 @@ async fn daemon_registers_tray_updates_opens_existing_window_and_stops() -> anyh
         .await?;
     }
     // A closed loopback port produces a deterministic SSH error without external access.
-    let free = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    let port = free.local_addr()?.port();
-    drop(free);
+    // The socket stays bound without listening until the test ends: Linux refuses
+    // connections to it, and no other process can take the port meanwhile.
+    let reserved = tokio::net::TcpSocket::new_v4()?;
+    reserved.bind(([127, 0, 0, 1], 0).into())?;
+    let port = reserved.local_addr()?.port();
     let mut tunnel = Tunnel {
         name: "Tray test".into(),
         enabled: true,

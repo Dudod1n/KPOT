@@ -127,6 +127,23 @@ def relay_sections():
     return parts
 
 
+FONT_NOTICES = ('COPYRIGHT.txt', 'OFL.txt', 'AUTHORS.txt')
+
+
+def font_sections(root=ROOT):
+    """Notices of the fonts KROT embeds itself, outside any crate (Medeo, SIL OFL 1.1)."""
+    directory = root / 'licenses' / 'fonts' / 'medeo'
+    missing = [name for name in FONT_NOTICES if not (directory / name).is_file()]
+    if missing:
+        raise ValueError(f"Medeo fonts: missing {', '.join(missing)} in {directory}")
+    parts = [f"\n{'=' * 72}\nMedeo fonts (embedded in the KROT executable)\n"
+             'Declared license: OFL-1.1\nSource: https://github.com/DNFDEVS/medeo-font\n']
+    for name in FONT_NOTICES:
+        contents = (directory / name).read_text(encoding='utf-8')
+        parts.append(f'\n--- fonts/medeo/{name} ---\n{contents.rstrip()}\n')
+    return parts
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', required=True)
@@ -140,6 +157,7 @@ def main():
                 'retain their original licenses. This file preserves upstream license\n'
                 'and attribution texts for the locked runtime dependency graph.\n']
     sections.extend(section(package) for package in packages)
+    sections.extend(font_sections())
     sections.extend(relay_sections())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(''.join(sections), encoding='utf-8')

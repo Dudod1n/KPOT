@@ -71,6 +71,18 @@ class LicenseTests(unittest.TestCase):
             self.assertEqual([name for name, _ in notices], ['LICENSE', 'src/NOTICE'])
             self.assertIn(('src/NOTICE', 'Nested attribution'), notices)
 
+    def test_embedded_medeo_fonts_ship_their_license_and_fail_without_it(self):
+        text = ''.join(collector.font_sections())
+        self.assertIn('SIL Open Font License', text)
+        self.assertIn('Copyright 2026 The Medeo Project Authors', text)
+        self.assertIn('--- fonts/medeo/AUTHORS.txt ---', text)
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / 'licenses' / 'fonts' / 'medeo'
+            directory.mkdir(parents=True)
+            (directory / 'COPYRIGHT.txt').write_text('Copyright', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'OFL.txt, AUTHORS.txt'):
+                collector.font_sections(Path(temp))
+
     def test_fallback_requires_reviewed_version_and_matching_declaration(self):
         with tempfile.TemporaryDirectory() as temp:
             package = {'name': 'hexf-parse', 'version': '0.2.1', 'license': 'CC0-1.0',

@@ -18,7 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tests'))
 
 import asyncssh
-from ssh_support import Client, Config, Endpoint, Frames, SSHFixtures, Store, attach_udp, kill_group
+from ssh_support import (Client, Config, Endpoint, Frames, SSHFixtures, Store, attach_udp, endpoint_path,
+                         kill_group)
 
 BINARY = Path(os.environ.get('KROT_RUST_BIN', ROOT / 'target' / 'debug' / ('krot-cli.exe' if os.name == 'nt' else 'krot-cli'))).resolve()
 
@@ -63,7 +64,7 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
 
     @property
     def endpoint(self):
-        return self.store.path.with_name('config.json.background.json')
+        return endpoint_path(self.store.path)
 
     async def connections_closed(self):
         async with asyncio.timeout(5):
