@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -101,8 +101,15 @@ pub struct Snapshot {
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pause between attempts to start the helper without asking the user; it doubles after
-/// every failed attempt, up to 32 times.
+/// every failed attempt, up to 32 times. An attempt has failed until the helper attaches:
+/// a started task says nothing about the helper it starts.
 const DIVERT_RETRY: Duration = Duration::from_secs(60);
+/// Starts in a row after which a helper that never attaches is reported as failed, so the
+/// window asks for consent again instead of running the remembered task. The starts go on:
+/// what kept the helper away may pass.
+const DIVERT_SILENT_STARTS: u32 = 3;
+const DIVERT_SILENT_ERROR: &str =
+    "Помощник перехвата запускается, но не подключается. Нажмите «Предоставить права…».";
 const MAX_APP_LOGS: usize = 200;
 
 /// The last word from the elevated helper and what it has reported so far.
@@ -125,7 +132,51 @@ impl Divert {
         cfg!(windows)
             && apps.rules.iter().any(|rule| rule.enabled)
             && !self.attached()
-            && self.error.is_empty()
+            && (self.error.is_empty() || self.error == DIVERT_SILENT_ERROR)
+    }
+}
+
+/// Paces the starts of the helper that ask the user nothing by how they end.
+struct DivertRetry {
+    at: Instant,
+    /// Failed attempts in a row; the blocking start adds its own failures.
+    failures: Arc<AtomicU64>,
+    /// A start went through and the helper has not attached since.
+    started: Arc<AtomicBool>,
+    /// Starts in a row that went through without the helper attaching.
+    silent: u32,
+}
+
+impl DivertRetry {
+    fn new(now: Instant) -> Self {
+        Self {
+            at: now,
+            failures: Arc::default(),
+            started: Arc::default(),
+            silent: 0,
+        }
+    }
+    /// The helper is attached: every count starts over, and a helper that goes away later
+    /// is started again at once.
+    fn attached(&mut self, now: Instant) {
+        self.at = now;
+        self.failures.store(0, Ordering::Relaxed);
+        self.started.store(false, Ordering::Relaxed);
+        self.silent = 0;
+    }
+    /// For a wanted helper that is not attached: `None` to wait, otherwise start it now, with
+    /// `true` when the starts so far went through and the helper never attached.
+    fn due(&mut self, now: Instant) -> Option<bool> {
+        if now < self.at {
+            return None;
+        }
+        if self.started.swap(false, Ordering::Relaxed) {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+            self.silent += 1;
+        }
+        let failures = self.failures.load(Ordering::Relaxed).min(5) as u32;
+        self.at = now + DIVERT_RETRY * 2u32.pow(failures);
+        Some(self.silent >= DIVERT_SILENT_STARTS)
     }
 }
 
@@ -1018,8 +1069,7 @@ pub async fn serve(store: Store) -> Result<()> {
     let (tray, mut tray_actions) = crate::tray::Tray::start(service.shutdown.child_token());
     let mut tray_poll = tokio::time::interval(Duration::from_secs(1));
     let mut backoff = crate::ssh::AcceptBackoff::default();
-    let mut divert_retry = Instant::now();
-    let divert_failures = Arc::new(AtomicU64::new(0));
+    let mut divert_retry = DivertRetry::new(Instant::now());
     loop {
         let terminated = async {
             #[cfg(unix)]
@@ -1042,17 +1092,22 @@ pub async fn serve(store: Store) -> Result<()> {
             },
             _ = tray_poll.tick() => {
                 // Keep the previous icon while a command holds the state.
-                if let Ok(owned) = service.owned.try_lock() {
+                if let Ok(mut owned) = service.owned.try_lock() {
                     let (states, waiting) = owned.manager.states().await;
                     tray.update(crate::tray::Status::count(&owned.config.tunnels, &states, &waiting));
-                    if Instant::now() >= divert_retry && owned.divert.wanted(&owned.apps) {
-                        let failures = divert_failures.load(Ordering::Relaxed).min(5) as u32;
-                        divert_retry = Instant::now() + DIVERT_RETRY * 2u32.pow(failures);
-                        let (path, failures) = (store.path.clone(), divert_failures.clone());
+                    if owned.divert.attached() {
+                        divert_retry.attached(Instant::now());
+                    } else if owned.divert.wanted(&owned.apps)
+                        && let Some(silent) = divert_retry.due(Instant::now())
+                    {
+                        if silent {
+                            owned.divert.error = DIVERT_SILENT_ERROR.into();
+                        }
+                        let (path, failures, started) = (store.path.clone(), divert_retry.failures.clone(), divert_retry.started.clone());
                         tokio::task::spawn_blocking(move || {
                             let ready = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| crate::divert::missing_components(dir).is_empty()));
                             if ready == Some(true) && crate::divert::launch(&path, crate::divert::Prompt::Never).is_ok() {
-                                failures.store(0, Ordering::Relaxed);
+                                started.store(true, Ordering::Relaxed);
                             } else {
                                 failures.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1099,6 +1154,40 @@ pub async fn serve(store: Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_starts_back_off_until_it_attaches_and_report_silent_failures() {
+        let now = Instant::now();
+        let mut retry = DivertRetry::new(now);
+        assert_eq!(retry.due(now), Some(false));
+        assert_eq!(retry.due(now), None, "One start per pause");
+        // The start itself fails (no remembered task): slower, but nothing to report.
+        retry.failures.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(retry.due(now + DIVERT_RETRY), Some(false));
+        assert_eq!(retry.due(now + DIVERT_RETRY * 2), None);
+        // Starts that go through while the helper never attaches are failures too.
+        let mut at = now + DIVERT_RETRY * 3;
+        for silent in 1..=DIVERT_SILENT_STARTS + 1 {
+            retry.started.store(true, Ordering::Relaxed);
+            at += DIVERT_RETRY * 32;
+            assert_eq!(
+                retry.due(at),
+                Some(silent >= DIVERT_SILENT_STARTS),
+                "{silent}"
+            );
+        }
+        assert_eq!(retry.due(at + DIVERT_RETRY * 31), None);
+        assert_eq!(
+            retry.due(at + DIVERT_RETRY * 32),
+            Some(true),
+            "The starts go on"
+        );
+        // An attached helper clears everything; when it goes away it is started at once.
+        retry.started.store(true, Ordering::Relaxed);
+        retry.attached(at + DIVERT_RETRY * 33);
+        assert_eq!(retry.due(at + DIVERT_RETRY * 33), Some(false));
+        assert_eq!(retry.failures.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn tokens_and_messages_are_strict() {

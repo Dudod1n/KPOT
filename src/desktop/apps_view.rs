@@ -119,11 +119,12 @@ impl Desktop {
         let shown: Vec<&str> = rules
             .iter()
             .filter(|rule| {
-                in_filter(
-                    rules.len(),
-                    self.app_filter,
-                    Self::app_group(rule, self.app_state(rule)),
-                )
+                self.selected_app.as_ref() == Some(&rule.id)
+                    || in_filter(
+                        rules.len(),
+                        self.app_filter,
+                        Self::app_group(rule, self.app_state(rule)),
+                    )
             })
             .map(|rule| rule.id.as_str())
             .collect();
@@ -268,7 +269,10 @@ impl Desktop {
                 }
                 for rule in &rules {
                     let state = self.app_state(rule).to_owned();
-                    if !in_filter(rules.len(), self.app_filter, Self::app_group(rule, &state)) {
+                    // The selected row stays while its new state is outside the filter.
+                    if self.selected_app.as_ref() != Some(&rule.id)
+                        && !in_filter(rules.len(), self.app_filter, Self::app_group(rule, &state))
+                    {
                         continue;
                     }
                     let (label, color) = app_state_label(&state);

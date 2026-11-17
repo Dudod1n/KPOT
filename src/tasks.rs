@@ -439,7 +439,8 @@ mod system {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        for stale in listed(&prefix)? {
+        // The task exists by now: failing to clear the tasks of other copies is no failure.
+        for stale in listed(&prefix).unwrap_or_default() {
             if !stale.eq_ignore_ascii_case(&name) {
                 let _ = schtasks(&["/delete", "/tn", &stale, "/f"]);
             }

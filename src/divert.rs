@@ -659,8 +659,13 @@ pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Res
             && crate::tasks::elevated()
             && crate::tasks::user_sid().is_ok_and(|own| own == sid)
         {
-            // Without the task the helper still works; the next start asks again.
-            let _ = crate::tasks::register(&store.path, crate::tasks::Kind::Divert);
+            // Without the task the helper still works; the next start asks again. Every
+            // consent registers anew, which also repairs a task that does not give the rights.
+            // Apart from interception: registering lists every task of the system.
+            let path = store.path.clone();
+            std::thread::spawn(move || {
+                let _ = crate::tasks::register(&path, crate::tasks::Kind::Divert);
+            });
         }
         windows::run(store)
     }
