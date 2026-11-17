@@ -306,12 +306,21 @@ mod system {
         Ok(sid)
     }
 
+    /// The Windows directory from the system, not from the environment, which the user sets.
+    fn windows_directory() -> std::path::PathBuf {
+        use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+        let mut directory = [0u16; 260];
+        // SAFETY: the buffer length matches the size passed to the call.
+        let length =
+            unsafe { GetSystemWindowsDirectoryW(directory.as_mut_ptr(), directory.len() as u32) };
+        if length == 0 || length as usize >= directory.len() {
+            return "C:\\Windows".into();
+        }
+        String::from_utf16_lossy(&directory[..length as usize]).into()
+    }
+
     fn schtasks_path() -> std::path::PathBuf {
-        std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "C:\\Windows".into())
-            .join("System32")
-            .join("schtasks.exe")
+        windows_directory().join("System32").join("schtasks.exe")
     }
 
     fn schtasks(arguments: &[&str]) -> Result<std::process::Output> {
@@ -420,10 +429,16 @@ mod system {
             kind.command().into(),
         ]);
         let xml = task_xml(kind, &user_sid()?, command, &arguments);
-        let mut file = tempfile::Builder::new()
-            .prefix("krot-task-")
-            .suffix(".xml")
-            .tempfile()?;
+        // `schtasks` reads the definition by its path later. An elevated process keeps it in the
+        // system temporary directory, where users create files but cannot change or rename
+        // those of others: the user's own one would let any program of theirs swap it.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("krot-task-").suffix(".xml");
+        let mut file = if elevated() {
+            builder.tempfile_in(windows_directory().join("Temp"))?
+        } else {
+            builder.tempfile()?
+        };
         let mut bytes = vec![0xFF, 0xFE];
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
         file.write_all(&bytes)?;

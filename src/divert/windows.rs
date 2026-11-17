@@ -903,10 +903,11 @@ pub(super) fn launch(config: &Path, prompt: super::Prompt) -> Result<()> {
         .to_str()
         .filter(|path| !path.contains('"'))
         .context("Путь к конфигурации нельзя передать помощнику.")?;
-    let remember = tasks::remembering(path);
-    let sid = tasks::user_sid()?;
+    // The SID is needed only to remember the rights: without it consent still works.
+    let sid = tasks::remembering(path).then(tasks::user_sid).transpose()?;
+    let remember = sid.is_some();
     let mut arguments = vec!["--config", config, "divert"];
-    if remember {
+    if let Some(sid) = &sid {
         arguments.extend(["--remember", sid.as_str()]);
     }
     if tasks::elevated() {
@@ -933,7 +934,7 @@ pub(super) fn launch(config: &Path, prompt: super::Prompt) -> Result<()> {
         "Права администратора для перехвата не сохранены: нажмите «Предоставить права…»."
     );
     let mut parameters = format!("--config \"{config}\" divert");
-    if remember {
+    if let Some(sid) = &sid {
         parameters.push_str(&format!(" --remember {sid}"));
     }
     tasks::runas(program.as_os_str(), &parameters, false)

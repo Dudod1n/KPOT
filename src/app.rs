@@ -140,14 +140,19 @@ pub fn run() -> Result<()> {
                         else { println!("Права запомнятся при следующем подтверждении запроса Windows («Предоставить права…»)."); }
                     }
                     "disable" => {
-                        set_remembering(&store.path, false)?;
+                        // The task goes first: if Windows refuses to delete it, remembering stays
+                        // on and the status keeps telling that the task still gives the rights.
                         #[cfg(windows)]
                         crate::tasks::unregister(&store.path, Kind::Divert)?;
+                        set_remembering(&store.path, false)?;
                     }
                     _ => {}
                 }
                 let enabled = remembering(&store.path) && registered(&store.path, Kind::Divert, false)?;
                 println!("Перехват без запроса прав: {}.", if enabled {"включён"} else {"выключен"});
+                if !enabled && registered(&store.path, Kind::Divert, true)? {
+                    println!("Задание планировщика с правами администратора осталось. Удалите его: krot-cli elevation disable.");
+                }
                 Ok(())
             }
             Some(Command::ApplyUpdate { manifest }) => runtime.block_on(crate::update::apply_install(&manifest)),
