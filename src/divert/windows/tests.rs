@@ -2,6 +2,7 @@
 use std::{
     io::Write,
     net::UdpSocket,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -16,6 +17,25 @@ fn report(text: &str) {
     let _ = writeln!(std::io::stderr(), "udp-owners: {text}");
 }
 
+/// Binds a new socket every `PACE` on another thread, as applications do, and hands each to
+/// the receiver the way the driver queues their first datagrams for the packet loop.
+fn new_endpoints() -> mpsc::Receiver<(UdpSocket, Instant)> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let began = Instant::now();
+        for index in 0..ENDPOINTS {
+            while began.elapsed() < PACE * index {
+                std::hint::spin_loop();
+            }
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            if sender.send((socket, Instant::now())).is_err() {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
 #[test]
 fn udp_tables_under_a_stream_of_new_endpoints() {
     let pid = std::process::id();
@@ -24,13 +44,10 @@ fn udp_tables_under_a_stream_of_new_endpoints() {
     let mut snapshot = Snapshot::default();
     let mut reads = 0u32;
     let mut busy = Duration::ZERO;
+    let mut delay = Duration::ZERO;
     let mut worst = Duration::ZERO;
     let began = Instant::now();
-    for index in 0..ENDPOINTS {
-        while began.elapsed() < PACE * index {
-            std::hint::spin_loop();
-        }
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for (socket, bound) in new_endpoints() {
         let local = socket.local_addr().unwrap();
         sockets.push(socket);
         let now = Instant::now();
@@ -47,9 +64,9 @@ fn udp_tables_under_a_stream_of_new_endpoints() {
                 Vec::new()
             },
         );
-        let spent = now.elapsed();
-        busy += spent;
-        worst = worst.max(spent);
+        busy += now.elapsed();
+        delay += bound.elapsed();
+        worst = worst.max(bound.elapsed());
         assert_eq!(rules, Some(vec![]));
         assert!(found, "the new socket {local} is in the last reading");
     }
@@ -68,8 +85,9 @@ fn udp_tables_under_a_stream_of_new_endpoints() {
         sockets.len()
     ));
     report(&format!(
-        "{ENDPOINTS} new endpoints without a rule in {elapsed:?}: {} table pairs read, \
-         {busy:?} spent in lookups, worst lookup {worst:?}",
-        reads / 2
+        "{ENDPOINTS} new endpoints without a rule in {elapsed:?}: {} readings of both tables, \
+         {busy:?} spent in lookups; delay from bind to decision {:?} on average, {worst:?} at most",
+        reads / 2,
+        delay / ENDPOINTS,
     ));
 }
