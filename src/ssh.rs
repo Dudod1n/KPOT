@@ -165,6 +165,8 @@ struct State {
     udp_links: HashMap<String, Arc<crate::udp::transport::Transport>>,
     /// Secrets of running tunnels, for the relay's removal while the tunnel runs.
     credentials: HashMap<String, Credentials>,
+    /// Measurement of each started tunnel's session, across its reconnects.
+    links: HashMap<String, Arc<crate::link::Link>>,
 }
 struct Inner {
     known_hosts: PathBuf,
@@ -291,6 +293,21 @@ impl Manager {
                     ),
                 )
             })
+            .collect()
+    }
+    /// The session measurement of every started tunnel.
+    pub async fn link_snapshot(&self) -> HashMap<String, crate::link::LinkStats> {
+        let links: Vec<_> = {
+            let state = self.0.state.lock().await;
+            state
+                .links
+                .iter()
+                .map(|(id, link)| (id.clone(), link.clone()))
+                .collect()
+        };
+        links
+            .into_iter()
+            .map(|(id, link)| (id, link.stats()))
             .collect()
     }
     fn announce(&self, notice: UdpNotice) {
@@ -573,12 +590,14 @@ impl Manager {
     }
     async fn run(&self, tunnel: Tunnel, cancel: CancellationToken) {
         let credentials = Credentials::default();
-        self.0
-            .state
-            .lock()
-            .await
-            .credentials
-            .insert(tunnel.id.clone(), credentials.clone());
+        let link = Arc::new(crate::link::Link::new());
+        {
+            let mut state = self.0.state.lock().await;
+            state
+                .credentials
+                .insert(tunnel.id.clone(), credentials.clone());
+            state.links.insert(tunnel.id.clone(), link.clone());
+        }
         let udp = (tunnel.kind == "D").then(|| {
             let manager = self.clone();
             let tunnel = tunnel.clone();
@@ -590,7 +609,7 @@ impl Manager {
         loop {
             let mut attempt = Attempt::new(cancel.child_token());
             let result = {
-                let forward = self.forward(&tunnel, &mut attempt, &credentials);
+                let forward = self.forward(&tunnel, &mut attempt, &credentials, &link);
                 tokio::pin!(forward);
                 tokio::select! {
                     biased;
@@ -606,6 +625,7 @@ impl Manager {
                 break;
             }
             let problem = result.err().unwrap_or(NETWORK);
+            link.disconnected(problem.message);
             if !tunnel.reconnect || !problem.retryable {
                 self.state(&tunnel.id, "error", problem.message, None).await;
                 break;
@@ -632,6 +652,7 @@ impl Manager {
             .prompts
             .retain(|_, p| p.prompt.request.tunnel_id != tunnel.id);
         state.credentials.remove(&tunnel.id);
+        state.links.remove(&tunnel.id);
     }
     async fn udp_down(&self, id: &str) {
         if self.0.state.lock().await.udp_links.remove(id).is_some() {
@@ -787,6 +808,7 @@ impl Manager {
         tunnel: &Tunnel,
         attempt: &mut Attempt,
         credentials: &Credentials,
+        link: &Arc<crate::link::Link>,
     ) -> std::result::Result<(), Problem> {
         let (remote_send, mut remote_receive) = mpsc::channel(64);
         let expected = Arc::new(StdMutex::new(None));
@@ -824,6 +846,19 @@ impl Manager {
         self.state(&tunnel.id, "running", "Туннель работает", None)
             .await;
         attempt.started = true;
+        link.connected();
+        {
+            // Pings share the session with the traffic; their failures never close it.
+            let (link, connection) = (link.clone(), connection.clone());
+            attempt.copies.spawn(async move {
+                link.probe(|| {
+                    let connection = connection.clone();
+                    async move { connection.send_ping().await.is_ok() && !connection.is_closed() }
+                })
+                .await;
+            });
+        }
+        let counters = link.counters();
         let mut check = tokio::time::interval(Duration::from_millis(100));
         let mut backoff = AcceptBackoff::default();
         loop {
@@ -847,18 +882,20 @@ impl Manager {
                     let target = tunnel.target.clone();
                     let port = tunnel.target_port;
                     let dynamic = tunnel.kind == "D";
+                    let counters = counters.clone();
                     attempt.copies.spawn(async move {
-                        let _ = local_connection(socket, origin, connection, dynamic, target, port).await;
+                        let _ = local_connection(socket, origin, connection, dynamic, target, port, counters).await;
                     });
                 },
                 Some((channel, reply)) = remote_receive.recv(), if tunnel.kind == "R" => {
                     let target = tunnel.target.clone();
                     let port = tunnel.target_port;
+                    let counters = counters.clone();
                     attempt.copies.spawn(async move {
                         match timed(TcpStream::connect((unbracket(&target), port))).await {
                             Ok(Ok(mut socket)) => {
                                 reply.accept().await;
-                                let mut stream = channel.into_stream();
+                                let mut stream = crate::link::Counted::new(channel.into_stream(), counters);
                                 let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
                             },
                             _ => reply.reject(ChannelOpenFailure::ConnectFailed).await,
@@ -1618,6 +1655,7 @@ async fn local_connection(
     dynamic: bool,
     target: String,
     port: u16,
+    counters: Arc<crate::link::Counters>,
 ) -> std::result::Result<(), Problem> {
     let (target, port) = if dynamic {
         timed(socks_destination(&mut socket))
@@ -1648,7 +1686,7 @@ async fn local_connection(
             .await
             .map_err(|_| NETWORK)?;
     }
-    let mut stream = channel.into_stream();
+    let mut stream = crate::link::Counted::new(channel.into_stream(), counters);
     tokio::io::copy_bidirectional(&mut socket, &mut stream)
         .await
         .map_err(|_| NETWORK)?;

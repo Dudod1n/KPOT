@@ -383,8 +383,19 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             status = await self.wait(tunnel)
             self.assertIsNotNone(status['started_at'])
             await self.exchange(tunnel.port, socks=tunnel.kind == 'D')
+            # The session measurement: a ping answered and the forwarded bytes counted.
+            async with asyncio.timeout(10):
+                while not (await self.request('snapshot')).get('links', {}).get(tunnel.id, {}).get('rtt', {}).get('count'):
+                    await asyncio.sleep(0.2)
+            code, out, err = await self.cli('metrics', '--tunnel', tunnel.id)
+            self.assertEqual(code, 0, err)
+            link = json.loads(out)['link'][tunnel.id]
+            self.assertEqual((link['rx_total'], link['tx_total'], link['reconnects']), (2400, 2400, 0))
+            self.assertIsNotNone(link['rtt']['p50_us'])
+            self.assertEqual([event['kind'] for event in link['events']], ['connected'])
             await self.request('stop', tunnel.id)
             await self.assert_closed(tunnel.port)
+            self.assertNotIn(tunnel.id, (await self.request('snapshot')).get('links', {}))
             saved = self.store.load()
             self.assertFalse(next(t for t in saved.tunnels if t.id == tunnel.id).enabled)
         self.assertEqual([p['kind'] for p in self.prompts], ['trust'])

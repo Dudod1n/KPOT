@@ -29,7 +29,8 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::metrics::{Summary, Traffic, Windowed, drops_map};
+use super::metrics::{Traffic, drops_map};
+use crate::metrics::{Summary, Windowed};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 128 * 1024;
