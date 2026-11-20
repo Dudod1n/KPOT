@@ -496,6 +496,11 @@ pub fn redact(report: &mut Report) {
             *answer = alias(answer);
         }
         probe.fingerprint = None;
+        // RFC 4253: `SSH-proto-software SP comments`; an administrator may put the host name in
+        // the comments, so only the protocol and software version stay.
+        if let Some(banner) = &mut probe.banner {
+            banner.truncate(banner.find(' ').unwrap_or(banner.len()));
+        }
     }
     report.redacted = true;
 }
@@ -756,6 +761,7 @@ mod tests {
         let mut ssh =
             Probe::new(Kind::SshHandshake, "обмен ключами").at("192.0.2.7:22".parse().unwrap());
         ssh.fingerprint = Some("SHA256:secret".into());
+        ssh.banner = Some("SSH-2.0-OpenSSH_9.6 secret.example".into());
         let mut report = Report {
             target: "secret.example".into(),
             port: 22,
@@ -774,6 +780,10 @@ mod tests {
         }
         assert_eq!(report.probes[2].address.as_deref(), Some("<IPv4-1>"));
         assert_eq!(report.probes[1].answers, ["<IPv4-1>", "<IPv6-1>"]);
+        assert_eq!(
+            report.probes[2].banner.as_deref(),
+            Some("SSH-2.0-OpenSSH_9.6")
+        );
         assert!(text.contains("github.com"));
         assert!(report.redacted);
     }
