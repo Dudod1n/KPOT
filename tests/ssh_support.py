@@ -9,7 +9,6 @@ import hmac
 import json
 import os
 from pathlib import Path
-import random
 import re
 import secrets
 import signal
@@ -233,29 +232,6 @@ class Frames:
         return body[0], body[1:]
 
 
-_issued_ports = set()
-
-
-def unused_port():
-    """A free port for a listener that the tested process opens later.
-
-    The port lies below the default ephemeral ranges (Linux 32768+, Windows and macOS 49152+),
-    so with default settings outgoing connections and `bind` to port 0 do not take it while it
-    waits for its listener. Another process that binds the port explicitly still can."""
-    for _ in range(100):
-        port = random.randint(20000, 32767)
-        if port in _issued_ports:
-            continue
-        with socket.socket() as sock:
-            try:
-                sock.bind(('127.0.0.1', port))
-            except OSError:
-                continue
-        _issued_ports.add(port)
-        return port
-    raise RuntimeError('No free port below the ephemeral range')
-
-
 def kill_group(process):
     """Stop a command started by `run_command` together with everything it started."""
     with contextlib.suppress(ProcessLookupError):
@@ -357,8 +333,11 @@ class SSHFixtures:
         return server
 
     def tunnel(self, server, **kw):
+        """A tunnel on port 0: the system chooses its listening port when it starts, so no other
+        process can take that port first. The chosen port is in the tunnel's runtime state,
+        and `wait` copies it into `port` (requires `KROT_TEST_EPHEMERAL_PORTS=1`)."""
         return Tunnel(name='test', server=Endpoint(host='127.0.0.1', port=server.get_port(), user='test'),
-                      port=unused_port(), target='127.0.0.1', target_port=self.echo_port,
+                      port=0, target='127.0.0.1', target_port=self.echo_port,
                       reconnect=False, **kw)
 
     async def exchange(self, port, *, socks=False):
