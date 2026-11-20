@@ -1,5 +1,6 @@
-//! The machine-readable UDP metrics of `krot-cli metrics`: everything the snapshot holds about
-//! UDP, grouped by tunnel and by rule. The schema number changes with any incompatible change.
+//! The machine-readable metrics of `krot-cli metrics`: everything the snapshot holds about
+//! UDP, grouped by tunnel and by rule, and the session measurement of every tunnel. The schema
+//! number changes with any incompatible change.
 use serde_json::{Value, json};
 
 use crate::background::Snapshot;
@@ -43,6 +44,14 @@ pub fn metrics(snapshot: &Snapshot, tunnel: Option<&str>) -> Value {
             )
         })
         .collect();
+    // Every kind of tunnel has a session; a stopped one has no measurement.
+    let link: serde_json::Map<String, Value> = snapshot
+        .config
+        .tunnels
+        .iter()
+        .filter(|item| tunnel.is_none_or(|id| id == item.id))
+        .map(|item| (item.id.clone(), json!(snapshot.links.get(&item.id))))
+        .collect();
     json!({
         "schema": SCHEMA,
         "version": snapshot.version,
@@ -50,6 +59,7 @@ pub fn metrics(snapshot: &Snapshot, tunnel: Option<&str>) -> Value {
         "helper_attached": snapshot.divert_attached,
         "tunnels": tunnels,
         "rules": rules,
+        "link": link,
     })
 }
 
@@ -114,6 +124,32 @@ mod tests {
         );
         for part in ["helper", "tunnel"] {
             assert!(rule[part]["drops"].is_object(), "{part}");
+        }
+
+        let link = value["link"].as_object().unwrap();
+        assert_eq!(link.len(), 2, "every tunnel");
+        assert!(link["t2"].is_null(), "a stopped tunnel has no measurement");
+
+        snapshot.links.insert(
+            "t2".into(),
+            crate::link::LinkStats {
+                rx_bps: 8_000,
+                ..Default::default()
+            },
+        );
+        let value = metrics(&snapshot, Some("t2"));
+        let link = value["link"].as_object().unwrap();
+        assert_eq!(link.len(), 1);
+        assert_eq!(link["t2"]["rx_bps"], 8_000);
+        for key in [
+            "rtt",
+            "jitter_us",
+            "ping_lost",
+            "reconnects",
+            "events",
+            "tx_total",
+        ] {
+            assert!(link["t2"].get(key).is_some(), "{key}");
         }
 
         snapshot.udp_metrics.insert("t1".into(), Default::default());

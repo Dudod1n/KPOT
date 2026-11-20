@@ -50,6 +50,10 @@ futures-util = "0.3"
 raw-window-handle = "0.6"
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
+[dev-dependencies]
+# Paused time for tests of timers; adds no crates.
+tokio = { version = "1", features = ["test-util"] }
+
 [build-dependencies]
 sha2 = "0.10"
 winresource = "=0.1.34"

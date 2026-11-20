@@ -8,6 +8,8 @@ pub mod diagnose;
 pub mod divert;
 pub mod icons;
 pub mod launcher;
+pub mod link;
+pub mod metrics;
 pub mod proxy;
 pub mod relay;
 pub mod ssh;

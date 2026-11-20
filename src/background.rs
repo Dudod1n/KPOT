@@ -97,6 +97,9 @@ pub struct Snapshot {
     /// The helper's part of each rule's UDP path, while it is attached.
     #[serde(default)]
     pub udp_helper: HashMap<String, crate::divert::link::HelperUdpStats>,
+    /// Delay, losses, reconnects and traffic of each started tunnel's SSH session.
+    #[serde(default)]
+    pub links: HashMap<String, crate::link::LinkStats>,
 }
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -641,6 +644,7 @@ impl Service {
                     udp_error: owned.udp_error.clone(),
                     udp_runtimes,
                     udp_metrics,
+                    links: owned.manager.link_snapshot().await,
                     apps: owned.apps.rules.clone(),
                     app_runtimes,
                     apps_unavailable: unavailable.into(),

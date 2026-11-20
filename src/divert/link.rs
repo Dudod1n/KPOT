@@ -29,7 +29,8 @@ use tokio::{
     sync::{Notify, mpsc},
 };
 
-use crate::udp::metrics::{Summary, Traffic, Windowed, drops_map};
+use crate::metrics::{Summary, Windowed};
+use crate::udp::metrics::{Traffic, drops_map};
 
 /// Pause before connecting again after the channel failed.
 const RECONNECT: Duration = Duration::from_secs(1);
