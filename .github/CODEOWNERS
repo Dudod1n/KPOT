@@ -7,6 +7,8 @@
 /src/divert/ @Dudod1n
 /src/update.rs @Dudod1n
 /src/autostart.rs @Dudod1n
+/src/tasks.rs @Dudod1n
+/src/udp/ @Dudod1n
 /Cargo.toml @Dudod1n
 /Cargo.lock @Dudod1n
 /build.rs @Dudod1n
@@ -17,6 +19,11 @@
 /scripts/package_release.py @Dudod1n
 /scripts/collect_licenses.py @Dudod1n
 /scripts/fetch_windivert.py @Dudod1n
+/scripts/check_rust.py @Dudod1n
+/scripts/build_icons.py @Dudod1n
+/requirements-test.txt @Dudod1n
+/assets/ @Dudod1n
+/CHANGELOG.md @Dudod1n
 /.github/ @Dudod1n
 /SECURITY.md @Dudod1n
 /REVIEW.md @Dudod1n

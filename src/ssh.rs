@@ -84,6 +84,10 @@ pub struct Runtime {
     pub message: String,
     pub hop: String,
     pub started_at: Option<f64>,
+    /// The port the tunnel actually listens on while it runs: the local one for L and D,
+    /// the server's for R. It differs from the configured port only when that is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub logs: VecDeque<String>,
 }
 impl Default for Runtime {
@@ -93,6 +97,7 @@ impl Default for Runtime {
             message: String::new(),
             hop: String::new(),
             started_at: None,
+            port: None,
             logs: VecDeque::new(),
         }
     }
@@ -588,6 +593,15 @@ impl Manager {
         };
         update(runtime, status, message);
     }
+    /// Marks the tunnel as running on `port` in one step, so a snapshot that shows it
+    /// running also shows where it listens.
+    async fn running(&self, id: &str, port: u16) {
+        let mut state = self.0.state.lock().await;
+        let runtime = state.runtimes.entry(id.into()).or_default();
+        runtime.started_at = Some(now());
+        runtime.port = Some(port);
+        update(runtime, "running", "Туннель работает");
+    }
     async fn run(&self, tunnel: Tunnel, cancel: CancellationToken) {
         let credentials = Credentials::default();
         let link = Arc::new(crate::link::Link::new());
@@ -823,28 +837,44 @@ impl Manager {
         )
         .await?;
         let connection = attempt.sessions.last().cloned().ok_or(NETWORK)?;
-        if tunnel.kind == "R" {
+        let listening = if tunnel.kind == "R" {
             *expected.lock().unwrap() = Some(RemoteRoute {
                 address: tunnel.bind.clone(),
                 port: tunnel.port,
             });
-            timed(connection.tcpip_forward(unbracket(&tunnel.bind), u32::from(tunnel.port)))
-                .await?
-                .map_err(|error| match error {
-                    russh::Error::RequestDenied => Problem::terminal(
-                        "SSH-сервер не разрешил удалённый порт или порт уже занят.",
-                    ),
-                    _ => NETWORK,
-                })?;
-        } else {
-            attempt.listener = Some(
-                timed(TcpListener::bind((unbracket(&tunnel.bind), tunnel.port)))
+            let assigned =
+                timed(connection.tcpip_forward(unbracket(&tunnel.bind), u32::from(tunnel.port)))
                     .await?
-                    .map_err(bind_problem)?,
-            );
-        }
-        self.state(&tunnel.id, "running", "Туннель работает", None)
-            .await;
+                    .map_err(|error| match error {
+                        russh::Error::RequestDenied => Problem::terminal(
+                            "SSH-сервер не разрешил удалённый порт или порт уже занят.",
+                        ),
+                        _ => NETWORK,
+                    })?;
+            if tunnel.port == 0 {
+                // The server reports the port it chose and names it in forwarded channels.
+                let port = u16::try_from(assigned)
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .ok_or(Problem::terminal(
+                        "SSH-сервер не сообщил выбранный удалённый порт.",
+                    ))?;
+                if let Some(route) = expected.lock().unwrap().as_mut() {
+                    route.port = port;
+                }
+                port
+            } else {
+                tunnel.port
+            }
+        } else {
+            let listener = timed(TcpListener::bind((unbracket(&tunnel.bind), tunnel.port)))
+                .await?
+                .map_err(bind_problem)?;
+            let port = listener.local_addr().map_err(bind_problem)?.port();
+            attempt.listener = Some(listener);
+            port
+        };
+        self.running(&tunnel.id, listening).await;
         attempt.started = true;
         link.connected();
         {
@@ -1133,6 +1163,9 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 fn update(runtime: &mut Runtime, state: &str, message: &str) {
+    if state != "running" {
+        runtime.port = None;
+    }
     runtime.state = state.into();
     runtime.message = message.into();
     push_log(runtime, message);

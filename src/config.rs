@@ -283,6 +283,16 @@ fn host_identity(value: &Endpoint) -> (String, u16) {
     )
 }
 
+/// Variable that lets a tunnel listen on port 0, a port the system chooses. Only
+/// integration tests set it: they read the chosen port from the tunnel's `Runtime` and so
+/// avoid a race for a free port. A user's tunnel needs a stable port, so without the
+/// variable port 0 is rejected as before.
+pub const EPHEMERAL_PORTS_VARIABLE: &str = "KROT_TEST_EPHEMERAL_PORTS";
+
+fn ephemeral_ports_allowed() -> bool {
+    std::env::var_os(EPHEMERAL_PORTS_VARIABLE).is_some_and(|value| value == "1")
+}
+
 pub fn validate_tunnel(tunnel: &Tunnel, others: &[Tunnel]) -> Result<()> {
     text(&tunnel.id, "ID туннеля", true)?;
     text(&tunnel.name, "Имя туннеля", true)?;
@@ -305,7 +315,7 @@ pub fn validate_tunnel(tunnel: &Tunnel, others: &[Tunnel]) -> Result<()> {
     endpoint(&tunnel.server, "SSH-сервер", true)?;
     host(&tunnel.bind, "Адрес прослушивания")?;
     ensure!(
-        tunnel.port > 0,
+        tunnel.port > 0 || ephemeral_ports_allowed(),
         "Порт прослушивания должен быть от 1 до 65535."
     );
     if tunnel.kind == "D" {
