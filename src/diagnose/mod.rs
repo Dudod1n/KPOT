@@ -315,11 +315,17 @@ impl Budget {
     }
     /// Takes one connection if `reserve` connections stay for later stages.
     pub(crate) fn take(&self, reserve: u32) -> bool {
-        self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                (used + reserve < self.limit).then_some(used + 1)
-            })
-            .is_ok()
+        let mut used = self.used.load(Ordering::SeqCst);
+        while used + reserve < self.limit {
+            match self
+                .used
+                .compare_exchange(used, used + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
+        false
     }
     pub(crate) fn used(&self) -> u32 {
         self.used.load(Ordering::SeqCst)
