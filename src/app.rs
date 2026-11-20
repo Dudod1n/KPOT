@@ -40,6 +40,29 @@ enum Command {
     Check,
     /// Показать путь конфигурации
     Path,
+    /// Проверить доступность SSH-сервера из текущей сети без входа на него
+    Diagnose {
+        /// ID или имя туннеля (проверяется его первый узел) либо host[:port]
+        target: String,
+        /// Отчёт в JSON
+        #[arg(long)]
+        json: bool,
+        /// Скрыть узел, IP-адреса и отпечаток ключа, чтобы приложить отчёт к задаче
+        #[arg(long)]
+        redact: bool,
+        /// Не проверять контрольные узлы
+        #[arg(long)]
+        no_control: bool,
+        /// Не спрашивать DoH-провайдеров (имя сервера не уходит к Cloudflare и Google)
+        #[arg(long)]
+        no_doh: bool,
+        /// Российский контрольный узел вместо встроенных; можно повторять
+        #[arg(long, value_name = "URL")]
+        control_domestic: Vec<String>,
+        /// Зарубежный контрольный узел вместо встроенных; можно повторять
+        #[arg(long, value_name = "URL")]
+        control_foreign: Vec<String>,
+    },
     /// Запустить туннели в фоне без окна
     Background,
     /// Показать состояние фоновых туннелей
@@ -159,6 +182,24 @@ pub fn run() -> Result<()> {
             Some(Command::Autostart {action}) => {
                 if action != "status" { store.load()?; autostart::set_enabled(&store.path,action == "enable")?; }
                 println!("Автозапуск после входа: {}.",if autostart::is_enabled(&store.path)? {"включён"} else {"выключен"});
+                Ok(())
+            }
+            Some(Command::Diagnose { target, json, redact, no_control, no_doh, control_domestic, control_foreign }) => {
+                use crate::diagnose;
+                // A broken configuration does not prevent checking an explicit host[:port].
+                let tunnels = store.load().map(|config| config.tunnels).unwrap_or_default();
+                let target = diagnose::Target::resolve(&target, &tunnels)?;
+                let mut options = diagnose::Options::new(store.known_hosts_path());
+                if !control_domestic.is_empty() { options.control_domestic = control_domestic; }
+                if !control_foreign.is_empty() { options.control_foreign = control_foreign; }
+                if no_control { options.control_domestic.clear(); options.control_foreign.clear(); }
+                options.doh = !no_doh;
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let interrupt = cancel.clone();
+                runtime.spawn(async move { if tokio::signal::ctrl_c().await.is_ok() { interrupt.cancel(); } });
+                let mut report = runtime.block_on(diagnose::run(target, options, cancel));
+                if redact { diagnose::redact(&mut report); }
+                if json { println!("{}", serde_json::to_string_pretty(&report)?); } else { print!("{}", diagnose::render(&report)); }
                 Ok(())
             }
             Some(Command::Metrics { tunnel }) => runtime.block_on(async {
