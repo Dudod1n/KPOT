@@ -7,9 +7,11 @@
 //!
 //! Answers wait for the client in one queue per flow. The flows are served in turn and a full
 //! queue drops from the flow that holds most, so a flood into the port of one flow, which
-//! needs no credentials, costs the other flows neither their place nor their turn.
+//! needs no credentials, costs the other flows neither their place nor their turn. Expired
+//! answers of any flow leave first, and finding the flow that holds most does not search all
+//! flows for every datagram dropped.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     ops::Range,
@@ -90,6 +92,15 @@ struct Flow {
 struct Pending {
     frame: Vec<u8>,
     at: Instant,
+    /// Order among all answers, filled in when queued.
+    seq: u64,
+}
+
+/// An answer in `Relay::arrivals`; it may have left its queue already.
+struct Arrival {
+    flow: u32,
+    seq: u64,
+    at: Instant,
 }
 
 /// Answers of one flow waiting for the client.
@@ -123,12 +134,23 @@ struct Relay {
     input_start: usize,
     flows: HashMap<u32, Flow>,
     control: VecDeque<Control>,
-    /// Answers for the client by flow; no entry is empty.
+    /// Answers for the client by flow. An entry emptied by a drop stays until its turn comes.
     data: HashMap<u32, Replies>,
     /// The flows in `data`, each once, in the order of their turns.
     turns: VecDeque<u32>,
     data_count: usize,
     data_bytes: usize,
+    /// Answers in the order they were queued, which is the order of their times, so expired
+    /// answers of every flow are found from the front.
+    arrivals: VecDeque<Arrival>,
+    next_seq: u64,
+    /// Flows by datagrams and by bytes held, with stale entries: each flow holding answers
+    /// has an entry at least as large as what it holds, and an entry is checked when on top.
+    by_count: BinaryHeap<(usize, u32)>,
+    by_bytes: BinaryHeap<(usize, u32)>,
+    /// Heap entries and flows looked at to find the flow that holds most.
+    #[cfg(test)]
+    examined: usize,
     /// The batch being written to stdout and how much of it is written.
     output: Vec<u8>,
     written: usize,
@@ -289,6 +311,12 @@ impl Relay {
             turns: VecDeque::new(),
             data_count: 0,
             data_bytes: 0,
+            arrivals: VecDeque::new(),
+            next_seq: 0,
+            by_count: BinaryHeap::new(),
+            by_bytes: BinaryHeap::new(),
+            #[cfg(test)]
+            examined: 0,
             output: Vec::with_capacity(WRITE_BATCH + proto::MAX_FRAME),
             written: 0,
             output_datagrams: VecDeque::new(),
@@ -724,12 +752,25 @@ impl Relay {
                 },
                 &mut frame,
             );
-            self.queue_reply(id, Pending { frame, at: now });
+            self.queue_reply(
+                id,
+                Pending {
+                    frame,
+                    at: now,
+                    seq: 0,
+                },
+            );
         }
     }
 
-    /// Queues an answer of `flow` for the client, making room when the queue is full.
-    fn queue_reply(&mut self, flow: u32, pending: Pending) {
+    /// Queues an answer of `flow` for the client, making room when the queue is full: expired
+    /// answers leave first, then the oldest of the flow that holds most.
+    fn queue_reply(&mut self, flow: u32, mut pending: Pending) {
+        if self.data_count >= CHANNEL_QUEUE_DATAGRAMS
+            || self.data_bytes + pending.frame.len() > CHANNEL_QUEUE_BYTES
+        {
+            self.expire_replies(pending.at);
+        }
         while self.data_count >= CHANNEL_QUEUE_DATAGRAMS
             || self.data_bytes + pending.frame.len() > CHANNEL_QUEUE_BYTES
         {
@@ -738,6 +779,13 @@ impl Relay {
                 break;
             }
         }
+        pending.seq = self.next_seq;
+        self.next_seq += 1;
+        self.arrivals.push_back(Arrival {
+            flow,
+            seq: pending.seq,
+            at: pending.at,
+        });
         self.data_count += 1;
         self.data_bytes += pending.frame.len();
         let replies = self.data.entry(flow).or_insert_with(|| {
@@ -750,48 +798,132 @@ impl Relay {
         });
         replies.bytes += pending.frame.len();
         replies.queue.push_back(pending);
+        self.by_count.push((replies.queue.len(), flow));
+        self.by_bytes.push((replies.bytes, flow));
+        self.compact();
+    }
+
+    /// Forgets answers that have left once their entries outnumber those queued, so the
+    /// work is paid for by the answers queued since.
+    fn compact(&mut self) {
+        let limit = 2 * self.data_count + 64;
+        if self.arrivals.len() > limit {
+            let data = &self.data;
+            self.arrivals.retain(|arrival| {
+                data.get(&arrival.flow)
+                    .and_then(|replies| replies.queue.front())
+                    .is_some_and(|front| front.seq <= arrival.seq)
+            });
+        }
+        let limit = 2 * self.data.len() + 64;
+        if self.by_count.len() > limit || self.by_bytes.len() > limit {
+            #[cfg(test)]
+            {
+                self.examined += self.data.len();
+            }
+            let held = self
+                .data
+                .iter()
+                .filter(|(_, replies)| !replies.queue.is_empty());
+            self.by_count = held
+                .clone()
+                .map(|(flow, replies)| (replies.queue.len(), *flow))
+                .collect();
+            self.by_bytes = held.map(|(flow, replies)| (replies.bytes, *flow)).collect();
+        }
+    }
+
+    /// Takes the oldest answer of `flow` and leaves its entry, even empty, in its turn.
+    fn pop_reply(&mut self, flow: u32) -> Option<Pending> {
+        let replies = self.data.get_mut(&flow)?;
+        let pending = replies.queue.pop_front()?;
+        replies.bytes -= pending.frame.len();
+        self.data_count -= 1;
+        self.data_bytes -= pending.frame.len();
+        Some(pending)
+    }
+
+    /// Drops the answers of all flows that waited longer than `DATAGRAM_EXPIRY`.
+    fn expire_replies(&mut self, now: Instant) {
+        while let Some(arrival) = self.arrivals.front() {
+            if now.saturating_duration_since(arrival.at) <= DATAGRAM_EXPIRY {
+                break;
+            }
+            let (flow, seq) = (arrival.flow, arrival.seq);
+            self.arrivals.pop_front();
+            // A flow sends and drops from the front, so an answer still queued is its first.
+            let queued = self
+                .data
+                .get(&flow)
+                .and_then(|replies| replies.queue.front())
+                .is_some_and(|front| front.seq == seq);
+            if queued && self.pop_reply(flow).is_some() {
+                self.stats.drops.add(DropReason::Expired);
+            }
+        }
+    }
+
+    /// The flow that holds most datagrams with `by_count`, bytes otherwise.
+    fn largest(&mut self, by_count: bool) -> Option<u32> {
+        let heap = if by_count {
+            &mut self.by_count
+        } else {
+            &mut self.by_bytes
+        };
+        while let Some(&(entry, flow)) = heap.peek() {
+            #[cfg(test)]
+            {
+                self.examined += 1;
+            }
+            let held = self.data.get(&flow).map_or(0, |replies| {
+                if by_count {
+                    replies.queue.len()
+                } else {
+                    replies.bytes
+                }
+            });
+            if held == entry {
+                return Some(flow);
+            }
+            heap.pop();
+            // The flow shrank since and goes back at its size. An entry below its size is a
+            // leftover: a larger one exists.
+            if held > 0 && held < entry {
+                heap.push((held, flow));
+            }
+        }
+        None
     }
 
     /// Drops the oldest answer of the flow that holds most of what ran out: datagrams with
     /// `by_count`, bytes otherwise, so a flood of small datagrams pays for the places it takes.
     /// `false` when none waits.
     fn drop_reply(&mut self, arriving: u32, by_count: bool) -> bool {
-        let size = |replies: &Replies| {
-            if by_count {
-                replies.queue.len()
-            } else {
-                replies.bytes
-            }
-        };
         let total = if by_count {
             self.data_count
         } else {
             self.data_bytes
         };
         // A flow that holds half of everything holds most: no search while it floods.
-        let held = self.data.get(&arriving).map_or(0, size);
+        let held = self.data.get(&arriving).map_or(0, |replies| {
+            if by_count {
+                replies.queue.len()
+            } else {
+                replies.bytes
+            }
+        });
         let largest = if held * 2 >= total && held > 0 {
             arriving
         } else {
-            let Some((flow, _)) = self.data.iter().max_by_key(|(_, replies)| size(replies)) else {
+            let Some(flow) = self.largest(by_count) else {
                 return false;
             };
-            *flow
+            flow
         };
-        let Some(replies) = self.data.get_mut(&largest) else {
+        if self.pop_reply(largest).is_none() {
             return false;
-        };
-        let Some(old) = replies.queue.pop_front() else {
-            return false;
-        };
-        replies.bytes -= old.frame.len();
-        self.data_count -= 1;
-        self.data_bytes -= old.frame.len();
-        self.stats.drops.add(DropReason::Overflow);
-        if replies.queue.is_empty() {
-            self.data.remove(&largest);
-            self.turns.retain(|flow| *flow != largest);
         }
+        self.stats.drops.add(DropReason::Overflow);
         true
     }
 
@@ -817,6 +949,8 @@ impl Relay {
                 ),
             }
         }
+        // Also while the window is full: expired answers must not hold places of fresh ones.
+        self.expire_replies(now);
         let mut in_flight = self.sent_bytes - self.acked_bytes;
         while self.output.len() < WRITE_BATCH {
             let Some(&flow) = self.turns.front() else {
@@ -826,19 +960,6 @@ impl Relay {
                 self.turns.pop_front();
                 continue;
             };
-            while replies
-                .queue
-                .front()
-                .is_some_and(|old| now.duration_since(old.at) > DATAGRAM_EXPIRY)
-            {
-                let Some(old) = replies.queue.pop_front() else {
-                    break;
-                };
-                replies.bytes -= old.frame.len();
-                self.data_count -= 1;
-                self.data_bytes -= old.frame.len();
-                self.stats.drops.add(DropReason::Expired);
-            }
             let Some(size) = replies.queue.front().map(|pending| pending.frame.len()) else {
                 self.data.remove(&flow);
                 self.turns.pop_front();
@@ -853,14 +974,15 @@ impl Relay {
                 self.turns.rotate_left(1);
                 continue;
             }
-            let Some(pending) = replies.queue.pop_front() else {
+            replies.credit -= size;
+            let Some(pending) = self.pop_reply(flow) else {
                 break;
             };
-            replies.credit -= size;
-            replies.bytes -= size;
-            self.data_count -= 1;
-            self.data_bytes -= size;
-            if replies.queue.is_empty() {
+            if self
+                .data
+                .get(&flow)
+                .is_some_and(|replies| replies.queue.is_empty())
+            {
                 self.data.remove(&flow);
                 self.turns.pop_front();
             }
@@ -987,6 +1109,7 @@ mod tests {
             Pending {
                 frame: frame.clone(),
                 at,
+                seq: 0,
             },
         );
         frame
@@ -1049,6 +1172,73 @@ mod tests {
         }
         assert_eq!(relay.data_count, CHANNEL_QUEUE_DATAGRAMS);
         assert_eq!(relay.data[&1].queue.len(), 200);
+    }
+
+    /// A full window; flow 1 is first in turns with a fresh answer behind an expired one, and
+    /// flow 2 fills the rest of the queue with answers expired at the returned time.
+    fn full_window_with_expired_answers() -> (Relay, Instant) {
+        let mut relay = Relay::new();
+        let start = Instant::now();
+        queue_flow_reply(&mut relay, 1, b"old", start);
+        for _ in 0..CHANNEL_QUEUE_DATAGRAMS - 2 {
+            queue_flow_reply(&mut relay, 2, b"stale", start + Duration::from_millis(1));
+        }
+        queue_flow_reply(&mut relay, 1, b"fresh", start + DATAGRAM_EXPIRY);
+        assert_eq!(relay.data_count, CHANNEL_QUEUE_DATAGRAMS);
+        relay.sent_bytes = IN_FLIGHT_WINDOW;
+        (relay, start + DATAGRAM_EXPIRY + Duration::from_millis(2))
+    }
+
+    #[test]
+    fn a_full_window_still_drops_expired_answers_of_every_flow() {
+        let (mut relay, now) = full_window_with_expired_answers();
+        relay.fill(now);
+        assert!(batch_flows(&relay).is_empty());
+        assert_eq!(
+            relay.stats.drops.get(DropReason::Expired) as usize,
+            CHANNEL_QUEUE_DATAGRAMS - 1
+        );
+        assert_eq!((relay.data_count, relay.data[&1].queue.len()), (1, 1));
+        assert_eq!(relay.turns.front(), Some(&1));
+    }
+
+    #[test]
+    fn expired_answers_make_room_before_fresh_ones() {
+        let (mut relay, now) = full_window_with_expired_answers();
+        for _ in 0..100 {
+            queue_flow_reply(&mut relay, 3, b"new", now);
+        }
+        assert_eq!(relay.stats.drops.get(DropReason::Overflow), 0);
+        assert_eq!(
+            relay.stats.drops.get(DropReason::Expired) as usize,
+            CHANNEL_QUEUE_DATAGRAMS - 1
+        );
+        assert_eq!(relay.data[&1].queue.len(), 1);
+        assert_eq!(relay.data[&3].queue.len(), 100);
+        assert_eq!(relay.data_count, 101);
+    }
+
+    #[test]
+    fn a_flood_into_many_flows_does_not_search_them_all_for_each_drop() {
+        let mut relay = Relay::new();
+        let now = Instant::now();
+        let flows = u32::from(RELAY_MAX_FLOWS);
+        let junk = [0u8; 1200];
+        for round in 0..20 * CHANNEL_QUEUE_DATAGRAMS as u32 {
+            queue_flow_reply(&mut relay, round % flows, &junk, now);
+        }
+        let drops = relay.stats.drops.get(DropReason::Overflow) as usize;
+        assert!(drops > 10 * CHANNEL_QUEUE_DATAGRAMS, "{drops} drops");
+        // A search of all flows would look at about `RELAY_MAX_FLOWS` of them per drop.
+        let per_drop = relay.examined as f64 / drops as f64;
+        assert!(per_drop < 8.0, "{per_drop} looked at per drop");
+        // The flood is still shared evenly: every flow keeps its part.
+        let held: Vec<usize> = relay.data.values().map(|r| r.queue.len()).collect();
+        assert_eq!(held.len(), flows as usize);
+        let (least, most) = (held.iter().min().unwrap(), held.iter().max().unwrap());
+        assert!(most - least <= 1, "from {least} to {most}");
+        assert!(relay.arrivals.len() <= 2 * relay.data_count + 64);
+        assert!(relay.by_bytes.len() <= 2 * relay.data.len() + 64);
     }
 
     #[test]
