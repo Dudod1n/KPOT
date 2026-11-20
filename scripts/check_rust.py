@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -378,6 +379,42 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(code, 0)
         self.assertIn('КРОТ', err)
         self.assertEqual(self.store.path.read_text(), '{broken')
+
+    async def test_diagnose_reaches_kex_without_login_and_compares_the_saved_key(self):
+        key = asyncssh.generate_private_key('ssh-ed25519')
+        server = await self.server(key=key, password='secret')
+        target = f'127.0.0.1:{server.get_port()}'
+        code, out, err = await self.cli('diagnose', target, '--json', '--no-control')
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        ssh = [p for p in report['probes'] if p['kind'] == 'ssh_handshake']
+        self.assertEqual([p['outcome'] for p in ssh], ['ok'])
+        self.assertTrue(ssh[0]['banner'].startswith('SSH-2.0-'))
+        self.assertTrue(ssh[0]['fingerprint'].startswith('SHA256:'))
+        self.assertEqual([v['code'] for v in report['verdicts']], ['reachable'])
+        self.assertLessEqual(report['connections'], 8)
+        self.assertEqual(self.auths, [])
+        self.assertFalse(self.store.known_hosts_path.exists())
+
+        other = asyncssh.generate_private_key('ssh-ed25519').export_public_key().decode().strip()
+        self.store.known_hosts_path.write_text(
+            json.dumps({f'[127.0.0.1]:{server.get_port()}': other}), encoding='utf-8')
+        code, out, err = await self.cli('diagnose', target, '--no-control', '--redact')
+        self.assertEqual(code, 0, err)
+        self.assertIn('Ключ узла отличается', out)
+        self.assertNotIn('127.0.0.1', out)
+        self.assertNotIn('SHA256:', out)
+        self.assertEqual(json.loads(self.store.known_hosts_path.read_text())[f'[127.0.0.1]:{server.get_port()}'], other)
+
+        # A bound socket that does not listen keeps its port closed for the whole check.
+        with socket.socket() as closed:
+            closed.bind(('127.0.0.1', 0))
+            port = closed.getsockname()[1]
+            code, out, err = await self.cli('diagnose', f'127.0.0.1:{port}', '--json', '--no-control')
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        self.assertIn('ssh_port_refused', [v['code'] for v in report['verdicts']])
+        self.assertTrue(all(isinstance(p['outcome'], dict) for p in report['probes'] if p['kind'] == 'ssh_handshake'))
 
     async def test_local_remote_socks_and_listener_cleanup(self):
         server = await self.server()

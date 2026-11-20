@@ -4,6 +4,7 @@ pub mod autostart;
 pub mod background;
 pub mod config;
 pub mod desktop;
+pub mod diagnose;
 pub mod divert;
 pub mod icons;
 pub mod launcher;

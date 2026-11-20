@@ -502,11 +502,7 @@ impl Manager {
         cancel: &CancellationToken,
         interactive: bool,
     ) -> std::result::Result<(), Problem> {
-        let identity = format!(
-            "[{}]:{}",
-            unbracket(&endpoint.host).to_lowercase(),
-            endpoint.port
-        );
+        let identity = trust_identity(&endpoint.host, endpoint.port);
         let exported = key
             .to_openssh()
             .map_err(|_| Problem::terminal("SSH-сервер предоставил неподдерживаемый ключ узла."))?;
@@ -1160,6 +1156,21 @@ fn read_trust(path: &Path) -> std::result::Result<HashMap<String, String>, Probl
         PublicKey::from_openssh(key).map_err(|_| problem)?;
     }
     Ok(trust)
+}
+/// The key of a host in the trust store: `[host]:port`, lower case.
+fn trust_identity(host: &str, port: u16) -> String {
+    format!("[{}]:{}", unbracket(host).to_lowercase(), port)
+}
+/// The saved key of `host:port`, looked up as a tunnel would; the store is not changed.
+pub(crate) fn saved_host_key(
+    path: &Path,
+    host: &str,
+    port: u16,
+) -> std::result::Result<Option<PublicKey>, &'static str> {
+    let trust = read_trust(path).map_err(|problem| problem.message)?;
+    Ok(trust
+        .get(&trust_identity(host, port))
+        .and_then(|encoded| PublicKey::from_openssh(encoded).ok()))
 }
 fn same_key(encoded: &str, key: &PublicKey) -> bool {
     PublicKey::from_openssh(encoded).is_ok_and(|old| old.key_data() == key.key_data())

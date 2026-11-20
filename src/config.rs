@@ -227,7 +227,7 @@ fn text(value: &str, label: &str, required: bool) -> Result<()> {
     Ok(())
 }
 
-fn host(value: &str, label: &str) -> Result<()> {
+pub(crate) fn host(value: &str, label: &str) -> Result<()> {
     text(value, label, true)?;
     ensure!(
         !value
