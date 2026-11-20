@@ -153,10 +153,10 @@ fn ipv4_fragments_are_recognised() {
     assert_eq!(fragment(&packet), None);
     packet[6] = 0x20; // more fragments, offset 0
     let key = (IpAddr::from([1, 2, 3, 4]), IpAddr::from([5, 6, 7, 8]), 77);
-    assert_eq!(fragment(&packet), Some((key, true)));
+    assert_eq!(fragment(&packet), Some((key, Some(20))));
     packet[6] = 0x00;
     packet[7] = 0x10; // offset 16 * 8
-    assert_eq!(fragment(&packet), Some((key, false)));
+    assert_eq!(fragment(&packet), Some((key, None)));
 }
 
 #[test]

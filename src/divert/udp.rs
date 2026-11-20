@@ -128,22 +128,74 @@ pub fn inbound(
     Some(packet)
 }
 
-/// An IPv4 fragment: its key and whether it is the first one.
-pub fn fragment(data: &[u8]) -> Option<((IpAddr, IpAddr, u16), bool)> {
-    if data.len() < 20 || data[0] >> 4 != 4 || data[9] != UDP {
-        return None;
+/// Identifies the fragments of one datagram: its addresses and the identification field.
+pub type FragmentKey = (IpAddr, IpAddr, u32);
+
+/// A fragment of a UDP datagram, IPv4 or IPv6: its key and, for the first fragment, where
+/// its UDP header starts. Later fragments carry no UDP header.
+pub fn fragment(data: &[u8]) -> Option<(FragmentKey, Option<usize>)> {
+    match data.first()? >> 4 {
+        4 => {
+            let header = usize::from(data[0] & 0x0f) * 4;
+            if data.len() < 20 || header < 20 || data[9] != UDP {
+                return None;
+            }
+            let field = u16::from_be_bytes([data[6], data[7]]);
+            let (more, offset) = (field & 0x2000 != 0, field & 0x1fff);
+            if !more && offset == 0 {
+                return None;
+            }
+            let address =
+                |at: usize| IpAddr::from([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+            let id = u16::from_be_bytes([data[4], data[5]]);
+            Some((
+                (address(12), address(16), u32::from(id)),
+                (offset == 0).then_some(header),
+            ))
+        }
+        6 if data.len() >= 40 => {
+            let at = ipv6_fragment_header(data)?;
+            let header = &data[at..at + 8];
+            if header[0] != UDP {
+                return None;
+            }
+            // An atomic fragment (offset 0, no more fragments) is a whole datagram behind a
+            // fragment header; it is treated as a first fragment and never captured.
+            let offset = u16::from_be_bytes([header[2], header[3]]) >> 3;
+            let address = |at: usize| {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&data[at..at + 16]);
+                IpAddr::from(octets)
+            };
+            let id = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+            Some((
+                (address(8), address(24), id),
+                (offset == 0).then_some(at + 8),
+            ))
+        }
+        _ => None,
     }
-    let field = u16::from_be_bytes([data[6], data[7]]);
-    let (more, offset) = (field & 0x2000 != 0, field & 0x1fff);
-    if !more && offset == 0 {
-        return None;
+}
+
+/// Where the fragment header of an IPv6 packet starts, past the extension headers that may
+/// precede it.
+fn ipv6_fragment_header(data: &[u8]) -> Option<usize> {
+    const HOP_BY_HOP: u8 = 0;
+    const ROUTING: u8 = 43;
+    const FRAGMENT: u8 = 44;
+    const DESTINATION: u8 = 60;
+    let (mut next, mut at) = (data[6], 40);
+    loop {
+        match next {
+            FRAGMENT => return (data.len() >= at + 8).then_some(at),
+            HOP_BY_HOP | ROUTING | DESTINATION => {
+                let header = data.get(at..at + 2)?;
+                next = header[0];
+                at += (usize::from(header[1]) + 1) * 8;
+            }
+            _ => return None,
+        }
     }
-    let source = IpAddr::from([data[12], data[13], data[14], data[15]]);
-    let destination = IpAddr::from([data[16], data[17], data[18], data[19]]);
-    Some((
-        (source, destination, u16::from_be_bytes([data[4], data[5]])),
-        offset == 0,
-    ))
 }
 
 #[derive(Clone, Debug)]
