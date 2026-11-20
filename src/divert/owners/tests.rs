@@ -292,91 +292,138 @@ fn every_owner(pids: &[u32]) -> Vec<String> {
     pids.iter().map(u32::to_string).collect()
 }
 
+/// A system with one process table, a capture clock that ticks on every look and waits that
+/// only move the clock.
+struct System {
+    ipv4: Vec<Vec<u8>>,
+    /// Readings of both tables.
+    reads: u32,
+    clock: i64,
+    /// The moment `wait` starts from: the `now` of the current lookup.
+    now: Instant,
+    waits: Vec<Duration>,
+}
+
+impl System {
+    fn new(ipv4: Vec<Vec<u8>>, now: Instant) -> Self {
+        Self {
+            ipv4,
+            reads: 0,
+            clock: 0,
+            now,
+            waits: Vec::new(),
+        }
+    }
+
+    /// A datagram captured now, by the capture clock.
+    fn capture(&mut self) -> i64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn rules(
+        &mut self,
+        snapshot: &mut Snapshot,
+        now: Instant,
+        local: &str,
+        captured: i64,
+        covering: impl FnMut(&[u32]) -> Vec<String>,
+    ) -> Option<Vec<String>> {
+        self.now = now;
+        snapshot.rules(now, local.parse().unwrap(), captured, self, covering)
+    }
+}
+
+impl Tables for System {
+    fn read(&mut self, v6: bool) -> Option<Vec<u8>> {
+        if v6 {
+            return Some(table(&[]));
+        }
+        self.reads += 1;
+        Some(table(&self.ipv4))
+    }
+
+    fn stamp(&mut self) -> i64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn wait(&mut self, time: Duration) -> Instant {
+        self.waits.push(time);
+        self.now + time
+    }
+}
+
 #[test]
 fn one_snapshot_serves_every_endpoint_for_its_hold() {
     let mut snapshot = Snapshot::default();
-    let reads = Cell::new(0);
-    let ipv4 = table(&[row("192.0.2.1:5", 1), row("192.0.2.2:5", 2)]);
-    let read = |v6: bool| {
-        reads.set(reads.get() + 1);
-        Some(if v6 { table(&[]) } else { ipv4.clone() })
-    };
     let start = Instant::now();
-    let local = |text: &str| text.parse::<SocketAddr>().unwrap();
+    let mut system = System::new(vec![row("192.0.2.1:5", 1), row("192.0.2.2:5", 2)], start);
+    let captured = system.capture();
     assert_eq!(
-        snapshot.rules(start, local("192.0.2.1:5"), read, every_owner),
+        system.rules(&mut snapshot, start, "192.0.2.1:5", captured, every_owner),
         Some(vec!["1".into()])
     );
     let soon = start + SNAPSHOT_HOLD - Duration::from_millis(1);
+    let captured = system.capture();
     assert_eq!(
-        snapshot.rules(soon, local("192.0.2.2:5"), read, every_owner),
+        system.rules(&mut snapshot, soon, "192.0.2.2:5", captured, every_owner),
         Some(vec!["2".into()])
     );
-    assert_eq!(reads.get(), 2, "both tables read once for both endpoints");
-    snapshot.rules(
+    assert_eq!(system.reads, 1, "both tables read once for both endpoints");
+    let captured = system.capture();
+    system.rules(
+        &mut snapshot,
         start + SNAPSHOT_HOLD,
-        local("192.0.2.1:5"),
-        read,
+        "192.0.2.1:5",
+        captured,
         every_owner,
     );
-    assert_eq!(reads.get(), 4);
+    assert_eq!(system.reads, 2);
+    assert!(system.waits.is_empty());
 }
 
 #[test]
 fn a_socket_bound_after_the_snapshot_is_found_by_a_fresh_reading() {
     let mut snapshot = Snapshot::default();
-    let reads = Cell::new(0);
-    let rows = std::cell::RefCell::new(vec![row("192.0.2.1:5", 1)]);
-    let read = |v6: bool| {
-        reads.set(reads.get() + 1);
-        Some(if v6 {
-            table(&[])
-        } else {
-            table(&rows.borrow())
-        })
-    };
     let start = Instant::now();
-    let local = |text: &str| text.parse::<SocketAddr>().unwrap();
+    let mut system = System::new(vec![row("192.0.2.1:5", 1)], start);
+    let captured = system.capture();
     assert_eq!(
-        snapshot.rules(start, local("192.0.2.1:5"), read, every_owner),
+        system.rules(&mut snapshot, start, "192.0.2.1:5", captured, every_owner),
         Some(vec!["1".into()])
     );
     // The application opens its voice socket and sends from it right away.
-    rows.borrow_mut().push(row("0.0.0.0:50000", 7));
-    let soon = start + Duration::from_millis(1);
+    system.ipv4.push(row("0.0.0.0:50000", 7));
+    let captured = system.capture();
+    let later = start + REREAD_GAP;
     assert_eq!(
-        snapshot.rules(soon, local("192.0.2.1:50000"), read, every_owner),
+        system.rules(
+            &mut snapshot,
+            later,
+            "192.0.2.1:50000",
+            captured,
+            every_owner
+        ),
         Some(vec!["7".into()])
     );
-    assert_eq!(reads.get(), 4, "the held snapshot was read again");
+    assert_eq!(system.reads, 2, "the held snapshot was read again");
     // The fresh reading serves known endpoints for its own hold.
-    let later = soon + SNAPSHOT_HOLD - Duration::from_millis(1);
+    let held = later + SNAPSHOT_HOLD - Duration::from_millis(1);
+    let captured = system.capture();
     assert_eq!(
-        snapshot.rules(later, local("192.0.2.1:5"), read, every_owner),
+        system.rules(&mut snapshot, held, "192.0.2.1:5", captured, every_owner),
         Some(vec!["1".into()])
     );
-    assert_eq!(reads.get(), 4);
-    // An endpoint nobody owns costs one more reading, not two.
-    assert_eq!(
-        snapshot.rules(later, local("192.0.2.1:6"), read, every_owner),
-        Some(vec![])
-    );
-    assert_eq!(reads.get(), 6);
+    assert_eq!(system.reads, 2);
+    assert!(system.waits.is_empty(), "the gap had passed: no wait");
 }
 
 #[test]
 fn a_port_left_by_another_process_is_read_again_for_its_new_owner() {
     let mut snapshot = Snapshot::default();
-    let reads = Cell::new(0);
-    let rows = std::cell::RefCell::new(vec![row("0.0.0.0:50000", 3)]);
-    let read = |v6: bool| {
-        reads.set(reads.get() + 1);
-        Some(if v6 {
-            table(&[])
-        } else {
-            table(&rows.borrow())
-        })
-    };
+    let start = Instant::now();
+    let mut system = System::new(vec![row("0.0.0.0:50000", 3)], start);
     // Only the voice application is under a rule.
     let voice = |pids: &[u32]| -> Vec<String> {
         pids.iter()
@@ -384,20 +431,107 @@ fn a_port_left_by_another_process_is_read_again_for_its_new_owner() {
             .map(|_| "voice".to_owned())
             .collect()
     };
-    let start = Instant::now();
-    let local: SocketAddr = "192.0.2.1:50000".parse().unwrap();
-    assert_eq!(snapshot.rules(start, local, read, voice), Some(vec![]));
+    let captured = system.capture();
+    assert_eq!(
+        system.rules(&mut snapshot, start, "192.0.2.1:50000", captured, voice),
+        Some(vec![])
+    );
     // Another process leaves the port and the voice application binds it right away.
-    *rows.borrow_mut() = vec![row("0.0.0.0:50000", 7)];
+    system.ipv4 = vec![row("0.0.0.0:50000", 7)];
+    let captured = system.capture();
     let soon = start + Duration::from_millis(1);
     assert_eq!(
-        snapshot.rules(soon, local, read, voice),
+        system.rules(&mut snapshot, soon, "192.0.2.1:50000", captured, voice),
         Some(vec!["voice".into()])
     );
     assert_eq!(
-        reads.get(),
-        4,
+        system.reads, 2,
         "the previous owner in the held snapshot is not trusted"
+    );
+    assert_eq!(
+        system.waits,
+        [REREAD_GAP - Duration::from_millis(1)],
+        "the datagram waited for the gap instead of passing"
+    );
+}
+
+#[test]
+fn a_datagram_captured_before_the_reading_needs_no_other() {
+    let mut snapshot = Snapshot::default();
+    let start = Instant::now();
+    let mut system = System::new(vec![], start);
+    // Both datagrams wait in the driver queue while the first one is looked up.
+    let first = system.capture();
+    let second = system.capture();
+    let rules = system.rules(&mut snapshot, start, "192.0.2.1:5", first, every_owner);
+    assert_eq!(rules, Some(vec![]));
+    let soon = start + Duration::from_millis(1);
+    let rules = system.rules(&mut snapshot, soon, "192.0.2.1:6", second, every_owner);
+    assert_eq!(rules, Some(vec![]));
+    assert_eq!(
+        system.reads, 1,
+        "the reading shows every socket bound before it"
+    );
+    assert!(system.waits.is_empty());
+}
+
+#[test]
+fn new_endpoints_without_a_rule_read_the_tables_at_most_once_per_gap() {
+    let mut snapshot = Snapshot::default();
+    let start = Instant::now();
+    let mut system = System::new(vec![], start);
+    // Five hundred new endpoints in a second, each looked up as soon as it is captured.
+    let mut now = start;
+    for index in 0..500u16 {
+        now = now.max(start + Duration::from_millis(2) * u32::from(index));
+        let captured = system.capture();
+        let local = format!("192.0.2.1:{}", 10_000 + index);
+        let rules = system.rules(&mut snapshot, now, &local, captured, every_owner);
+        assert_eq!(rules, Some(vec![]));
+        // The loop goes on after the wait, if there was one.
+        now = snapshot.at.unwrap().max(now);
+    }
+    let elapsed = now - start;
+    let limit = elapsed.as_millis() / REREAD_GAP.as_millis() + 1;
+    assert!(
+        u128::from(system.reads) <= limit,
+        "{} readings in {elapsed:?}",
+        system.reads
+    );
+    assert!(system.waits.iter().all(|&wait| wait <= REREAD_GAP));
+}
+
+#[test]
+fn a_new_socket_under_a_rule_is_found_even_right_after_a_reading() {
+    let mut snapshot = Snapshot::default();
+    let start = Instant::now();
+    let mut system = System::new(vec![], start);
+    let captured = system.capture();
+    system.rules(&mut snapshot, start, "192.0.2.1:5", captured, every_owner);
+    // A busy moment: endpoints without a rule have just made the tables be read again.
+    let busy = start + Duration::from_millis(20);
+    let captured = system.capture();
+    system.rules(&mut snapshot, busy, "192.0.2.1:6", captured, every_owner);
+    assert_eq!(system.reads, 2);
+    // The voice application binds its socket and sends at once, within the gap.
+    system.ipv4.push(row("0.0.0.0:50000", 7));
+    let captured = system.capture();
+    let soon = busy + Duration::from_millis(1);
+    assert_eq!(
+        system.rules(
+            &mut snapshot,
+            soon,
+            "192.0.2.1:50000",
+            captured,
+            every_owner
+        ),
+        Some(vec!["7".into()]),
+        "the first datagram does not pass around the tunnel"
+    );
+    assert_eq!(system.waits, [REREAD_GAP - Duration::from_millis(1)]);
+    assert_eq!(
+        snapshot.at,
+        Some(soon + REREAD_GAP - Duration::from_millis(1))
     );
 }
 
