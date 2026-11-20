@@ -39,10 +39,11 @@ fn new_endpoints() -> mpsc::Receiver<(UdpSocket, Instant, i64)> {
     receiver
 }
 
-/// The system tables, counted.
+/// The system tables, counted and timed.
 struct Counted<'a> {
     tables: SystemTables<'a>,
     reads: u32,
+    reading: Duration,
     waits: u32,
     waited: Duration,
 }
@@ -50,7 +51,10 @@ struct Counted<'a> {
 impl Tables for Counted<'_> {
     fn read(&mut self, v6: bool) -> Option<Vec<u8>> {
         self.reads += 1;
-        self.tables.read(v6)
+        let start = Instant::now();
+        let table = self.tables.read(v6);
+        self.reading += start.elapsed();
+        table
     }
 
     fn stamp(&mut self) -> i64 {
@@ -64,19 +68,20 @@ impl Tables for Counted<'_> {
     }
 }
 
-#[test]
-fn udp_tables_under_a_stream_of_new_endpoints() {
+/// One stream of new endpoints without a rule, looked up with tables read at most once per
+/// `gap`; reports the cost and checks the limit.
+fn stream(gap: Duration) {
     let pid = std::process::id();
     let mut table = vec![0u8; 4096];
     let mut tables = Counted {
         tables: SystemTables { buffer: &mut table },
         reads: 0,
+        reading: Duration::ZERO,
         waits: 0,
         waited: Duration::ZERO,
     };
     let mut sockets = Vec::new();
-    let mut snapshot = Snapshot::default();
-    let mut busy = Duration::ZERO;
+    let mut snapshot = Snapshot::with_gap(gap);
     let mut delay = Duration::ZERO;
     let mut worst = Duration::ZERO;
     let began = Instant::now();
@@ -89,7 +94,6 @@ fn udp_tables_under_a_stream_of_new_endpoints() {
             found = pids.contains(&pid);
             Vec::new()
         });
-        busy += now.elapsed();
         delay += bound.elapsed();
         worst = worst.max(bound.elapsed());
         assert_eq!(rules, Some(vec![]));
@@ -98,26 +102,32 @@ fn udp_tables_under_a_stream_of_new_endpoints() {
         assert!(found, "the new socket {local} is in the last reading");
     }
     let elapsed = began.elapsed();
-    let (reads, waits, waited) = (tables.reads / 2, tables.waits, tables.waited);
-    // Both tables, read the way the packet loop reads them, with every socket above bound.
-    let rounds = 200;
-    let start = Instant::now();
-    for _ in 0..rounds {
-        for v6 in [false, true] {
-            assert!(tables.tables.read(v6).is_some());
-        }
-    }
-    let one = start.elapsed() / rounds;
+    let reads = tables.reads / 2;
     report(&format!(
-        "one reading of both tables: {one:?} with {} own sockets bound",
-        sockets.len()
-    ));
-    report(&format!(
-        "{ENDPOINTS} new endpoints without a rule in {elapsed:?}: {reads} readings of both \
-         tables, {waits} waits for the {REREAD_GAP:?} gap ({waited:?} in all), {busy:?} \
-         spent in lookups; delay from bind to decision {:?} on average, {worst:?} at most",
+        "gap {gap:?}: {ENDPOINTS} new endpoints without a rule in {elapsed:?}: {reads} \
+         readings of both tables taking {:?} ({:?} each), {} waits ({:?} in all); delay from \
+         bind to decision {:?} on average, {worst:?} at most",
+        tables.reading,
+        tables.reading / reads.max(1),
+        tables.waits,
+        tables.waited,
         delay / ENDPOINTS,
     ));
-    let limit = elapsed.as_millis() / REREAD_GAP.as_millis() + 2;
-    assert!(u128::from(reads) <= limit, "{reads} readings");
+    if !gap.is_zero() {
+        let limit = elapsed.as_micros() / gap.as_micros() + 2;
+        assert!(u128::from(reads) <= limit, "{reads} readings");
+    }
+}
+
+#[test]
+fn udp_tables_under_a_stream_of_new_endpoints() {
+    // The capture stamp alone, then the limits considered for `REREAD_GAP`.
+    for gap in [
+        Duration::ZERO,
+        Duration::from_millis(1),
+        Duration::from_millis(2),
+        REREAD_GAP,
+    ] {
+        stream(gap);
+    }
 }

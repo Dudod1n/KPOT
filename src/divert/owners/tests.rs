@@ -439,7 +439,7 @@ fn a_port_left_by_another_process_is_read_again_for_its_new_owner() {
     // Another process leaves the port and the voice application binds it right away.
     system.ipv4 = vec![row("0.0.0.0:50000", 7)];
     let captured = system.capture();
-    let soon = start + Duration::from_millis(1);
+    let soon = start + REREAD_GAP / 4;
     assert_eq!(
         system.rules(&mut snapshot, soon, "192.0.2.1:50000", captured, voice),
         Some(vec!["voice".into()])
@@ -450,7 +450,7 @@ fn a_port_left_by_another_process_is_read_again_for_its_new_owner() {
     );
     assert_eq!(
         system.waits,
-        [REREAD_GAP - Duration::from_millis(1)],
+        [REREAD_GAP - REREAD_GAP / 4],
         "the datagram waited for the gap instead of passing"
     );
 }
@@ -480,10 +480,10 @@ fn new_endpoints_without_a_rule_read_the_tables_at_most_once_per_gap() {
     let mut snapshot = Snapshot::default();
     let start = Instant::now();
     let mut system = System::new(vec![], start);
-    // Five hundred new endpoints in a second, each looked up as soon as it is captured.
+    // Five thousand new endpoints in a second, each looked up as soon as it is captured.
     let mut now = start;
-    for index in 0..500u16 {
-        now = now.max(start + Duration::from_millis(2) * u32::from(index));
+    for index in 0..5000u16 {
+        now = now.max(start + Duration::from_micros(200) * u32::from(index));
         let captured = system.capture();
         let local = format!("192.0.2.1:{}", 10_000 + index);
         let rules = system.rules(&mut snapshot, now, &local, captured, every_owner);
@@ -492,7 +492,7 @@ fn new_endpoints_without_a_rule_read_the_tables_at_most_once_per_gap() {
         now = snapshot.at.unwrap().max(now);
     }
     let elapsed = now - start;
-    let limit = elapsed.as_millis() / REREAD_GAP.as_millis() + 1;
+    let limit = elapsed.as_micros() / REREAD_GAP.as_micros() + 1;
     assert!(
         u128::from(system.reads) <= limit,
         "{} readings in {elapsed:?}",
@@ -516,7 +516,7 @@ fn a_new_socket_under_a_rule_is_found_even_right_after_a_reading() {
     // The voice application binds its socket and sends at once, within the gap.
     system.ipv4.push(row("0.0.0.0:50000", 7));
     let captured = system.capture();
-    let soon = busy + Duration::from_millis(1);
+    let soon = busy + REREAD_GAP / 4;
     assert_eq!(
         system.rules(
             &mut snapshot,
@@ -528,11 +528,8 @@ fn a_new_socket_under_a_rule_is_found_even_right_after_a_reading() {
         Some(vec!["7".into()]),
         "the first datagram does not pass around the tunnel"
     );
-    assert_eq!(system.waits, [REREAD_GAP - Duration::from_millis(1)]);
-    assert_eq!(
-        snapshot.at,
-        Some(soon + REREAD_GAP - Duration::from_millis(1))
-    );
+    assert_eq!(system.waits, [REREAD_GAP - REREAD_GAP / 4]);
+    assert_eq!(snapshot.at, Some(soon + REREAD_GAP - REREAD_GAP / 4));
 }
 
 #[test]

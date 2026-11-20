@@ -35,7 +35,7 @@ pub const PASS_HOLD: Duration = Duration::from_millis(100);
 /// How long one reading of the system tables answers for every endpoint.
 pub const SNAPSHOT_HOLD: Duration = Duration::from_millis(50);
 /// The least time between two readings of the tables, for every endpoint together.
-pub const REREAD_GAP: Duration = Duration::from_millis(10);
+pub const REREAD_GAP: Duration = Duration::from_millis(1);
 /// How long a "block" decision is reused, and kept after its socket is gone.
 /// Matches WinDivert's default queue time.
 pub const BLOCK_HOLD: Duration = Duration::from_secs(2);
@@ -157,16 +157,34 @@ pub trait Tables {
 }
 
 /// One reading of both UDP tables, shared by every endpoint for `SNAPSHOT_HOLD`.
-#[derive(Default)]
 pub struct Snapshot {
     ipv4: Option<Vec<u8>>,
     ipv6: Option<Vec<u8>>,
     /// When the reading started, by the monotonic clock and by the capture clock.
     at: Option<Instant>,
     stamp: Option<i64>,
+    /// The least time between two readings.
+    gap: Duration,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self::with_gap(REREAD_GAP)
+    }
 }
 
 impl Snapshot {
+    /// A snapshot that reads the tables again at most once per `gap`.
+    pub fn with_gap(gap: Duration) -> Self {
+        Self {
+            ipv4: None,
+            ipv6: None,
+            at: None,
+            stamp: None,
+            gap,
+        }
+    }
+
     /// The rules of the owners of `local`, as `covering(owners)` gives them, for a datagram
     /// captured at `captured` by the capture clock of `tables`. The tables are read when the
     /// snapshot is old, or when it covers no owner of `local` with a rule and was read before
@@ -202,8 +220,8 @@ impl Snapshot {
         // passing, and the reading answers for every datagram captured before it.
         let since = self
             .at
-            .map_or(REREAD_GAP, |at| now.saturating_duration_since(at));
-        let at = match REREAD_GAP.checked_sub(since) {
+            .map_or(self.gap, |at| now.saturating_duration_since(at));
+        let at = match self.gap.checked_sub(since) {
             Some(left) if !left.is_zero() => tables.wait(left),
             _ => now,
         };
