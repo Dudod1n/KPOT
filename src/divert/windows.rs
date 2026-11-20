@@ -940,3 +940,6 @@ pub(super) fn launch(config: &Path, prompt: super::Prompt) -> Result<()> {
     tasks::runas(program.as_os_str(), &parameters, false)
         .context("Права администратора не предоставлены: перехват не запущен.")
 }
+
+#[cfg(test)]
+mod tests;
