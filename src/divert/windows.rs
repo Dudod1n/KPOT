@@ -56,7 +56,9 @@ use crate::{
 };
 use krot_udp_proto::metrics::DropReason;
 
-const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp)\0";
+/// Later IP fragments carry no transport header and match neither `tcp` nor `udp`: without
+/// `fragment` they would leave unseen, around the verdict of their first fragment.
+const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp or fragment)\0";
 const FIREWALL_RULE: &str = "KROT-app-relay";
 const OUTBOUND: u32 = 1 << 17;
 const AF_INET: u32 = 2;
