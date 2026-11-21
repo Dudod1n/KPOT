@@ -7,26 +7,22 @@ use std::{
 };
 
 use super::{SystemTables, performance_counter};
-use crate::divert::owners::{REREAD_GAP, Snapshot, Tables};
-
-/// New endpoints without a rule, one every `PACE`: 500 per second.
-const ENDPOINTS: u32 = 500;
-const PACE: Duration = Duration::from_millis(2);
+use crate::divert::owners::{Snapshot, Tables};
 
 /// Written past the test harness capture, so that a passing run shows it too.
 fn report(text: &str) {
     let _ = writeln!(std::io::stderr(), "udp-owners: {text}");
 }
 
-/// Binds a new socket every `PACE` on another thread, as applications do, and hands each to
+/// Binds `count` new sockets, one every `pace`, on another thread, as applications do, and hands each to
 /// the receiver the way the driver queues their first datagrams for the packet loop. Each
 /// comes with the moment it was bound and its capture stamp, taken after the bind.
-fn new_endpoints() -> mpsc::Receiver<(UdpSocket, Instant, i64)> {
+fn new_endpoints(count: u32, pace: Duration) -> mpsc::Receiver<(UdpSocket, Instant, i64)> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let began = Instant::now();
-        for index in 0..ENDPOINTS {
-            while began.elapsed() < PACE * index {
+        for index in 0..count {
+            while began.elapsed() < pace * index {
                 std::hint::spin_loop();
             }
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -68,9 +64,9 @@ impl Tables for Counted<'_> {
     }
 }
 
-/// One stream of new endpoints without a rule, looked up with tables read at most once per
-/// `gap`; reports the cost and checks the limit.
-fn stream(gap: Duration) {
+/// One second of new endpoints without a rule, `rate` per second, looked up with tables read
+/// at most once per `gap`; reports the cost and checks the limit.
+fn stream(rate: u32, gap: Duration) {
     let pid = std::process::id();
     let mut table = vec![0u8; 4096];
     let mut tables = Counted {
@@ -85,7 +81,7 @@ fn stream(gap: Duration) {
     let mut delay = Duration::ZERO;
     let mut worst = Duration::ZERO;
     let began = Instant::now();
-    for (socket, bound, captured) in new_endpoints() {
+    for (socket, bound, captured) in new_endpoints(rate, Duration::from_secs(1) / rate) {
         let local = socket.local_addr().unwrap();
         sockets.push(socket);
         let now = Instant::now();
@@ -104,14 +100,14 @@ fn stream(gap: Duration) {
     let elapsed = began.elapsed();
     let reads = tables.reads / 2;
     report(&format!(
-        "gap {gap:?}: {ENDPOINTS} new endpoints without a rule in {elapsed:?}: {reads} \
+        "gap {gap:?}: {rate} new endpoints without a rule in {elapsed:?}: {reads} \
          readings of both tables taking {:?} ({:?} each), {} waits ({:?} in all); delay from \
          bind to decision {:?} on average, {worst:?} at most",
         tables.reading,
         tables.reading / reads.max(1),
         tables.waits,
         tables.waited,
-        delay / ENDPOINTS,
+        delay / rate,
     ));
     if !gap.is_zero() {
         let limit = elapsed.as_micros() / gap.as_micros() + 2;
@@ -121,13 +117,15 @@ fn stream(gap: Duration) {
 
 #[test]
 fn udp_tables_under_a_stream_of_new_endpoints() {
-    // The capture stamp alone, then the limits considered for `REREAD_GAP`.
-    for gap in [
-        Duration::ZERO,
-        Duration::from_millis(1),
-        Duration::from_millis(2),
-        REREAD_GAP,
-    ] {
-        stream(gap);
+    // The capture stamp alone, then the limits considered for `REREAD_GAP`, for hundreds and
+    // for thousands of new endpoints per second.
+    for rate in [500, 2000] {
+        for gap in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        ] {
+            stream(rate, gap);
+        }
     }
 }

@@ -9,8 +9,9 @@
 //! socket bound since, possibly on a port another process has just left. A snapshot read after
 //! the datagram was captured still answers for it: its socket was bound before it sent. An older
 //! one does not, and the tables are read again, but at most once per `REREAD_GAP` for all
-//! endpoints together: the datagram waits for the next reading rather than pass unchecked, and
-//! the datagrams captured meanwhile are answered by that same reading.
+//! endpoints together: the datagram, and the packet loop with it, waits up to that gap for the
+//! next reading rather than pass unchecked, and the datagrams captured meanwhile are answered by
+//! that same reading.
 //! Decisions are kept per local endpoint, measured with the monotonic clock only:
 //! - a datagram that is let through (no rule, a rule that bypasses its stopped tunnel, or owners
 //!   that could not be read) is decided again after `PASS_HOLD`, so that a blocked application
@@ -34,7 +35,11 @@ use std::{
 pub const PASS_HOLD: Duration = Duration::from_millis(100);
 /// How long one reading of the system tables answers for every endpoint.
 pub const SNAPSHOT_HOLD: Duration = Duration::from_millis(50);
-/// The least time between two readings of the tables, for every endpoint together.
+/// The least time between two readings of the tables, for every endpoint together: at most
+/// 1000 readings a second. The packet loop, and with it every captured packet, waits for the
+/// rest of the gap only when a datagram needs a reading less than 1 ms after the previous one
+/// started, so no packet waits more than 1 ms for it. A reading takes about 0.2-0.3 ms, so a
+/// longer gap would make packets wait longer than the readings it saves.
 pub const REREAD_GAP: Duration = Duration::from_millis(1);
 /// How long a "block" decision is reused, and kept after its socket is gone.
 /// Matches WinDivert's default queue time.
