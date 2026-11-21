@@ -104,8 +104,8 @@ def helpers():
 
 def krot_processes():
     return as_list(powershell(
-        'Get-Process -Name krot, krot-cli -ErrorAction SilentlyContinue | '
-        'Select-Object Id, Path | ConvertTo-Json -Compress'))
+        'Get-CimInstance Win32_Process -Filter "Name=\'krot.exe\' OR Name=\'krot-cli.exe\'" | '
+        'Select-Object ProcessId, ExecutablePath | ConvertTo-Json -Compress'))
 
 
 def wait(condition, what, seconds=60):
