@@ -526,7 +526,8 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
                     let _ = crate::tasks::unregister(&path, crate::tasks::Kind::Logon, false);
                     return Err(error);
                 }
-                return Ok(());
+                // A task of another copy that an elevated КРОТ registered stays after `register`.
+                return crate::tasks::unregister_others(&path, crate::tasks::Kind::Logon, true);
             }
             // Tasks of moved copies, or one that an elevated КРОТ registered, must not start a
             // second КРОТ next to the Run key. Where the Task Scheduler cannot be read there is

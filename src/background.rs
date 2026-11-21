@@ -115,7 +115,7 @@ const DIVERT_SILENT_STARTS: u32 = 3;
 /// as a start that failed, so a helper that attaches and crashes is not started again at once.
 const DIVERT_STABLE: Duration = Duration::from_secs(60);
 const DIVERT_SILENT_ERROR: &str =
-    "Помощник перехвата запускается, но не подключается. Нажмите «Предоставить права…».";
+    "Помощник перехвата запускается, но не остаётся подключённым. Нажмите «Предоставить права…».";
 const MAX_APP_LOGS: usize = 200;
 
 /// The last word from the elevated helper and what it has reported so far.
@@ -168,6 +168,13 @@ impl DivertRetry {
     /// The helper is attached. Once it has stayed for `DIVERT_STABLE`, every count starts
     /// over and a helper that goes away later is started again at once.
     fn attached(&mut self, now: Instant) {
+        // The helper went away unnoticed, while it was not wanted: this is another one.
+        if self
+            .session
+            .is_some_and(|(_, last)| now.saturating_duration_since(last) > DIVERT_TIMEOUT)
+        {
+            self.end_session();
+        }
         let (since, last) = self.session.get_or_insert((now, now));
         *last = now;
         self.started.store(false, Ordering::Relaxed);
@@ -177,16 +184,22 @@ impl DivertRetry {
             self.silent = 0;
         }
     }
-    /// For a wanted helper that is not attached: `None` to wait, otherwise start it now, with
-    /// `true` when the starts so far went through and the helper never attached for long.
-    fn due(&mut self, now: Instant) -> Option<bool> {
-        // A helper that went away before it proved stable is a start that failed: the pause
-        // of that start goes on and the next one is longer.
+    /// A helper that went away before it proved stable is a start that failed: the next start
+    /// waits for the pause of the failures so far, counted from its going away at the latest,
+    /// and the pause after it is longer.
+    fn end_session(&mut self) {
         if let Some((since, last)) = self.session.take()
             && last.saturating_duration_since(since) < DIVERT_STABLE
         {
             self.started.store(true, Ordering::Relaxed);
+            let failures = self.failures.load(Ordering::Relaxed).min(5) as u32;
+            self.at = self.at.max(last + DIVERT_RETRY * 2u32.pow(failures));
         }
+    }
+    /// For a wanted helper that is not attached: `None` to wait, otherwise start it now, with
+    /// `true` when the starts so far went through and the helper never attached for long.
+    fn due(&mut self, now: Instant) -> Option<bool> {
+        self.end_session();
         if now < self.at {
             return None;
         }
@@ -1207,8 +1220,9 @@ mod tests {
         // at once.
         retry.started.store(true, Ordering::Relaxed);
         let attached = at + DIVERT_RETRY * 33;
-        retry.attached(attached);
-        retry.attached(attached + DIVERT_STABLE);
+        for second in 0..=DIVERT_STABLE.as_secs() {
+            retry.attached(attached + Duration::from_secs(second));
+        }
         assert_eq!(retry.due(attached + DIVERT_STABLE), Some(false));
         assert_eq!(retry.failures.load(Ordering::Relaxed), 0);
     }
@@ -1250,6 +1264,24 @@ mod tests {
             retry.failures.load(Ordering::Relaxed),
             u64::from(DIVERT_SILENT_STARTS + 1)
         );
+    }
+
+    #[test]
+    fn an_earlier_attachment_does_not_make_a_new_one_stable() {
+        let now = Instant::now();
+        let mut retry = DivertRetry::new(now);
+        assert_eq!(retry.due(now), Some(false));
+        // Attached briefly, then it went away while nothing waited for it.
+        retry.attached(now + Duration::from_secs(1));
+        // Started by the user long after: it attaches and crashes at once.
+        let later = now + DIVERT_STABLE * 10;
+        retry.attached(later);
+        retry.attached(later + Duration::from_secs(4));
+        let gone = later + Duration::from_secs(4) + DIVERT_TIMEOUT;
+        assert_eq!(retry.due(gone), None, "No start right after a crash");
+        assert!(retry.at >= later + DIVERT_RETRY);
+        assert_eq!(retry.due(retry.at), Some(false));
+        assert_eq!(retry.failures.load(Ordering::Relaxed), 1);
     }
 
     #[test]

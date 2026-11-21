@@ -166,7 +166,12 @@ pub fn run() -> Result<()> {
                         // The task goes first: if Windows refuses to delete it, remembering stays
                         // on and the status keeps telling that the task still gives the rights.
                         #[cfg(windows)]
-                        crate::tasks::unregister(&store.path, Kind::Divert, true)?;
+                        // A Task Scheduler that cannot be read has no task to remove.
+                        if let Err(error) = crate::tasks::unregister(&store.path, Kind::Divert, true)
+                            && registered(&store.path, Kind::Divert, true).unwrap_or(false)
+                        {
+                            return Err(error);
+                        }
                         set_remembering(&store.path, false)?;
                     }
                     _ => {}

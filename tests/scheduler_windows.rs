@@ -36,11 +36,14 @@ fn text(bytes: &[u8]) -> String {
     }
 }
 
-/// Names of every task that starts with `prefix`.
-fn listed(prefix: &str) -> Vec<String> {
-    let output = schtasks(&["/query", "/fo", "csv", "/nh"]);
-    assert!(output.status.success(), "schtasks /query failed");
-    String::from_utf8_lossy(&output.stdout)
+/// Names of every task that starts with `prefix`, if the scheduler lists them.
+fn query(prefix: &str) -> Option<Vec<String>> {
+    let output = Command::new("schtasks.exe")
+        .args(["/query", "/fo", "csv", "/nh"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let names = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.trim_start().strip_prefix('"')?.split('"').next())
         .filter(|name| {
@@ -48,7 +51,12 @@ fn listed(prefix: &str) -> Vec<String> {
                 .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
         })
         .map(str::to_owned)
-        .collect()
+        .collect();
+    Some(names)
+}
+
+fn listed(prefix: &str) -> Vec<String> {
+    query(prefix).expect("schtasks /query lists the tasks")
 }
 
 fn name(config: &Path) -> String {
@@ -83,18 +91,19 @@ fn run_key(config: &Path) -> bool {
 }
 
 /// Removes every task and `Run` entry of the test configurations, also after a failure.
-struct Cleanup(Vec<PathBuf>);
+/// It never panics: a panic while the test unwinds would abort before the rest is removed.
+struct Cleanup(Vec<String>);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        for config in &self.0 {
-            for kind in ["logon", "divert"] {
-                for task in listed(&prefix(config, kind)) {
-                    schtasks(&["/delete", "/tn", &task, "/f"]);
-                }
+        for name in &self.0 {
+            for task in query(&format!("\\{name}-")).unwrap_or_default() {
+                let _ = Command::new("schtasks.exe")
+                    .args(["/delete", "/tn", &task, "/f"])
+                    .output();
             }
             let _ = Command::new("reg.exe")
-                .args(["delete", RUN_KEY, "/v", &name(config), "/f"])
+                .args(["delete", RUN_KEY, "/v", name, "/f"])
                 .output();
         }
     }
@@ -116,7 +125,7 @@ fn tasks_are_registered_found_and_removed_through_the_real_scheduler() {
     let temp = tempfile::tempdir().unwrap();
     let first = store(temp.path().join("first").join("config.json"));
     let second = store(temp.path().join("second").join("config.json"));
-    let cleanup = Cleanup(vec![first.clone(), second.clone()]);
+    let cleanup = Cleanup(vec![name(&first), name(&second)]);
     let divert = prefix(&first, "divert");
     assert!(listed(&divert).is_empty());
 
