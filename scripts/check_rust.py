@@ -22,6 +22,10 @@ import asyncssh
 from ssh_support import (Client, Config, Endpoint, Frames, SSHFixtures, Store, attach_udp, endpoint_path,
                          kill_group)
 
+
+def _metadata_token(path):
+    return json.loads(Path(path).read_text('utf-8'))['token']
+
 # Tunnels listen on port 0, and the tests take the chosen port from the runtime state. KROT
 # accepts port 0 only with this variable; every process the tests start inherits it.
 os.environ['KROT_TEST_EPHEMERAL_PORTS'] = '1'
@@ -70,6 +74,19 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
     @property
     def endpoint(self):
         return endpoint_path(self.store.path)
+
+    @property
+    def journal(self):
+        path = Path(f'{self.store.path}.log')
+        return path.read_text('utf-8') if path.exists() else ''
+
+    def assert_journal_has_no(self, *secrets):
+        journal = self.journal
+        self.assertIn('Фоновый процесс запущен', journal)
+        for secret in (*secrets, _metadata_token(self.endpoint)):
+            self.assertNotIn(secret, journal)
+        if os.name != 'nt':
+            self.assertEqual(Path(f'{self.store.path}.log').stat().st_mode & 0o777, 0o600)
 
     async def connections_closed(self):
         async with asyncio.timeout(5):
@@ -468,6 +485,8 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         for secret in ('jump-password','target-password','key-passphrase'):
             self.assertNotIn(secret, snapshot)
             self.assertNotIn(secret, self.store.path.read_text())
+        self.assert_journal_has_no('jump-password', 'target-password', 'key-passphrase')
+        self.assertIn(f'Туннель {tunnel.id}: Туннель работает', self.journal)
         await self.request('stop', tunnel.id)
         await self.assert_closed(tunnel.port)
         await self.connections_closed()
@@ -580,6 +599,30 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(code, 0, err)
             self.assertIn('не запущен', out)
 
+    @unittest.skipIf(os.name == 'nt', 'Windows retries a refused loopback connection past the client timeout')
+    async def test_journal_keeps_the_events_before_a_kill(self):
+        server = await self.server()
+        tunnel = self.tunnel(server)
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        self.process.kill()
+        await self.process.wait()
+        await self.start(self.store.load())
+        await self.wait(tunnel)
+        lines = self.journal.splitlines()
+        starts = [i for i, line in enumerate(lines) if 'Фоновый процесс запущен' in line]
+        running = [i for i, line in enumerate(lines) if f'Туннель {tunnel.id}: Туннель работает' in line]
+        self.assertEqual(len(starts), 2, lines)
+        self.assertTrue(running and running[0] < starts[1], 'Events of the killed process stay in the file')
+        self.assertRegex(lines[running[0]], r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} [+-]\d\d:\d\d INFO  ')
+        await self.request('shutdown')
+        await asyncio.wait_for(self.process.wait(), 8)
+        self.assertIn('Фоновый процесс остановлен.', self.journal.splitlines()[-1])
+        code, out, err = await self.cli('diagnostics')
+        self.assertEqual(code, 0, err)
+        self.assertIn(f'{self.store.path}.log', out)
+
     async def test_deferred_password_does_not_block_other_tunnel(self):
         protected = await self.server(password='only-in-memory')
         normal = await self.server()
@@ -598,6 +641,9 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             await self.request('answer', {'id':pending['id'],'value':True})
         self.assertEqual((await self.request('snapshot'))['prompts'][waiting.id]['id'], pending['id'])
         await self.request('answer', {'id':pending['id'],'value':'only-in-memory'})
+        await self.wait(waiting)
+        self.assertIn('Команда «answer» не выполнена', self.journal, 'The internal reason stays in the journal')
+        self.assert_journal_has_no('only-in-memory')
         await self.wait(waiting)
         await self.exchange(waiting.port)
 
@@ -684,6 +730,12 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError) as error:
                 await self.request(command,payload)
             self.assertNotIn('must-not-echo',str(error.exception))
+        with self.assertRaises(ValueError):
+            await self.request('answer', {'id': 'missing', 'value': {'must-not-echo': 'must-not-echo'}})
+        with self.assertRaises(ValueError):
+            await self.request('udp_tunnel', {'id': 'must-not-echo', 'enabled': 'must-not-echo'})
+        self.assertIn('Команда «udp_tunnel» не выполнена', self.journal)
+        self.assert_journal_has_no('must-not-echo')
         self.assertEqual((await self.request('snapshot'))['config']['tunnels'],[])
         if os.name != 'nt':
             self.assertEqual(self.endpoint.stat().st_mode & 0o777,0o600)

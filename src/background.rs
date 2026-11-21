@@ -865,6 +865,10 @@ impl Service {
                 }
                 let divert = &mut owned.divert;
                 if !report.error.is_empty() {
+                    if divert.error != report.error {
+                        let text = format!("Помощник перехвата: {}", report.error);
+                        crate::journal::write(crate::journal::Level::Error, &text);
+                    }
                     divert.error = report.error;
                     divert.seen = None;
                     return Ok(json!({"rules": []}));
@@ -988,7 +992,15 @@ impl Service {
                     Err(error) if error.is::<StaleConfig>() => {
                         json!({"ok":false,"error":CONFIG_CHANGED})
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        // The reason stays in the owner-only journal; values are hidden there too.
+                        crate::journal::write(
+                            crate::journal::Level::Warn,
+                            &crate::journal::hide_values(&format!(
+                                "Команда «{}» не выполнена: {error:#}",
+                                request.command.chars().take(40).collect::<String>()
+                            )),
+                        );
                         json!({"ok":false,"error":"Не удалось выполнить команду. Проверьте данные и обновите состояние КРОТ."})
                     }
                 };
@@ -1090,6 +1102,7 @@ pub async fn serve(store: Store) -> Result<()> {
                 crate::tray::Action::Open => {
                     if crate::app::open_desktop(&store).await.is_err() {
                         eprintln!("КРОТ: не удалось открыть окно из трея.");
+                        crate::journal::write(crate::journal::Level::Warn, "Не удалось открыть окно из трея.");
                     }
                 }
                 crate::tray::Action::Stop => { service.shutdown.cancel(); break; }

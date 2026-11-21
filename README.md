@@ -76,6 +76,7 @@ krot-cli background
 krot-cli status
 krot-cli stop
 krot-cli autostart enable
+krot-cli diagnostics
 ```
 
 `--config <файл>` выбирает отдельную конфигурацию. Например:

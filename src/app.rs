@@ -8,7 +8,7 @@ use crate::{
     autostart,
     background::{self, Client},
     config::{Store, default_config_path},
-    desktop, launcher,
+    desktop, journal, launcher,
 };
 
 #[derive(Parser)]
@@ -73,6 +73,8 @@ enum Command {
         #[arg(long)]
         tunnel: Option<String>,
     },
+    /// Показать пути файлов журнала фонового процесса и помощника перехвата
+    Diagnostics,
     /// Остановить фон и все туннели, сохранив выбор для следующего запуска
     Stop,
     /// Автозапуск после входа в учётную запись
@@ -149,8 +151,24 @@ pub fn run() -> Result<()> {
             }
             Some(Command::Check) => { let config = store.load()?; println!("Конфигурация корректна. Туннелей: {}. SSH не запускается.",config.tunnels.len()); Ok(()) }
             Some(Command::Path) => { println!("{}",store.path.display()); Ok(()) }
-            Some(Command::Serve) => runtime.block_on(background::serve(store)),
-            Some(Command::Divert { remember }) => crate::divert::run(store, remember),
+            Some(Command::Serve) => journaled("Фоновый процесс", journal::background_path(&store),
+                || runtime.block_on(background::serve(store))),
+            Some(Command::Divert { remember }) => journaled("Помощник перехвата", journal::divert_path(&store),
+                || crate::divert::run(store, remember)),
+            Some(Command::Diagnostics) => {
+                for (name, path) in [("фонового процесса", journal::background_path(&store)), ("помощника перехвата (Windows)", journal::divert_path(&store))] {
+                    println!("Журнал {name}: {}", path.display());
+                    for part in [path.clone(), journal::rotated_path(&path)] {
+                        match std::fs::metadata(&part) {
+                            Ok(metadata) => println!("  {} — {} КиБ", part.display(), metadata.len().div_ceil(1024)),
+                            Err(_) if part == path => println!("  ещё не создан"),
+                            Err(_) => {}
+                        }
+                    }
+                }
+                println!("Пароли, парольные фразы и ключи в журнал не записываются. Перед публикацией удалите из него адреса серверов, если они личные.");
+                Ok(())
+            }
             Some(Command::Elevation { action }) => {
                 use crate::tasks::{Kind, registered, remembering, set_remembering};
                 #[cfg(not(windows))]
@@ -243,6 +261,22 @@ pub fn run() -> Result<()> {
     if gui && let Err(ref error) = result {
         let _ = desktop::show_error(format!("Не удалось открыть КРОТ.\n\n{error:#}"));
     }
+    result
+}
+
+/// Runs a long-lived process with its journal: the start, the end and panics are recorded.
+fn journaled(process: &str, path: PathBuf, run: impl FnOnce() -> Result<()>) -> Result<()> {
+    journal::init(path);
+    journal::write(
+        journal::Level::Info,
+        &format!(
+            "{process} запущен: версия {}, PID {}.",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        ),
+    );
+    let result = run();
+    journal::finished(process, &result);
     result
 }
 
