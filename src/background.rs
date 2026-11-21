@@ -111,6 +111,9 @@ const DIVERT_RETRY: Duration = Duration::from_secs(60);
 /// window asks for consent again instead of running the remembered task. The starts go on:
 /// what kept the helper away may pass.
 const DIVERT_SILENT_STARTS: u32 = 3;
+/// A helper that stays attached this long has started well. One that goes away sooner counts
+/// as a start that failed, so a helper that attaches and crashes is not started again at once.
+const DIVERT_STABLE: Duration = Duration::from_secs(60);
 const DIVERT_SILENT_ERROR: &str =
     "Помощник перехвата запускается, но не подключается. Нажмите «Предоставить права…».";
 const MAX_APP_LOGS: usize = 200;
@@ -146,8 +149,10 @@ struct DivertRetry {
     failures: Arc<AtomicU64>,
     /// A start went through and the helper has not attached since.
     started: Arc<AtomicBool>,
-    /// Starts in a row that went through without the helper attaching.
+    /// Starts in a row that went through without the helper attaching for long.
     silent: u32,
+    /// The current attachment: when it began and when the helper was last seen attached.
+    session: Option<(Instant, Instant)>,
 }
 
 impl DivertRetry {
@@ -157,19 +162,31 @@ impl DivertRetry {
             failures: Arc::default(),
             started: Arc::default(),
             silent: 0,
+            session: None,
         }
     }
-    /// The helper is attached: every count starts over, and a helper that goes away later
-    /// is started again at once.
+    /// The helper is attached. Once it has stayed for `DIVERT_STABLE`, every count starts
+    /// over and a helper that goes away later is started again at once.
     fn attached(&mut self, now: Instant) {
-        self.at = now;
-        self.failures.store(0, Ordering::Relaxed);
+        let (since, last) = self.session.get_or_insert((now, now));
+        *last = now;
         self.started.store(false, Ordering::Relaxed);
-        self.silent = 0;
+        if now.saturating_duration_since(*since) >= DIVERT_STABLE {
+            self.at = now;
+            self.failures.store(0, Ordering::Relaxed);
+            self.silent = 0;
+        }
     }
     /// For a wanted helper that is not attached: `None` to wait, otherwise start it now, with
-    /// `true` when the starts so far went through and the helper never attached.
+    /// `true` when the starts so far went through and the helper never attached for long.
     fn due(&mut self, now: Instant) -> Option<bool> {
+        // A helper that went away before it proved stable is a start that failed: the pause
+        // of that start goes on and the next one is longer.
+        if let Some((since, last)) = self.session.take()
+            && last.saturating_duration_since(since) < DIVERT_STABLE
+        {
+            self.started.store(true, Ordering::Relaxed);
+        }
         if now < self.at {
             return None;
         }
@@ -1186,11 +1203,53 @@ mod tests {
             Some(true),
             "The starts go on"
         );
-        // An attached helper clears everything; when it goes away it is started at once.
+        // A helper that stays attached clears everything; when it goes away it is started
+        // at once.
         retry.started.store(true, Ordering::Relaxed);
-        retry.attached(at + DIVERT_RETRY * 33);
-        assert_eq!(retry.due(at + DIVERT_RETRY * 33), Some(false));
+        let attached = at + DIVERT_RETRY * 33;
+        retry.attached(attached);
+        retry.attached(attached + DIVERT_STABLE);
+        assert_eq!(retry.due(attached + DIVERT_STABLE), Some(false));
         assert_eq!(retry.failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn helper_that_attaches_and_goes_away_at_once_backs_off() {
+        let now = Instant::now();
+        let mut retry = DivertRetry::new(now);
+        let mut start = now;
+        assert_eq!(retry.due(start), Some(false));
+        let mut pauses = Vec::new();
+        for crash in 1..=DIVERT_SILENT_STARTS + 1 {
+            // The start goes through, the helper attaches for a few seconds and crashes.
+            retry.started.store(true, Ordering::Relaxed);
+            retry.attached(start + Duration::from_secs(2));
+            retry.attached(start + Duration::from_secs(4));
+            let gone = start + Duration::from_secs(4) + DIVERT_TIMEOUT;
+            assert_eq!(
+                retry.due(gone),
+                None,
+                "{crash}: no start right after a crash"
+            );
+            let next = retry.at;
+            assert!(next > gone);
+            assert_eq!(retry.due(next - Duration::from_secs(1)), None);
+            assert_eq!(
+                retry.due(next),
+                Some(crash >= DIVERT_SILENT_STARTS),
+                "{crash}: reported like a helper that never attaches"
+            );
+            pauses.push(next - start);
+            start = next;
+        }
+        assert!(
+            pauses.windows(2).all(|pair| pair[1] > pair[0]),
+            "{pauses:?}"
+        );
+        assert_eq!(
+            retry.failures.load(Ordering::Relaxed),
+            u64::from(DIVERT_SILENT_STARTS + 1)
+        );
     }
 
     #[test]
