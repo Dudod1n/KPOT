@@ -706,10 +706,16 @@ fn rename_file(source: &Path, target: &Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     fs::rename(source, target)
 }
-fn lock_directory() -> PathBuf {
+/// Root for the installation locks of `locked`.
+///
+/// A release build has one root for every directory, beside the default configuration;
+/// `locked` is not used there, and the lock file itself is told apart by `install_guard`.
+/// Tests keep the root beside the locked directory instead, so a test's temporary directory
+/// takes its locks away; one directory still maps to one lock in both builds.
+fn lock_directory(#[cfg_attr(not(test), allow(unused_variables))] locked: &Path) -> PathBuf {
     #[cfg(test)]
     {
-        std::env::temp_dir().join(format!("krot-update-locks-test-{}", std::process::id()))
+        locked.join(".krot-update-locks")
     }
     #[cfg(not(test))]
     {
@@ -768,14 +774,10 @@ pub async fn startup_guard() -> Result<File> {
     let before = fs::metadata("/proc/self/exe")?;
     #[cfg(not(target_os = "linux"))]
     let before = fs::metadata(&executable)?;
-    let guard = install_guard(
-        executable
-            .parent()
-            .context("Не найден каталог программы.")?,
-        false,
-        &lock_directory(),
-    )
-    .await?;
+    let directory = executable
+        .parent()
+        .context("Не найден каталог программы.")?;
+    let guard = install_guard(directory, false, &lock_directory(directory)).await?;
     let after =
         fs::metadata(&executable).context("Программа была обновлена; запустите КРОТ снова.")?;
     #[cfg(unix)]
@@ -816,10 +818,15 @@ pub async fn apply_install(manifest: &Path) -> Result<()> {
     let _transaction = install_guard(
         &install.directory,
         true,
-        &lock_directory().join("transactions"),
+        &lock_directory(&install.directory).join("transactions"),
     )
     .await?;
-    let guard = install_guard(&install.directory, true, &lock_directory()).await?;
+    let guard = install_guard(
+        &install.directory,
+        true,
+        &lock_directory(&install.directory),
+    )
+    .await?;
     // Recheck under the installation lock before stopping any running tunnels.
     let install = validate_install(manifest, &helper)?;
     let store = Store::new(&install.manifest.config)?;
@@ -874,7 +881,12 @@ pub async fn apply_install(manifest: &Path) -> Result<()> {
         Err(error) => Err(error),
     };
     if let Err(error) = readiness {
-        let guard = install_guard(&install.directory, true, &lock_directory()).await?;
+        let guard = install_guard(
+            &install.directory,
+            true,
+            &lock_directory(&install.directory),
+        )
+        .await?;
         if let Err(recovery) = restore_failed_restart(&install, &mut process, owner.as_ref()).await
         {
             return Err(error).context(format!("Автоматический откат невозможен: {recovery:#}. Закройте КРОТ; резервные копии old-0 и old-1 сохранены в {}", install.staging.display()));
