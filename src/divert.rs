@@ -662,7 +662,7 @@ pub fn launch(config: &std::path::Path, prompt: Prompt) -> anyhow::Result<()> {
 pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        if let Some(sid) = remember
+        let registration = if let Some(sid) = remember
             && crate::tasks::remembering(&store.path)
             && crate::tasks::elevated()
             && crate::tasks::user_sid().is_ok_and(|own| own == sid)
@@ -671,11 +671,13 @@ pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Res
             // consent registers anew, which also repairs a task that does not give the rights.
             // Apart from interception: registering lists every task of the system.
             let path = store.path.clone();
-            std::thread::spawn(move || {
+            Some(std::thread::spawn(move || {
                 let _ = crate::tasks::register(&path, crate::tasks::Kind::Divert);
-            });
-        }
-        windows::run(store)
+            }))
+        } else {
+            None
+        };
+        windows::run(store, windows::Registration(registration))
     }
     #[cfg(not(windows))]
     {

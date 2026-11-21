@@ -190,7 +190,9 @@ fn listed_names(output: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-pub use system::{elevated, register, registered, run, runas, unregister, user_sid};
+pub use system::{
+    elevated, register, registered, run, runas, unregister, unregister_others, user_sid,
+};
 
 /// Administrator rights exist only on Windows.
 #[cfg(not(windows))]
@@ -443,8 +445,10 @@ mod system {
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
         file.write_all(&bytes)?;
         file.as_file().sync_all()?;
+        // `schtasks` cannot open a file that is still open for writing: close it and keep
+        // only the path, which removes the file when dropped.
+        let file = file.into_temp_path();
         let path = file
-            .path()
             .to_str()
             .context("Путь временного файла не является корректным Unicode.")?
             .to_owned();
@@ -456,24 +460,34 @@ mod system {
             );
         }
         // The task exists by now: failing to clear the tasks of other copies is no failure.
-        for stale in listed(&prefix).unwrap_or_default() {
-            if !stale.eq_ignore_ascii_case(&name) {
-                let _ = schtasks(&["/delete", "/tn", &stale, "/f"]);
-            }
-        }
+        let _ = remove(&prefix, Some(&name), false);
         Ok(())
     }
 
-    /// Removes the tasks of every copy; an elevated task may need administrator consent.
-    pub fn unregister(config: &Path, kind: Kind) -> Result<()> {
+    /// Removes the tasks of every copy. A task that an elevated process registered may refuse
+    /// the user's deletion: with `consent` Windows then asks for administrator rights. The
+    /// helper's task is always registered so, a logon task when an older КРОТ ran elevated.
+    pub fn unregister(config: &Path, kind: Kind, consent: bool) -> Result<()> {
         let (prefix, _) = names(config, kind)?;
-        for name in listed(&prefix)? {
-            if schtasks(&["/delete", "/tn", &name, "/f"])?.status.success() {
+        remove(&prefix, None, consent)
+    }
+
+    /// Removes the tasks of the other copies, which `register` leaves where they refuse.
+    pub fn unregister_others(config: &Path, kind: Kind, consent: bool) -> Result<()> {
+        let (prefix, name) = names(config, kind)?;
+        remove(&prefix, Some(&name), consent)
+    }
+
+    fn remove(prefix: &str, keep: Option<&str>, consent: bool) -> Result<()> {
+        for name in listed(prefix)? {
+            if keep.is_some_and(|keep| keep.eq_ignore_ascii_case(&name))
+                || schtasks(&["/delete", "/tn", &name, "/f"])?.status.success()
+            {
                 continue;
             }
             ensure!(
-                kind == Kind::Divert,
-                "Не удалось удалить задание автозапуска {name}."
+                consent,
+                "Не удалось удалить задание планировщика Windows {name}."
             );
             runas(
                 schtasks_path().as_os_str(),
