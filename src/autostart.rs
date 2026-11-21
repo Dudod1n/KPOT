@@ -587,11 +587,33 @@ pub fn migrate(path: &Path) {
         else {
             return;
         };
-        let owned = registry::value(&name)
-            .ok()
-            .flatten()
-            .is_some_and(|value| windows_owned(&value, &path));
-        if !owned || refused.exists() || crate::tasks::elevated() {
+        let value = registry::value(&name).ok().flatten();
+        let owned = value
+            .as_ref()
+            .is_some_and(|value| windows_owned(value, &path));
+        let elevated = crate::tasks::elevated();
+        // After installation autostart moves from a portable copy to the installed one.
+        if crate::service::installed() {
+            use crate::tasks::{Kind, register, registered};
+            if !owned
+                && !elevated
+                && registered(&path, Kind::Logon, true).unwrap_or(false)
+                && !registered(&path, Kind::Logon, false).unwrap_or(true)
+            {
+                // `register` also removes the task of the other copy.
+                let _ = register(&path, Kind::Logon);
+                return;
+            }
+            if owned
+                && (refused.exists() || elevated)
+                && let Ok(command) = launch_command(&path).map(|command| windows_command(&command))
+                && value.as_ref().is_some_and(|value| value.0 != command)
+            {
+                let _ = registry::set(&name, Some(&command));
+                return;
+            }
+        }
+        if !owned || refused.exists() || elevated {
             return;
         }
         if crate::tasks::register(&path, crate::tasks::Kind::Logon).is_ok() {

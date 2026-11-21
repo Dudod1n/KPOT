@@ -87,24 +87,14 @@ fn path_key(path: &Path) -> String {
     text.trim_end_matches('\\').to_lowercase()
 }
 
-/// Both paths name the same directory, compared as Windows does.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn same_directory(first: &Path, second: &Path) -> bool {
-    path_key(first) == path_key(second)
-}
-
 /// A program of the installed copy that may ask the service for a helper.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn installed_program(program: &Path, directory: &Path) -> bool {
-    program
-        .parent()
-        .is_some_and(|parent| same_directory(parent, directory))
-        && program
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.eq_ignore_ascii_case("krot.exe") || name.eq_ignore_ascii_case("krot-cli.exe")
-            })
+    // Split as Windows paths whatever the platform, so that the tests run everywhere.
+    let program = path_key(program);
+    program.rsplit_once('\\').is_some_and(|(parent, name)| {
+        parent == path_key(directory) && (name == "krot.exe" || name == "krot-cli.exe")
+    })
 }
 
 /// A `Run` value that the installed `program` registered for autostart: its name is the
