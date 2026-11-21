@@ -97,7 +97,8 @@ def uninstall_entries():
 def helpers():
     """Owners of the running helpers that the service started."""
     return as_list(powershell(
-        'Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*divert-service*" } | '
+        'Get-CimInstance Win32_Process -Filter "Name=\'krot.exe\'" | '
+        'Where-Object { $_.CommandLine -like "*divert-service*" } | '
         'ForEach-Object { (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User } | ConvertTo-Json -Compress'))
 
 
