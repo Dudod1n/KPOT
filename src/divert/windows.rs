@@ -60,6 +60,8 @@ use krot_udp_proto::metrics::DropReason;
 /// `fragment` they would leave unseen, around the verdict of their first fragment.
 const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp or fragment)\0";
 const FIREWALL_RULE: &str = "KROT-app-relay";
+/// Rules of the helpers that the service starts, one per relay port: several run at once.
+const SERVICE_FIREWALL_RULE: &str = "KROT-service-relay";
 const OUTBOUND: u32 = 1 << 17;
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 23;
@@ -230,15 +232,22 @@ fn parents() -> HashMap<u32, u32> {
     map
 }
 
-/// Processes of the helper's own logon session; services and other users are never captured.
+/// Processes of one logon session, and with `user` only those of that user; services and
+/// other users are never captured.
 struct System {
     session: Option<u32>,
+    user: Option<String>,
     parents: RefCell<Option<(HashMap<u32, u32>, Instant)>>,
 }
 
 impl Processes for System {
     fn path(&self, pid: u32) -> Option<String> {
         if session(pid) != self.session {
+            return None;
+        }
+        if let Some(user) = &self.user
+            && crate::service::process_user(pid).as_ref() != Some(user)
+        {
             return None;
         }
         process_path(pid)
@@ -376,15 +385,15 @@ fn policies(rules: &[DivertRule]) -> HashMap<String, (Policy, Policy)> {
         .collect()
 }
 
-fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) {
+fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>, scope: Scope) {
     let own = std::env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
         .unwrap_or_default();
     let mut matcher = Matcher::new(&own);
     let system = System {
-        // SAFETY: returns the identifier of the calling process.
-        session: session(unsafe { GetCurrentProcessId() }),
+        session: scope.session,
+        user: scope.user,
         parents: RefCell::new(None),
     };
     let mut generation = u64::MAX;
@@ -681,18 +690,61 @@ fn netsh(arguments: &str) {
 }
 
 /// The relay accepts reflected connections that look inbound, so the firewall must let them in.
-fn firewall(port: Option<u16>) {
-    netsh(&format!(
-        "advfirewall firewall delete rule name={FIREWALL_RULE}"
-    ));
-    if let (Some(port), Ok(program)) = (port, std::env::current_exe())
-        && let Some(program) = program.to_str().filter(|path| !path.contains('"'))
-    {
-        netsh(&format!(
-            "advfirewall firewall add rule name={FIREWALL_RULE} dir=in action=allow \
-             protocol=TCP localport={port} program=\"{program}\""
-        ));
+#[derive(Clone, Copy)]
+enum Firewall {
+    /// The helper of one copy: one rule, replaced at every start.
+    Own,
+    /// A helper of the service: a rule for its own port, next to those of other helpers.
+    Service,
+}
+
+impl Firewall {
+    fn open(self, port: u16) {
+        let name = match self {
+            Firewall::Own => {
+                netsh(&format!(
+                    "advfirewall firewall delete rule name={FIREWALL_RULE}"
+                ));
+                FIREWALL_RULE
+            }
+            Firewall::Service => {
+                self.close(port);
+                SERVICE_FIREWALL_RULE
+            }
+        };
+        if let Ok(program) = std::env::current_exe()
+            && let Some(program) = program.to_str().filter(|path| !path.contains('"'))
+        {
+            netsh(&format!(
+                "advfirewall firewall add rule name={name} dir=in action=allow \
+                 protocol=TCP localport={port} program=\"{program}\""
+            ));
+        }
     }
+
+    fn close(self, port: u16) {
+        match self {
+            Firewall::Own => netsh(&format!(
+                "advfirewall firewall delete rule name={FIREWALL_RULE}"
+            )),
+            Firewall::Service => netsh(&format!(
+                "advfirewall firewall delete rule name={SERVICE_FIREWALL_RULE} protocol=tcp localport={port}"
+            )),
+        }
+    }
+}
+
+pub(super) fn clear_service_firewall() {
+    netsh(&format!(
+        "advfirewall firewall delete rule name={SERVICE_FIREWALL_RULE}"
+    ));
+}
+
+/// Whose processes the helper captures and how it opens the firewall.
+struct Scope {
+    session: Option<u32>,
+    user: Option<String>,
+    firewall: Firewall,
 }
 
 async fn accept(listener: tokio::net::TcpListener, shared: Arc<Shared>) {
@@ -808,8 +860,9 @@ fn listener(address: &str) -> Result<tokio::net::TcpListener> {
     Ok(tokio::net::TcpListener::from_std(listener)?)
 }
 
-async fn serve(store: Store) -> Result<()> {
-    let client = Client::new(&store);
+async fn serve(client: Client, scope: Scope) -> Result<()> {
+    let firewall = scope.firewall;
+    let mut scope = Some(scope);
     let shared = Arc::new(Shared {
         nat: Mutex::new(Nat::default()),
         rules: Mutex::new(Vec::new()),
@@ -820,13 +873,13 @@ async fn serve(store: Store) -> Result<()> {
         logs: Mutex::new(Vec::new()),
         ipv6: Mutex::new(super::Ipv6Health::default()),
     });
-    let start = || -> Result<u16> {
+    let mut start = || -> Result<u16> {
         let api = load()?;
         let relay = listener("0.0.0.0:0")
             .context("Не удалось открыть порт для перехваченных соединений.")?;
         let port = relay.local_addr()?.port();
         let device = Arc::new(open(&api)?);
-        firewall(Some(port));
+        firewall.open(port);
         let (inbound_send, inbound) = tokio::sync::mpsc::channel(INBOUND_QUEUE);
         let attach = client.clone();
         tokio::spawn(shared.link.clone().run(
@@ -843,20 +896,24 @@ async fn serve(store: Store) -> Result<()> {
             tokio::spawn(accept(relay, shared.clone()));
         }
         let shared = shared.clone();
+        let scope = scope.take().context("Перехват уже запущен.")?;
         std::thread::Builder::new()
             .name("divert".into())
-            .spawn(move || packets(api, device, port, shared))?;
+            .spawn(move || packets(api, device, port, shared, scope))?;
         Ok(port)
     };
-    if let Err(error) = start() {
-        let report = DivertReport {
-            version: env!("CARGO_PKG_VERSION").into(),
-            error: error.to_string(),
-            ..Default::default()
-        };
-        let _ = client.request("divert_sync", json!(report)).await;
-        return Err(error);
-    }
+    let port = match start() {
+        Ok(port) => port,
+        Err(error) => {
+            let report = DivertReport {
+                version: env!("CARGO_PKG_VERSION").into(),
+                error: error.to_string(),
+                ..Default::default()
+            };
+            let _ = client.request("divert_sync", json!(report)).await;
+            return Err(error);
+        }
+    };
     let mut failures = 0;
     let mut pending: Vec<(String, String)> = Vec::new();
     let mut events: Vec<String> = Vec::new();
@@ -926,7 +983,7 @@ async fn serve(store: Store) -> Result<()> {
         }
         tokio::time::sleep(SYNC_TIME).await;
     }
-    firewall(None);
+    firewall.close(port);
     Ok(())
 }
 
@@ -950,14 +1007,44 @@ pub(super) fn run(store: Store, registration: Registration) -> Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let result = runtime.block_on(serve(store));
+    let scope = Scope {
+        // SAFETY: returns the identifier of the calling process.
+        session: session(unsafe { GetCurrentProcessId() }),
+        user: None,
+        firewall: Firewall::Own,
+    };
+    let result = runtime.block_on(serve(Client::new(&store), scope));
     // `exit` runs no destructors.
     drop(registration);
     // The packet thread blocks in the driver; ending the process closes its handle.
     std::process::exit(if result.is_ok() { 0 } else { 1 })
 }
 
+/// The helper that the service started for one user in one session. It holds no lock in the
+/// user's directory: the service runs one helper per configuration itself.
+pub(super) fn run_assigned(assignment: crate::service::Assignment) -> Result<()> {
+    let client = Client::fixed(assignment.port, &assignment.token)?;
+    // Like the helper of a portable copy, it writes no file: panics reach the background journal.
+    crate::journal::keep_panics();
+    let scope = Scope {
+        session: Some(assignment.session),
+        user: Some(assignment.user),
+        firewall: Firewall::Service,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(serve(client, scope));
+    // The packet thread blocks in the driver; ending the process closes its handle.
+    std::process::exit(if result.is_ok() { 0 } else { 1 })
+}
+
 pub(super) fn launch(config: &Path, prompt: super::Prompt) -> Result<()> {
+    // The installed copy has the service: no consent, no task and nothing elevated from here.
+    if crate::service::installed() {
+        return crate::service::request(config);
+    }
     use crate::tasks::{self, Kind};
     let program = tasks::program()?;
     let path = config;

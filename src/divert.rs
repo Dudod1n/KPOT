@@ -686,6 +686,32 @@ pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Res
     }
 }
 
+/// Runs the helper that the interception service started: its assignment comes on standard
+/// input, and it reads nothing from the user's directory.
+pub fn run_assigned() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use anyhow::Context;
+        use std::io::Read;
+        let mut data = zeroize::Zeroizing::new(Vec::new());
+        std::io::stdin().take(4097).read_to_end(&mut data)?;
+        anyhow::ensure!(data.len() <= 4096, "Слишком длинное задание помощника.");
+        let assignment: crate::service::Assignment =
+            serde_json::from_slice(&data).context("Некорректное задание помощника.")?;
+        windows::run_assigned(assignment)
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("Перехват трафика приложений работает только в Windows.")
+    }
+}
+
+/// Removes the firewall rules of the service's helpers; the service and the uninstaller call it.
+#[cfg(windows)]
+pub(crate) fn clear_service_firewall() {
+    windows::clear_service_firewall();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

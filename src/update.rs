@@ -285,6 +285,23 @@ fn installation_names(executable: &Path) -> Result<[String; 2]> {
 #[derive(Debug)]
 pub struct PreparedUpdate {
     staging: tempfile::TempDir,
+    /// The installed copy is updated by the Windows Installer package, not file by file.
+    package: bool,
+}
+/// The Windows Installer package of a release; the installed copy updates from it.
+fn package_name(version: &str) -> String {
+    format!("krot-{version}-windows-x64.msi")
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackageManifest {
+    version: String,
+    config: PathBuf,
+    /// The installation directory the package must update.
+    directory: PathBuf,
+    name: String,
+    hash: String,
+    size: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -357,6 +374,9 @@ pub async fn prepare(release: &Release, store: &Store) -> Result<PreparedUpdate>
         version(&release.version)?.pre.is_empty(),
         "Предварительные версии не устанавливаются."
     );
+    if crate::service::installed() {
+        return prepare_package(release, store).await;
+    }
     let executable = std::env::current_exe()?.canonicalize()?;
     let names = installation_names(&executable)?;
     let directory = executable
@@ -409,7 +429,61 @@ pub async fn prepare(release: &Release, store: &Store) -> Result<PreparedUpdate>
         &manifest,
         Some(16384),
     )?;
-    Ok(PreparedUpdate { staging })
+    Ok(PreparedUpdate {
+        staging,
+        package: false,
+    })
+}
+/// The installed copy cannot replace files in its protected directory: it downloads the
+/// release's installer package next to a copy of itself in the user's temporary directory.
+async fn prepare_package(release: &Release, store: &Store) -> Result<PreparedUpdate> {
+    let directory = crate::service::install_dir().context("Не найден каталог установки КРОТа.")?;
+    let name = package_name(&release.version);
+    let matches: Vec<_> = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name == name)
+        .collect();
+    ensure!(
+        matches.len() == 1,
+        "В релизе отсутствует установщик {name}; обновление отменено."
+    );
+    let asset = matches[0];
+    let hash = asset_digest(asset)?;
+    let url = reqwest::Url::parse(&asset.browser_download_url)?;
+    ensure!(
+        version(url.path_segments().unwrap().nth(4).unwrap())? == version(&release.version)?,
+        "Версия файла отличается от версии релиза."
+    );
+    let staging = tempfile::Builder::new()
+        .prefix(".krot-update-")
+        .tempdir()
+        .context("Не удалось создать каталог обновления.")?;
+    restrict_access(staging.path())?;
+    let package = staging.path().join(&name);
+    download(&client()?, asset, &package).await?;
+    // Windows Installer reads the package as LocalSystem; nobody else may change it.
+    #[cfg(windows)]
+    crate::config::restrict_access_for_installer(&package)?;
+    let helper = staging.path().join(helper_name());
+    fs::copy(std::env::current_exe()?, &helper)?;
+    executable_permissions(&helper)?;
+    atomic_json(
+        &staging.path().join("package.json"),
+        &PackageManifest {
+            version: release.version.clone(),
+            config: store.path.clone(),
+            directory,
+            name,
+            hash,
+            size: asset.size,
+        },
+        Some(16384),
+    )?;
+    Ok(PreparedUpdate {
+        staging,
+        package: true,
+    })
 }
 /// Starts a just-written executable.
 ///
@@ -433,10 +507,15 @@ fn spawn_fresh_executable(command: &mut Command) -> std::io::Result<std::process
     }
 }
 pub fn launch_installer(prepared: PreparedUpdate) -> Result<()> {
+    let (command, manifest) = if prepared.package {
+        ("apply-package", "package.json")
+    } else {
+        ("apply-update", "manifest.json")
+    };
     spawn_fresh_executable(
         Command::new(prepared.staging.path().join(helper_name()))
-            .arg("apply-update")
-            .arg(prepared.staging.path().join("manifest.json"))
+            .arg(command)
+            .arg(prepared.staging.path().join(manifest))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -886,6 +965,134 @@ pub async fn apply_install(manifest: &Path) -> Result<()> {
     }
     // Windows keeps the running helper locked until the installer exits.
     let _ = fs::remove_dir_all(&install.staging);
+    Ok(())
+}
+
+fn validate_package(path: &Path, helper: &Path) -> Result<(PathBuf, PackageManifest)> {
+    ensure!(
+        path.is_absolute() && path.file_name() == Some(std::ffi::OsStr::new("package.json")),
+        "Некорректный путь плана установки."
+    );
+    regular_file(path)?;
+    let staging = path
+        .parent()
+        .context("Не найден каталог обновления.")?
+        .canonicalize()?;
+    ensure!(
+        path == staging.join("package.json")
+            && helper == staging.join(helper_name())
+            && staging
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".krot-update-")),
+        "Установщик и план должны находиться в одном каталоге обновления."
+    );
+    let mut raw = Vec::new();
+    File::open(path)?.take(16385).read_to_end(&mut raw)?;
+    ensure!(raw.len() <= 16384, "План установки слишком велик.");
+    let manifest: PackageManifest = serde_json::from_slice(&raw)?;
+    ensure!(
+        version(&manifest.version)?.pre.is_empty()
+            && manifest.name == package_name(&manifest.version)
+            && manifest.size > 0
+            && manifest.size <= MAX_ASSET
+            && manifest.hash.len() == 64
+            && manifest.config.is_absolute(),
+        "Некорректный план установки."
+    );
+    Ok((staging, manifest))
+}
+/// Runs the release's Windows Installer package and waits for it. The package is held open
+/// against changes from the check of its SHA-256 until Windows Installer has read it.
+#[cfg(windows)]
+fn install_package(package: &Path, manifest: &PackageManifest) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ: others may read the package, but nobody may write, rename or delete it.
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .open(package)
+        .context("Не удалось открыть скачанный установщик.")?;
+    let (size, hash) = hash_reader(&held, manifest.size)?;
+    ensure!(
+        size == manifest.size && hash == manifest.hash,
+        "Проверка SHA-256 установщика не пройдена; обновление отменено."
+    );
+    // Windows Installer asks for administrator rights itself and shows the package's name.
+    let status = Command::new(crate::service::system_program("msiexec.exe"))
+        .arg("/i")
+        .arg(package)
+        .args(["/passive", "/norestart"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Не удалось запустить установщик Windows.")?;
+    drop(held);
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(3010) => {
+            bail!("Обновление установлено; перезагрузите компьютер, чтобы завершить его.")
+        }
+        Some(1602) => bail!("Установка обновления отменена."),
+        code => bail!(
+            "Установщик Windows завершился с кодом {}; прежняя версия сохранена.",
+            code.map_or_else(|| "?".into(), |code| code.to_string())
+        ),
+    }
+}
+#[cfg(not(windows))]
+fn install_package(_package: &Path, _manifest: &PackageManifest) -> Result<()> {
+    bail!("Установщик есть только в Windows.")
+}
+#[cfg(windows)]
+fn hash_reader(mut reader: impl Read, limit: u64) -> Result<(u64, String)> {
+    let mut digest = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        ensure!(
+            size <= limit,
+            "Файл обновления превышает допустимый размер."
+        );
+        digest.update(&buffer[..count]);
+    }
+    Ok((size, hex::encode(digest.finalize())))
+}
+/// Updates the installed copy: stops КРОТ, runs the package and starts КРОТ again. Windows
+/// Installer rolls a failed installation back by itself, so the copy that starts afterwards
+/// is either the new version or the previous one.
+pub async fn apply_package(manifest: &Path) -> Result<()> {
+    let helper = std::env::current_exe()?.canonicalize()?;
+    let (staging, manifest) = validate_package(manifest, &helper)?;
+    let directory = crate::service::install_dir().context("КРОТ больше не установлен.")?;
+    ensure!(
+        directory == manifest.directory,
+        "План обновления относится к другой установке КРОТа."
+    );
+    let package = staging.join(&manifest.name);
+    regular_file(&package)?;
+    let store = Store::new(&manifest.config)?;
+    crate::background::stop_and_wait(&store).await?;
+    let result = install_package(&package, &manifest);
+    let _ = fs::remove_file(&package);
+    let mut command = Command::new(directory.join(installed_names()[0]));
+    command.arg("--config").arg(&manifest.config);
+    if result.is_err() {
+        command.arg("--skip-update-check");
+    }
+    let started = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    result?;
+    started.context("Обновление установлено, но КРОТ нужно открыть вручную.")?;
     Ok(())
 }
 

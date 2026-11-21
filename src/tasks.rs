@@ -97,6 +97,26 @@ fn task_name(registration: &str, kind: Kind, executable: &str) -> String {
     format!("{}{}", prefix(registration, kind), &digest[..8])
 }
 
+/// A task of any configuration and kind that starts `executable`: the uninstaller removes
+/// those of the installed program and leaves the tasks of other copies.
+#[cfg(any(windows, test))]
+fn program_task(name: &str, executable: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("\\krot-") else {
+        return false;
+    };
+    let Some(digest) = rest.get(..16).filter(|digest| {
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) else {
+        return false;
+    };
+    [Kind::Logon, Kind::Divert].into_iter().any(|kind| {
+        task_name(&format!("krot-{digest}"), kind, executable).eq_ignore_ascii_case(name)
+    })
+}
+
 #[cfg(any(windows, test))]
 fn escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -191,7 +211,8 @@ fn listed_names(output: &str) -> Vec<String> {
 
 #[cfg(windows)]
 pub use system::{
-    elevated, register, registered, run, runas, unregister, unregister_others, user_sid,
+    elevated, register, registered, remove_program_tasks, run, runas, unregister,
+    unregister_others, user_sid,
 };
 
 /// Administrator rights exist only on Windows.
@@ -499,6 +520,25 @@ mod system {
         Ok(())
     }
 
+    /// Removes the tasks of every configuration that start `executable`; for the uninstaller,
+    /// which runs with the rights to delete them all.
+    pub fn remove_program_tasks(executable: &str) -> Result<()> {
+        let mut failed = Vec::new();
+        for name in listed("\\krot-")? {
+            if program_task(&name, executable)
+                && !schtasks(&["/delete", "/tn", &name, "/f"])?.status.success()
+            {
+                failed.push(name);
+            }
+        }
+        ensure!(
+            failed.is_empty(),
+            "Не удалось удалить задания планировщика Windows: {}.",
+            failed.join(", ")
+        );
+        Ok(())
+    }
+
     /// Starts the task of this copy; Windows applies its rights without asking.
     pub fn run(config: &Path, kind: Kind) -> Result<()> {
         let (_, name) = names(config, kind)?;
@@ -591,6 +631,22 @@ mod tests {
         set_remembering(&config, false).unwrap();
         set_remembering(&config, false).unwrap();
         assert!(!remembering(&config));
+    }
+
+    #[test]
+    fn the_uninstaller_finds_the_tasks_of_its_program_only() {
+        let program = "C:\\Program Files\\KROT\\krot.exe";
+        for kind in [Kind::Logon, Kind::Divert] {
+            let name = task_name("krot-0123456789abcdef", kind, program);
+            assert!(program_task(&name, program));
+            assert!(program_task(&name.to_uppercase(), &program.to_lowercase()));
+            assert!(!program_task(
+                &task_name("krot-0123456789abcdef", kind, "D:\\krot\\krot.exe"),
+                program
+            ));
+        }
+        assert!(!program_task("\\krot-xyz-logon-12345678", program));
+        assert!(!program_task("\\Microsoft\\krot", program));
     }
 
     #[test]

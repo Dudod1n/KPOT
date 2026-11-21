@@ -98,6 +98,18 @@ enum Command {
     },
     #[command(hide = true)]
     ApplyUpdate { manifest: PathBuf },
+    /// Обновление установленной копии через установщик Windows
+    #[command(hide = true)]
+    ApplyPackage { manifest: PathBuf },
+    /// Служба перехвата установленного КРОТа; её запускает диспетчер служб Windows
+    #[command(hide = true)]
+    Service,
+    /// Помощник перехвата, которого запускает служба; задание приходит на стандартный ввод
+    #[command(hide = true)]
+    DivertService,
+    /// Очистка перед удалением установленного КРОТа; её запускает установщик
+    #[command(hide = true)]
+    UninstallCleanup,
 }
 
 #[cfg(windows)]
@@ -131,8 +143,30 @@ pub fn run() -> Result<()> {
             .enable_all()
             .build()?,
     );
+    // The service, its helper and the uninstaller run as LocalSystem: they never resolve a
+    // configuration path, which would lead into a user's profile.
+    match args.command {
+        Some(Command::Service) => {
+            #[cfg(windows)]
+            return crate::service::run();
+            #[cfg(not(windows))]
+            anyhow::bail!("Служба перехвата есть только в Windows.");
+        }
+        Some(Command::DivertService) => return crate::divert::run_assigned(),
+        Some(Command::UninstallCleanup) => {
+            #[cfg(windows)]
+            return crate::service::cleanup();
+            #[cfg(not(windows))]
+            anyhow::bail!("Установщик есть только в Windows.");
+        }
+        _ => {}
+    }
     let gui = args.update_ready.is_none()
-        && (args.command.is_none() || matches!(args.command, Some(Command::ApplyUpdate { .. })));
+        && (args.command.is_none()
+            || matches!(
+                args.command,
+                Some(Command::ApplyUpdate { .. } | Command::ApplyPackage { .. })
+            ));
     let result = (|| {
         anyhow::ensure!(
             args.update_ready.is_none() || (args.command.is_none() && !args.reuse_running),
@@ -175,6 +209,11 @@ pub fn run() -> Result<()> {
                 println!("Пароли, парольные фразы и ключи в журнал не записываются, а имена и адреса серверов и ID туннелей записываются: удалите их перед публикацией, если они личные.");
                 Ok(())
             }
+            Some(Command::Elevation { .. }) if crate::service::installed() => {
+                // The service gives the rights; the task and the choice belong to portable copies.
+                println!("Перехват без запроса прав: служба перехвата КРОТа установлена вместе с программой.");
+                Ok(())
+            }
             Some(Command::Elevation { action }) => {
                 use crate::tasks::{Kind, registered, remembering, set_remembering};
                 #[cfg(not(windows))]
@@ -210,6 +249,8 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
             Some(Command::ApplyUpdate { manifest }) => runtime.block_on(crate::update::apply_install(&manifest)),
+            Some(Command::ApplyPackage { manifest }) => runtime.block_on(crate::update::apply_package(&manifest)),
+            Some(Command::Service | Command::DivertService | Command::UninstallCleanup) => unreachable!(),
             Some(Command::Autostart {action}) => {
                 if action != "status" { store.load()?; autostart::set_enabled(&store.path,action == "enable")?; }
                 println!("Автозапуск после входа: {}.",if autostart::is_enabled(&store.path)? {"включён"} else {"выключен"});
@@ -311,6 +352,10 @@ mod tests {
             vec!["krot", "--skip-update-check"],
             vec!["krot", "--update-ready", "/tmp/ready.json"],
             vec!["krot", "apply-update", "/tmp/manifest.json"],
+            vec!["krot", "apply-package", "/tmp/package.json"],
+            vec!["krot", "service"],
+            vec!["krot", "divert-service"],
+            vec!["krot", "uninstall-cleanup"],
         ] {
             assert!(Args::try_parse_from(args).is_ok());
         }
@@ -319,5 +364,8 @@ mod tests {
         assert!(!help.contains("skip-update-check"));
         assert!(!help.contains("apply-update"));
         assert!(!help.contains("update-ready"));
+        for hidden in ["apply-package", "divert-service", "uninstall-cleanup"] {
+            assert!(!help.contains(hidden));
+        }
     }
 }

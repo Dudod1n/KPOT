@@ -270,6 +270,13 @@ pub(crate) fn observe_owner(store: &Store) -> Result<Option<Owner>> {
     Ok(read_metadata(store)?.map(Owner))
 }
 
+#[cfg(windows)]
+/// Port and token of the running background КРОТ, which the interception service passes to
+/// its helper: the service itself never reads the user's files.
+pub(crate) fn endpoint(store: &Store) -> Result<Option<(u16, Zeroizing<String>)>> {
+    Ok(read_metadata(store)?.map(|metadata| (metadata.port, Zeroizing::new(metadata.token))))
+}
+
 impl Metadata {
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -342,6 +349,8 @@ fn scrub_answer(command: &str, payload: &mut Value) {
 #[derive(Clone)]
 pub struct Client {
     pub path: PathBuf,
+    /// The address given by the service instead of one read from `path`.
+    endpoint: Option<Metadata>,
 }
 
 /// Test helper: waits up to 3 s until the daemon answers.
@@ -360,7 +369,22 @@ impl Client {
     pub fn new(store: &Store) -> Self {
         Self {
             path: store.path.clone(),
+            endpoint: None,
         }
+    }
+
+    /// A client of the background process at a known address, for the helper that the
+    /// interception service starts: it has no configuration path to read the address from.
+    pub fn fixed(port: u16, token: &str) -> Result<Self> {
+        let metadata = Metadata {
+            port,
+            token: token.to_owned(),
+        };
+        metadata.validate()?;
+        Ok(Self {
+            path: PathBuf::new(),
+            endpoint: Some(metadata),
+        })
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot> {
@@ -403,8 +427,10 @@ impl Client {
         mut payload: Value,
         owner: Option<&Owner>,
     ) -> Result<(Value, BufReader<TcpStream>)> {
-        let metadata =
-            read_metadata(&Store::new(&self.path)?)?.context("Фоновый КРОТ не запущен.")?;
+        let metadata = match &self.endpoint {
+            Some(metadata) => metadata.clone(),
+            None => read_metadata(&Store::new(&self.path)?)?.context("Фоновый КРОТ не запущен.")?,
+        };
         ensure!(
             owner.is_none_or(|owner| owner.0 == metadata),
             "Предыдущий КРОТ уже сменился. Проверьте новый процесс и повторите выбор."
