@@ -7,6 +7,7 @@
 //! [`hide_values`] first.
 
 use std::{
+    cell::Cell,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -95,9 +96,11 @@ impl Journal {
     fn open(&mut self, incoming: u64) {
         self.file = None;
         let size = fs::metadata(&self.path).map_or(0, |metadata| metadata.len());
-        if size > 0 && size + incoming > MAX_BYTES {
-            let _ = fs::rename(&self.path, rotated_path(&self.path));
-        }
+        // A part held open by another program cannot be replaced: the file starts anew instead
+        // of growing past the bound.
+        let overflow = size > 0
+            && size + incoming > MAX_BYTES
+            && fs::rename(&self.path, rotated_path(&self.path)).is_err();
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -109,7 +112,7 @@ impl Journal {
             return;
         };
         // Like the configuration: only its owner reads the journal; otherwise nothing is written.
-        if restrict_access(&self.path).is_err() {
+        if restrict_access(&self.path).is_err() || (overflow && file.set_len(0).is_err()) {
             return;
         }
         self.size = file.metadata().map_or(0, |metadata| metadata.len());
@@ -127,22 +130,30 @@ pub fn init(path: PathBuf) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // A panic inside `write` holds the lock: skip the record instead of a deadlock.
-        if let Some(journal) = JOURNAL.get()
-            && let Ok(mut journal) = journal.try_lock()
-        {
-            journal.write(
-                &chrono::Local::now(),
-                Level::Error,
-                &format!("Паника: {info}"),
-            );
+        if !WRITING.get() {
+            write(Level::Error, &hide_values(&format!("Паника: {info}")));
         }
         previous(info);
     }));
 }
 
+thread_local! {
+    static WRITING: Cell<bool> = const { Cell::new(false) };
+}
+
+struct Writing;
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        WRITING.set(false);
+    }
+}
+
 /// Appends a record if [`init`] was called; a failing disk never fails the caller.
 pub fn write(level: Level, text: &str) {
     if let Some(journal) = JOURNAL.get() {
+        WRITING.set(true);
+        let _writing = Writing;
         let mut journal = journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -150,14 +161,28 @@ pub fn write(level: Level, text: &str) {
     }
 }
 
+/// Records the start once the process owns its configuration, so a refused second copy
+/// does not look like a restart.
+pub fn started(process: &str) {
+    write(
+        Level::Info,
+        &format!(
+            "{process} запущен: версия {}, PID {}.",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        ),
+    );
+}
+
 /// Records the end of a process started with [`init`].
 pub fn finished(process: &str, result: &anyhow::Result<()>) {
+    let pid = std::process::id();
     match result {
-        Ok(()) => write(Level::Info, &format!("{process} остановлен.")),
+        Ok(()) => write(Level::Info, &format!("{process} остановлен, PID {pid}.")),
         Err(error) => write(
             Level::Error,
             &format!(
-                "{process} завершился с ошибкой: {}",
+                "{process} (PID {pid}) завершился с ошибкой: {}",
                 hide_values(&format!("{error:#}"))
             ),
         ),
@@ -169,8 +194,12 @@ pub fn finished(process: &str, result: &anyhow::Result<()>) {
 pub fn hide_values(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut open: Option<char> = None;
+    let mut escaped = false;
     for character in text.chars() {
         match open {
+            // `{:?}` escapes a quote inside the value: it does not end the value.
+            Some(_) if escaped => escaped = false,
+            Some(_) if character == '\\' => escaped = true,
             Some(quote) if character == quote => {
                 result.push('…');
                 result.push(quote);
@@ -259,6 +288,23 @@ mod tests {
     }
 
     #[test]
+    fn a_part_that_cannot_be_replaced_does_not_unbound_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json.log");
+        // Renaming onto a non-empty directory fails, like a part held open on Windows.
+        fs::create_dir(rotated_path(&path)).unwrap();
+        fs::write(rotated_path(&path).join("held"), "").unwrap();
+        let mut journal = Journal::new(path.clone());
+        let text = "x".repeat(MAX_LINE_CHARS);
+        for _ in 0..(2 * MAX_BYTES as usize / MAX_LINE_CHARS) {
+            journal.write(&time(), Level::Info, &text);
+        }
+        journal.write(&time(), Level::Info, "последняя");
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_BYTES);
+        assert!(fs::read_to_string(&path).unwrap().ends_with("последняя\n"));
+    }
+
+    #[test]
     fn echoed_request_values_are_hidden() {
         let error = serde_json::from_value::<bool>(serde_json::json!("hunter2")).unwrap_err();
         let shown = hide_values(&format!("Некорректный ответ: {error}"));
@@ -267,6 +313,10 @@ mod tests {
             hide_values("unknown field `secret`, value \"pass"),
             "unknown field `…`, value \"…"
         );
+        let error = serde_json::from_value::<bool>(serde_json::json!("a\"secret\\")).unwrap_err();
+        let shown = hide_values(&error.to_string());
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(shown, "invalid type: string \"…\", expected a boolean");
         assert_eq!(
             hide_values("«Туннель» без кавычек"),
             "«Туннель» без кавычек"

@@ -272,15 +272,15 @@ impl Manager {
         .flatten()
             == Some(true);
         attempt.cleanup().await;
-        self.log(
-            &tunnel.id,
-            if removed {
-                "UDP: помощник удалён с сервера."
-            } else {
-                "UDP: помощник не удалён с сервера: сервер недоступен или для входа нужен пароль."
-            },
-        )
-        .await;
+        let (level, message) = if removed {
+            (Level::Info, "UDP: помощник удалён с сервера.")
+        } else {
+            (
+                Level::Warn,
+                "UDP: помощник не удалён с сервера: сервер недоступен или для входа нужен пароль.",
+            )
+        };
+        self.log(&tunnel.id, level, message).await;
     }
     /// UDP state of every tunnel that has one, with the metrics of running transports.
     pub async fn udp_snapshot(
@@ -578,12 +578,12 @@ impl Manager {
             return Ok(());
         }
     }
-    async fn log(&self, id: &str, message: &str) {
+    async fn log(&self, id: &str, level: Level, message: &str) {
         let mut state = self.0.state.lock().await;
         push_log(
             id,
             state.runtimes.entry(id.into()).or_default(),
-            Level::Info,
+            level,
             message,
         );
     }
@@ -913,7 +913,7 @@ impl Manager {
                     let Ok((socket, origin)) = accepted else {
                         // Retry a transient error; reconnect with a new listener if it persists.
                         match backoff.failed() {
-                            1 => self.log(&tunnel.id, "Ошибка приёма соединения на локальном порту; повторяем.").await,
+                            1 => self.log(&tunnel.id, Level::Warn, "Ошибка приёма соединения на локальном порту; повторяем.").await,
                             ACCEPT_ATTEMPTS.. => return Err(ACCEPT_FAILED),
                             _ => {}
                         }

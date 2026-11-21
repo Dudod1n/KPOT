@@ -929,11 +929,14 @@ async fn serve(store: Store) -> Result<()> {
 pub(super) fn run(store: Store) -> Result<()> {
     // One helper per configuration: two would fight over the same packets.
     let _lease = Store::new(store.sidecar(".divert"))?.lock()?;
+    crate::journal::started("Помощник перехвата");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
     let result = runtime.block_on(serve(store));
+    // `exit` skips the caller, which records the end otherwise.
+    crate::journal::finished("Помощник перехвата", &result);
     // The packet thread blocks in the driver; ending the process closes its handle.
     std::process::exit(if result.is_ok() { 0 } else { 1 })
 }

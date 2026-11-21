@@ -1029,6 +1029,7 @@ impl Service {
 pub async fn serve(store: Store) -> Result<()> {
     let guard = crate::update::startup_guard().await?;
     let _lease: File = store.lock()?;
+    crate::journal::started("Фоновый процесс");
     let config = store.load()?;
     // Broken application rules must not keep the tunnels from starting.
     let apps = crate::apps::load(&store).unwrap_or_default();

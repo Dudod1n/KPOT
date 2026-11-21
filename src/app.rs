@@ -161,8 +161,10 @@ pub fn run() -> Result<()> {
                     for part in [path.clone(), journal::rotated_path(&path)] {
                         match std::fs::metadata(&part) {
                             Ok(metadata) => println!("  {} — {} КиБ", part.display(), metadata.len().div_ceil(1024)),
-                            Err(_) if part == path => println!("  ещё не создан"),
-                            Err(_) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                if part == path { println!("  ещё не создан"); }
+                            }
+                            Err(error) => println!("  {}: {error}", part.display()),
                         }
                     }
                 }
@@ -264,17 +266,10 @@ pub fn run() -> Result<()> {
     result
 }
 
-/// Runs a long-lived process with its journal: the start, the end and panics are recorded.
+/// Runs a long-lived process with its journal: its end and panics are recorded.
 fn journaled(process: &str, path: PathBuf, run: impl FnOnce() -> Result<()>) -> Result<()> {
+    // The start is recorded by the process once it owns the configuration.
     journal::init(path);
-    journal::write(
-        journal::Level::Info,
-        &format!(
-            "{process} запущен: версия {}, PID {}.",
-            env!("CARGO_PKG_VERSION"),
-            std::process::id()
-        ),
-    );
     let result = run();
     journal::finished(process, &result);
     result

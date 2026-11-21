@@ -618,7 +618,7 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(lines[running[0]], r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} [+-]\d\d:\d\d INFO  ')
         await self.request('shutdown')
         await asyncio.wait_for(self.process.wait(), 8)
-        self.assertIn('Фоновый процесс остановлен.', self.journal.splitlines()[-1])
+        self.assertIn('Фоновый процесс остановлен, PID', self.journal.splitlines()[-1])
         code, out, err = await self.cli('diagnostics')
         self.assertEqual(code, 0, err)
         self.assertIn(f'{self.store.path}.log', out)
