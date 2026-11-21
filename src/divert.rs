@@ -712,6 +712,12 @@ pub(crate) fn clear_service_firewall() {
     windows::clear_service_firewall();
 }
 
+/// Removes the firewall rule of one helper of the service, which the service ended.
+#[cfg(windows)]
+pub(crate) fn close_service_firewall(port: u16) {
+    windows::close_service_firewall(port);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

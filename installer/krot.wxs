@@ -15,7 +15,8 @@
            Language="1049" Codepage="1251" Compressed="yes" InstallerVersion="500">
     <SummaryInformation Description="КРОТ — менеджер SSH-туннелей" Manufacturer="Проект КРОТ" Codepage="1251" />
     <!-- The previous version goes first, as a whole: no file of two versions mixes. -->
-    <MajorUpgrade Schedule="afterInstallInitialize"
+    <!-- A build of the same version replaces the installed one instead of going next to it. -->
+    <MajorUpgrade Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="Уже установлена более новая версия КРОТа." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -53,10 +54,15 @@
       <Component Id="WinDivertSys">
         <File Id="WinDivertSys" Source="$(var.Binaries)\WinDivert64.sys" KeyPath="yes" />
       </Component>
-      <Component Id="Licenses">
+      <!-- Unversioned files: one per component, so that their GUIDs can be generated. -->
+      <Component Id="License">
         <File Id="License" Source="$(var.Root)\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
-        <File Id="Notices" Source="$(var.Binaries)\THIRD_PARTY_NOTICES.txt" />
-        <File Id="WinDivertLicense" Source="$(var.Binaries)\WinDivert-LICENSE.txt" />
+      </Component>
+      <Component Id="Notices">
+        <File Id="Notices" Source="$(var.Binaries)\THIRD_PARTY_NOTICES.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="WinDivertLicense">
+        <File Id="WinDivertLicense" Source="$(var.Binaries)\WinDivert-LICENSE.txt" KeyPath="yes" />
       </Component>
       <!-- КРОТ tells the installed copy from portable ones by this value. -->
       <Component Id="InstallDir">

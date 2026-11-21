@@ -734,6 +734,10 @@ impl Firewall {
     }
 }
 
+pub(super) fn close_service_firewall(port: u16) {
+    Firewall::Service.close(port);
+}
+
 pub(super) fn clear_service_firewall() {
     netsh(&format!(
         "advfirewall firewall delete rule name={SERVICE_FIREWALL_RULE}"
@@ -903,7 +907,15 @@ async fn serve(client: Client, scope: Scope) -> Result<()> {
         Ok(port)
     };
     let port = match start() {
-        Ok(port) => port,
+        Ok(port) => {
+            // The service removes the rule of this port if it has to end the helper.
+            if matches!(firewall, Firewall::Service) {
+                use std::io::Write;
+                let mut output = std::io::stdout();
+                let _ = writeln!(output, "{port}").and_then(|()| output.flush());
+            }
+            port
+        }
         Err(error) => {
             let report = DivertReport {
                 version: env!("CARGO_PKG_VERSION").into(),

@@ -17,7 +17,10 @@ pub const NAME: &str = "KrotDivert";
 const MAX_MESSAGE: usize = 4096;
 /// Helpers the service runs at once: one per configuration of every user in every session.
 #[cfg_attr(not(windows), allow(dead_code))]
-const MAX_HELPERS: usize = 16;
+const MAX_HELPERS: usize = 64;
+/// Helpers of one user: one user cannot take the places of the others.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MAX_USER_HELPERS: usize = 4;
 
 /// What the background КРОТ asks the service for: a helper attached to it.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -143,7 +146,7 @@ mod system {
         process::{Child, Command, Stdio},
         sync::{
             Arc, Condvar, Mutex, OnceLock,
-            atomic::{AtomicPtr, AtomicUsize, Ordering},
+            atomic::{AtomicPtr, AtomicU16, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -749,6 +752,24 @@ mod system {
         port: u16,
         token: Zeroizing<String>,
         child: Child,
+        /// The helper's relay port, which it reports once its firewall rule exists.
+        relay: Arc<AtomicU16>,
+    }
+
+    impl Helper {
+        /// Ends the helper and removes its firewall rule, which a killed helper leaves.
+        fn end(mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.forget();
+        }
+
+        fn forget(&self) {
+            let port = self.relay.load(Ordering::Acquire);
+            if port != 0 {
+                crate::divert::close_service_firewall(port);
+            }
+        }
     }
 
     /// The running service: its helpers and the job that ends them with the service.
@@ -786,8 +807,6 @@ mod system {
             };
             // Helpers of a service that ended abruptly may have left their rules.
             crate::divert::clear_service_firewall();
-            // The first instance fails if another program already took the name.
-            let pipe = Pipe::create(true).context("Канал службы перехвата уже занят.")?;
             let host = Arc::new(Self {
                 program,
                 directory,
@@ -798,19 +817,27 @@ mod system {
             let listener = host.clone();
             std::thread::Builder::new()
                 .name("pipe".into())
-                .spawn(move || listener.listen(pipe))?;
+                .spawn(move || listener.listen())?;
             Ok(host)
         }
 
         fn stop(&self) {
-            for (_, mut helper) in self.helpers.lock().unwrap().drain() {
-                let _ = helper.child.kill();
-                let _ = helper.child.wait();
+            for (_, helper) in self.helpers.lock().unwrap().drain() {
+                helper.end();
             }
             crate::divert::clear_service_firewall();
         }
 
-        fn listen(self: Arc<Self>, mut pipe: Pipe) {
+        fn listen(self: Arc<Self>) {
+            // The first instance fails while another program holds the name. The service runs
+            // on and tries again: failing would roll back an installation, and clients check
+            // that the service itself answers anyway.
+            let mut pipe = loop {
+                match Pipe::create(true) {
+                    Ok(pipe) => break pipe,
+                    Err(_) => std::thread::sleep(Duration::from_secs(1)),
+                }
+            };
             loop {
                 let connected = pipe.accept();
                 // The next instance exists before this one is handed over.
@@ -879,7 +906,14 @@ mod system {
         /// same background process; a helper of an earlier background process is replaced.
         fn assign(&self, client: Client, mut request: Request) -> Result<()> {
             let mut helpers = self.helpers.lock().unwrap();
-            helpers.retain(|_, helper| matches!(helper.child.try_wait(), Ok(None)));
+            // A helper that ended by itself removed its rule, unless it crashed.
+            helpers.retain(|_, helper| {
+                let running = matches!(helper.child.try_wait(), Ok(None));
+                if !running {
+                    helper.forget();
+                }
+                running
+            });
             let key = (client.session, client.user.clone(), request.key.clone());
             if let Some(helper) = helpers.get(&key)
                 && helper.port == request.port
@@ -887,12 +921,16 @@ mod system {
             {
                 return Ok(());
             }
-            if let Some(mut helper) = helpers.remove(&key) {
-                let _ = helper.child.kill();
-                let _ = helper.child.wait();
+            if let Some(helper) = helpers.remove(&key) {
+                helper.end();
             }
             ensure!(
-                helpers.len() < MAX_HELPERS,
+                helpers.len() < MAX_HELPERS
+                    && helpers
+                        .keys()
+                        .filter(|(_, user, _)| *user == client.user)
+                        .count()
+                        < MAX_USER_HELPERS,
                 "Служба перехвата уже обслуживает слишком много конфигураций."
             );
             let token = Zeroizing::new(std::mem::take(&mut request.token));
@@ -909,7 +947,7 @@ mod system {
             let mut child = Command::new(&self.program)
                 .arg("divert-service")
                 .stdin(Stdio::piped())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
@@ -927,12 +965,25 @@ mod system {
                 let _ = child.wait();
                 bail!("Служба не запустила помощник перехвата.");
             }
+            let relay = Arc::new(AtomicU16::new(0));
+            if let Some(output) = child.stdout.take() {
+                let relay = relay.clone();
+                // Only a port number is read; the helper writes nothing else there.
+                let _ = std::thread::Builder::new().spawn(move || {
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(output.take(16)).read_line(&mut line);
+                    if let Ok(port) = line.trim().parse::<u16>() {
+                        relay.store(port, Ordering::Release);
+                    }
+                });
+            }
             helpers.insert(
                 key,
                 Helper {
                     port: request.port,
                     token,
                     child,
+                    relay,
                 },
             );
             Ok(())

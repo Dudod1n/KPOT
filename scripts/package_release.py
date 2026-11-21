@@ -44,7 +44,6 @@ def package(tag, builds, output, notes_path):
                 raise ValueError(f'Missing release input: {path}')
     output.mkdir(parents=True)
     readme = (f'КРОТ {version} — менеджер SSH-туннелей.\n\n'
-              'Это переносная копия: для установки в Windows используйте krot-*-windows-x64.msi.\n'
               'Распакуйте оба бинарника в каталог с правом записи.\n'
               'Запустите krot.exe на Windows или ./krot на Linux.\n'
               'Перед ручной заменой файлов полностью остановите КРОТ через меню трея.\n'
@@ -79,7 +78,8 @@ def package(tag, builds, output, notes_path):
             with zipfile.ZipFile(output / f'krot-{version}-windows-x64.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
                 for path, name in files:
                     archive.write(path, name)
-                archive.writestr('README.txt', readme)
+                archive.writestr('README.txt', 'Это переносная копия: для установки в Windows '
+                                 f'используйте {installer}.\n' + readme)
         else:
             import io
             with tarfile.open(output / f'krot-{version}-linux-x64.tar.gz', 'w:gz') as archive:

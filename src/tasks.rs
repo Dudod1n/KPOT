@@ -211,8 +211,8 @@ fn listed_names(output: &str) -> Vec<String> {
 
 #[cfg(windows)]
 pub use system::{
-    elevated, register, registered, remove_program_tasks, run, runas, unregister,
-    unregister_others, user_sid,
+    copies, elevated, register, registered, remove_program_tasks, run, runas, unregister,
+    unregister_others, unregister_own, user_sid,
 };
 
 /// Administrator rights exist only on Windows.
@@ -432,6 +432,24 @@ mod system {
         }
         let output = schtasks(&["/query", "/tn", &name, "/xml"])?;
         Ok(output.status.success() && !disabled(&output.stdout))
+    }
+
+    /// Whether a task of this copy exists, enabled or not, and whether tasks of other copies do.
+    pub fn copies(config: &Path, kind: Kind) -> Result<(bool, bool)> {
+        let (prefix, name) = names(config, kind)?;
+        let listed = listed(&prefix)?;
+        let own = listed.iter().any(|task| task.eq_ignore_ascii_case(&name));
+        Ok((own, listed.len() > usize::from(own)))
+    }
+
+    /// Removes the task of this copy only.
+    pub fn unregister_own(config: &Path, kind: Kind) -> Result<()> {
+        let (_, name) = names(config, kind)?;
+        ensure!(
+            schtasks(&["/delete", "/tn", &name, "/f"])?.status.success(),
+            "Не удалось удалить задание планировщика Windows {name}."
+        );
+        Ok(())
     }
 
     /// Registers the task for the current user and copy, replacing the tasks of other copies.

@@ -594,14 +594,23 @@ pub fn migrate(path: &Path) {
         let elevated = crate::tasks::elevated();
         // After installation autostart moves from a portable copy to the installed one.
         if crate::service::installed() {
-            use crate::tasks::{Kind, register, registered};
+            use crate::tasks::{Kind, copies, register, unregister_others, unregister_own};
+            // Only another copy's task moves: a task of this copy that the user turned off
+            // stays off. A task that cannot be moved is not retried at every start.
             if !owned
                 && !elevated
-                && registered(&path, Kind::Logon, true).unwrap_or(false)
-                && !registered(&path, Kind::Logon, false).unwrap_or(true)
+                && !refused.exists()
+                && copies(&path, Kind::Logon).is_ok_and(|(own, others)| !own && others)
             {
-                // `register` also removes the task of the other copy.
-                let _ = register(&path, Kind::Logon);
+                // `register` removes the other copy's task where Windows lets it.
+                let registered = register(&path, Kind::Logon).is_ok();
+                if !registered || unregister_others(&path, Kind::Logon, false).is_err() {
+                    // Two tasks would start КРОТ twice at logon: the other copy's one stays.
+                    if registered {
+                        let _ = unregister_own(&path, Kind::Logon);
+                    }
+                    let _ = std::fs::write(&refused, b"");
+                }
                 return;
             }
             if owned

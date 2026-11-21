@@ -1077,9 +1077,15 @@ pub async fn apply_package(manifest: &Path) -> Result<()> {
     );
     let package = staging.join(&manifest.name);
     regular_file(&package)?;
+    // The same locks as a file-by-file update, keyed like `startup_guard`: КРОТ does not start
+    // from the installation while Windows Installer replaces it, nor does a second update.
+    let locked = directory.canonicalize()?;
+    let _transaction = install_guard(&locked, true, &lock_directory().join("transactions")).await?;
+    let guard = install_guard(&locked, true, &lock_directory()).await?;
     let store = Store::new(&manifest.config)?;
     crate::background::stop_and_wait(&store).await?;
     let result = install_package(&package, &manifest);
+    drop(guard);
     let _ = fs::remove_file(&package);
     let mut command = Command::new(directory.join(installed_names()[0]));
     command.arg("--config").arg(&manifest.config);
