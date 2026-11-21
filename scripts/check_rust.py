@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,10 @@ sys.path.insert(0, str(ROOT / 'tests'))
 import asyncssh
 from ssh_support import (Client, Config, Endpoint, Frames, SSHFixtures, Store, attach_udp, endpoint_path,
                          kill_group)
+
+# Tunnels listen on port 0, and the tests take the chosen port from the runtime state. KROT
+# accepts port 0 only with this variable; every process the tests start inherits it.
+os.environ['KROT_TEST_EPHEMERAL_PORTS'] = '1'
 
 BINARY = Path(os.environ.get('KROT_RUST_BIN', ROOT / 'target' / 'debug' / ('krot-cli.exe' if os.name == 'nt' else 'krot-cli'))).resolve()
 
@@ -110,6 +115,9 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
                         await self.request('answer', {'id': pending['id'], 'value': answer})
                 status = last["runtimes"].get(tunnel.id, {})
                 if status.get('state') in expected:
+                    if status.get('port'):
+                        # Keeps the last port after the tunnel stops, to check it is closed.
+                        tunnel.port = status['port']
                     return status
                 if status.get('state') == 'error' and 'error' not in expected:
                     self.fail(f"{tunnel.name}: {status.get('message')}")
@@ -372,6 +380,42 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn('КРОТ', err)
         self.assertEqual(self.store.path.read_text(), '{broken')
 
+    async def test_diagnose_reaches_kex_without_login_and_compares_the_saved_key(self):
+        key = asyncssh.generate_private_key('ssh-ed25519')
+        server = await self.server(key=key, password='secret')
+        target = f'127.0.0.1:{server.get_port()}'
+        code, out, err = await self.cli('diagnose', target, '--json', '--no-control')
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        ssh = [p for p in report['probes'] if p['kind'] == 'ssh_handshake']
+        self.assertEqual([p['outcome'] for p in ssh], ['ok'])
+        self.assertTrue(ssh[0]['banner'].startswith('SSH-2.0-'))
+        self.assertTrue(ssh[0]['fingerprint'].startswith('SHA256:'))
+        self.assertEqual([v['code'] for v in report['verdicts']], ['reachable'])
+        self.assertLessEqual(report['connections'], 8)
+        self.assertEqual(self.auths, [])
+        self.assertFalse(self.store.known_hosts_path.exists())
+
+        other = asyncssh.generate_private_key('ssh-ed25519').export_public_key().decode().strip()
+        self.store.known_hosts_path.write_text(
+            json.dumps({f'[127.0.0.1]:{server.get_port()}': other}), encoding='utf-8')
+        code, out, err = await self.cli('diagnose', target, '--no-control', '--redact')
+        self.assertEqual(code, 0, err)
+        self.assertIn('Ключ узла отличается', out)
+        self.assertNotIn('127.0.0.1', out)
+        self.assertNotIn('SHA256:', out)
+        self.assertEqual(json.loads(self.store.known_hosts_path.read_text())[f'[127.0.0.1]:{server.get_port()}'], other)
+
+        # A bound socket that does not listen keeps its port closed for the whole check.
+        with socket.socket() as closed:
+            closed.bind(('127.0.0.1', 0))
+            port = closed.getsockname()[1]
+            code, out, err = await self.cli('diagnose', f'127.0.0.1:{port}', '--json', '--no-control')
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        self.assertIn('ssh_port_refused', [v['code'] for v in report['verdicts']])
+        self.assertTrue(all(isinstance(p['outcome'], dict) for p in report['probes'] if p['kind'] == 'ssh_handshake'))
+
     async def test_local_remote_socks_and_listener_cleanup(self):
         server = await self.server()
         tunnels = [self.tunnel(server, kind=kind) for kind in ('L', 'R', 'D')]
@@ -382,11 +426,25 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
             await self.request('start', tunnel.id)
             status = await self.wait(tunnel)
             self.assertIsNotNone(status['started_at'])
+            self.assertGreater(status['port'], 0, 'The runtime reports the chosen port')
             await self.exchange(tunnel.port, socks=tunnel.kind == 'D')
+            # The session measurement: a ping answered and the forwarded bytes counted.
+            async with asyncio.timeout(10):
+                while not (await self.request('snapshot')).get('links', {}).get(tunnel.id, {}).get('rtt', {}).get('count'):
+                    await asyncio.sleep(0.2)
+            code, out, err = await self.cli('metrics', '--tunnel', tunnel.id)
+            self.assertEqual(code, 0, err)
+            link = json.loads(out)['link'][tunnel.id]
+            self.assertEqual((link['rx_total'], link['tx_total'], link['reconnects']), (2400, 2400, 0))
+            self.assertIsNotNone(link['rtt']['p50_us'])
+            self.assertEqual([event['kind'] for event in link['events']], ['connected'])
             await self.request('stop', tunnel.id)
+            self.assertNotIn('port', (await self.request('snapshot'))['runtimes'][tunnel.id])
             await self.assert_closed(tunnel.port)
-            saved = self.store.load()
-            self.assertFalse(next(t for t in saved.tunnels if t.id == tunnel.id).enabled)
+            self.assertNotIn(tunnel.id, (await self.request('snapshot')).get('links', {}))
+            saved = next(t for t in self.store.load().tunnels if t.id == tunnel.id)
+            self.assertFalse(saved.enabled)
+            self.assertEqual(saved.port, 0, 'The chosen port is not written to the configuration')
         self.assertEqual([p['kind'] for p in self.prompts], ['trust'])
 
     async def test_two_jumps_password_and_encrypted_key(self):
@@ -575,8 +633,11 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         await self.start(Config(tunnels=[tunnel]))
         await self.request('start',tunnel.id)
         await self.request('stop',tunnel.id)
-        self.assertFalse((await self.request('snapshot'))['prompts'])
-        await self.assert_closed(tunnel.port)
+        snapshot = await self.request('snapshot')
+        self.assertFalse(snapshot['prompts'])
+        # A cancelled start reports no listener: its port, if one was chosen, is closed.
+        self.assertEqual(snapshot['runtimes'][tunnel.id]['state'],'stopped')
+        self.assertNotIn('port',snapshot['runtimes'][tunnel.id])
         await self.request('start',tunnel.id)
         await self.wait(tunnel)
         await self.request('shutdown')
@@ -603,7 +664,8 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
                 if status['state'] == 'running' and status['started_at'] != first['started_at']:
                     break
                 await asyncio.sleep(.05)
-        await self.exchange(tunnel.port)
+        # A reconnected tunnel listens on a newly chosen port.
+        await self.exchange(status['port'])
 
     async def test_background_command_detaches_and_duplicate_owner_fails(self):
         self.store.save(Config())

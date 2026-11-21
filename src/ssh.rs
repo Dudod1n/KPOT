@@ -84,6 +84,10 @@ pub struct Runtime {
     pub message: String,
     pub hop: String,
     pub started_at: Option<f64>,
+    /// The port the tunnel actually listens on while it runs: the local one for L and D,
+    /// the server's for R. It differs from the configured port only when that is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub logs: VecDeque<String>,
 }
 impl Default for Runtime {
@@ -93,6 +97,7 @@ impl Default for Runtime {
             message: String::new(),
             hop: String::new(),
             started_at: None,
+            port: None,
             logs: VecDeque::new(),
         }
     }
@@ -165,6 +170,8 @@ struct State {
     udp_links: HashMap<String, Arc<crate::udp::transport::Transport>>,
     /// Secrets of running tunnels, for the relay's removal while the tunnel runs.
     credentials: HashMap<String, Credentials>,
+    /// Measurement of each started tunnel's session, across its reconnects.
+    links: HashMap<String, Arc<crate::link::Link>>,
 }
 struct Inner {
     known_hosts: PathBuf,
@@ -291,6 +298,21 @@ impl Manager {
                     ),
                 )
             })
+            .collect()
+    }
+    /// The session measurement of every started tunnel.
+    pub async fn link_snapshot(&self) -> HashMap<String, crate::link::LinkStats> {
+        let links: Vec<_> = {
+            let state = self.0.state.lock().await;
+            state
+                .links
+                .iter()
+                .map(|(id, link)| (id.clone(), link.clone()))
+                .collect()
+        };
+        links
+            .into_iter()
+            .map(|(id, link)| (id, link.stats()))
             .collect()
     }
     fn announce(&self, notice: UdpNotice) {
@@ -497,11 +519,7 @@ impl Manager {
         cancel: &CancellationToken,
         interactive: bool,
     ) -> std::result::Result<(), Problem> {
-        let identity = format!(
-            "[{}]:{}",
-            unbracket(&endpoint.host).to_lowercase(),
-            endpoint.port
-        );
+        let identity = trust_identity(&endpoint.host, endpoint.port);
         let exported = key
             .to_openssh()
             .map_err(|_| Problem::terminal("SSH-сервер предоставил неподдерживаемый ключ узла."))?;
@@ -571,14 +589,25 @@ impl Manager {
         };
         update(runtime, status, message);
     }
+    /// Marks the tunnel as running on `port` in one step, so a snapshot that shows it
+    /// running also shows where it listens.
+    async fn running(&self, id: &str, port: u16) {
+        let mut state = self.0.state.lock().await;
+        let runtime = state.runtimes.entry(id.into()).or_default();
+        runtime.started_at = Some(now());
+        runtime.port = Some(port);
+        update(runtime, "running", "Туннель работает");
+    }
     async fn run(&self, tunnel: Tunnel, cancel: CancellationToken) {
         let credentials = Credentials::default();
-        self.0
-            .state
-            .lock()
-            .await
-            .credentials
-            .insert(tunnel.id.clone(), credentials.clone());
+        let link = Arc::new(crate::link::Link::new());
+        {
+            let mut state = self.0.state.lock().await;
+            state
+                .credentials
+                .insert(tunnel.id.clone(), credentials.clone());
+            state.links.insert(tunnel.id.clone(), link.clone());
+        }
         let udp = (tunnel.kind == "D").then(|| {
             let manager = self.clone();
             let tunnel = tunnel.clone();
@@ -590,7 +619,7 @@ impl Manager {
         loop {
             let mut attempt = Attempt::new(cancel.child_token());
             let result = {
-                let forward = self.forward(&tunnel, &mut attempt, &credentials);
+                let forward = self.forward(&tunnel, &mut attempt, &credentials, &link);
                 tokio::pin!(forward);
                 tokio::select! {
                     biased;
@@ -606,6 +635,7 @@ impl Manager {
                 break;
             }
             let problem = result.err().unwrap_or(NETWORK);
+            link.disconnected(problem.message);
             if !tunnel.reconnect || !problem.retryable {
                 self.state(&tunnel.id, "error", problem.message, None).await;
                 break;
@@ -632,6 +662,7 @@ impl Manager {
             .prompts
             .retain(|_, p| p.prompt.request.tunnel_id != tunnel.id);
         state.credentials.remove(&tunnel.id);
+        state.links.remove(&tunnel.id);
     }
     async fn udp_down(&self, id: &str) {
         if self.0.state.lock().await.udp_links.remove(id).is_some() {
@@ -787,6 +818,7 @@ impl Manager {
         tunnel: &Tunnel,
         attempt: &mut Attempt,
         credentials: &Credentials,
+        link: &Arc<crate::link::Link>,
     ) -> std::result::Result<(), Problem> {
         let (remote_send, mut remote_receive) = mpsc::channel(64);
         let expected = Arc::new(StdMutex::new(None));
@@ -801,29 +833,58 @@ impl Manager {
         )
         .await?;
         let connection = attempt.sessions.last().cloned().ok_or(NETWORK)?;
-        if tunnel.kind == "R" {
+        let listening = if tunnel.kind == "R" {
             *expected.lock().unwrap() = Some(RemoteRoute {
                 address: tunnel.bind.clone(),
                 port: tunnel.port,
             });
-            timed(connection.tcpip_forward(unbracket(&tunnel.bind), u32::from(tunnel.port)))
-                .await?
-                .map_err(|error| match error {
-                    russh::Error::RequestDenied => Problem::terminal(
-                        "SSH-сервер не разрешил удалённый порт или порт уже занят.",
-                    ),
-                    _ => NETWORK,
-                })?;
-        } else {
-            attempt.listener = Some(
-                timed(TcpListener::bind((unbracket(&tunnel.bind), tunnel.port)))
+            let assigned =
+                timed(connection.tcpip_forward(unbracket(&tunnel.bind), u32::from(tunnel.port)))
                     .await?
-                    .map_err(bind_problem)?,
-            );
-        }
-        self.state(&tunnel.id, "running", "Туннель работает", None)
-            .await;
+                    .map_err(|error| match error {
+                        russh::Error::RequestDenied => Problem::terminal(
+                            "SSH-сервер не разрешил удалённый порт или порт уже занят.",
+                        ),
+                        _ => NETWORK,
+                    })?;
+            if tunnel.port == 0 {
+                // The server reports the port it chose and names it in forwarded channels.
+                let port = u16::try_from(assigned)
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .ok_or(Problem::terminal(
+                        "SSH-сервер не сообщил выбранный удалённый порт.",
+                    ))?;
+                if let Some(route) = expected.lock().unwrap().as_mut() {
+                    route.port = port;
+                }
+                port
+            } else {
+                tunnel.port
+            }
+        } else {
+            let listener = timed(TcpListener::bind((unbracket(&tunnel.bind), tunnel.port)))
+                .await?
+                .map_err(bind_problem)?;
+            let port = listener.local_addr().map_err(bind_problem)?.port();
+            attempt.listener = Some(listener);
+            port
+        };
+        self.running(&tunnel.id, listening).await;
         attempt.started = true;
+        link.connected();
+        {
+            // Pings share the session with the traffic; their failures never close it.
+            let (link, connection) = (link.clone(), connection.clone());
+            attempt.copies.spawn(async move {
+                link.probe(|| {
+                    let connection = connection.clone();
+                    async move { connection.send_ping().await.is_ok() && !connection.is_closed() }
+                })
+                .await;
+            });
+        }
+        let counters = link.counters();
         let mut check = tokio::time::interval(Duration::from_millis(100));
         let mut backoff = AcceptBackoff::default();
         loop {
@@ -847,18 +908,20 @@ impl Manager {
                     let target = tunnel.target.clone();
                     let port = tunnel.target_port;
                     let dynamic = tunnel.kind == "D";
+                    let counters = counters.clone();
                     attempt.copies.spawn(async move {
-                        let _ = local_connection(socket, origin, connection, dynamic, target, port).await;
+                        let _ = local_connection(socket, origin, connection, dynamic, target, port, counters).await;
                     });
                 },
                 Some((channel, reply)) = remote_receive.recv(), if tunnel.kind == "R" => {
                     let target = tunnel.target.clone();
                     let port = tunnel.target_port;
+                    let counters = counters.clone();
                     attempt.copies.spawn(async move {
                         match timed(TcpStream::connect((unbracket(&target), port))).await {
                             Ok(Ok(mut socket)) => {
                                 reply.accept().await;
-                                let mut stream = channel.into_stream();
+                                let mut stream = crate::link::Counted::new(channel.into_stream(), counters);
                                 let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
                             },
                             _ => reply.reject(ChannelOpenFailure::ConnectFailed).await,
@@ -1096,6 +1159,9 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 fn update(runtime: &mut Runtime, state: &str, message: &str) {
+    if state != "running" {
+        runtime.port = None;
+    }
     runtime.state = state.into();
     runtime.message = message.into();
     push_log(runtime, message);
@@ -1127,6 +1193,21 @@ fn read_trust(path: &Path) -> std::result::Result<HashMap<String, String>, Probl
         PublicKey::from_openssh(key).map_err(|_| problem)?;
     }
     Ok(trust)
+}
+/// The key of a host in the trust store: `[host]:port`, lower case.
+fn trust_identity(host: &str, port: u16) -> String {
+    format!("[{}]:{}", unbracket(host).to_lowercase(), port)
+}
+/// The saved key of `host:port`, looked up as a tunnel would; the store is not changed.
+pub(crate) fn saved_host_key(
+    path: &Path,
+    host: &str,
+    port: u16,
+) -> std::result::Result<Option<PublicKey>, &'static str> {
+    let trust = read_trust(path).map_err(|problem| problem.message)?;
+    Ok(trust
+        .get(&trust_identity(host, port))
+        .and_then(|encoded| PublicKey::from_openssh(encoded).ok()))
 }
 fn same_key(encoded: &str, key: &PublicKey) -> bool {
     PublicKey::from_openssh(encoded).is_ok_and(|old| old.key_data() == key.key_data())
@@ -1618,6 +1699,7 @@ async fn local_connection(
     dynamic: bool,
     target: String,
     port: u16,
+    counters: Arc<crate::link::Counters>,
 ) -> std::result::Result<(), Problem> {
     let (target, port) = if dynamic {
         timed(socks_destination(&mut socket))
@@ -1648,7 +1730,7 @@ async fn local_connection(
             .await
             .map_err(|_| NETWORK)?;
     }
-    let mut stream = channel.into_stream();
+    let mut stream = crate::link::Counted::new(channel.into_stream(), counters);
     tokio::io::copy_bidirectional(&mut socket, &mut stream)
         .await
         .map_err(|_| NETWORK)?;

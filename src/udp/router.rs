@@ -25,9 +25,10 @@ use tokio::{
 };
 
 use super::{
-    metrics::{Summary, Traffic, Windowed, drops_map, merge_drops},
+    metrics::{Traffic, drops_map, merge_drops},
     transport::{Event, FlowCounters, Transport},
 };
+use crate::metrics::{Summary, Windowed};
 use crate::ssh::UdpNotice;
 
 /// Per-rule UDP traffic on the background side, as the snapshot and the CLI show it.

@@ -411,15 +411,37 @@ pub async fn prepare(release: &Release, store: &Store) -> Result<PreparedUpdate>
     )?;
     Ok(PreparedUpdate { staging })
 }
+/// Starts a just-written executable.
+///
+/// On Linux `execve` fails with `ETXTBSY` while any process holds the file open for
+/// writing. A `fork` from another thread inherits our write descriptor and keeps it
+/// until its own `exec` closes it, so a freshly written file can be briefly busy even
+/// after we closed it. The window is short, so a few retries outlast it.
+fn spawn_fresh_executable(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const ATTEMPTS: u32 = 20;
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
 pub fn launch_installer(prepared: PreparedUpdate) -> Result<()> {
-    Command::new(prepared.staging.path().join(helper_name()))
-        .arg("apply-update")
-        .arg(prepared.staging.path().join("manifest.json"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Не удалось запустить установщик обновления.")?;
+    spawn_fresh_executable(
+        Command::new(prepared.staging.path().join(helper_name()))
+            .arg("apply-update")
+            .arg(prepared.staging.path().join("manifest.json"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .context("Не удалось запустить установщик обновления.")?;
     let _ = prepared.staging.keep();
     Ok(())
 }
@@ -784,8 +806,8 @@ fn restart(install: &Installation, skip_check: bool) -> Result<std::process::Chi
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    spawn_fresh_executable(&mut command)
         .context("Не удалось запустить КРОТ; запустите программу вручную.")
 }
 pub async fn apply_install(manifest: &Path) -> Result<()> {
@@ -1291,6 +1313,26 @@ mod readiness_tests {
             b"new0"
         );
         drop(lease);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_waits_until_the_executable_is_no_longer_open_for_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("script");
+        let mut file = File::create(&script).unwrap();
+        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        file.flush().unwrap();
+        executable_permissions(&script).unwrap();
+        // The open write descriptor plays the part of one inherited by a concurrent fork.
+        let busy = Command::new(&script).spawn().unwrap_err();
+        assert_eq!(busy.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(file);
+        });
+        let mut child = spawn_fresh_executable(&mut Command::new(&script)).unwrap();
+        assert!(child.wait().unwrap().success());
+        writer.join().unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]

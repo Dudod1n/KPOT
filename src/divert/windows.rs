@@ -30,6 +30,7 @@ use windows_sys::Win32::{
             TH32CS_SNAPPROCESS,
         },
         LibraryLoader::{GetProcAddress, LoadLibraryW},
+        Performance::QueryPerformanceCounter,
         RemoteDesktop::ProcessIdToSessionId,
         SystemInformation::GetSystemDirectoryW,
         Threading::{
@@ -43,7 +44,7 @@ use super::{
     BlockedLog, DLL_SHA256, Matcher, Nat, Origin, Processes, SYS_SHA256, TCP, Verdict,
     blocked_reason, handle,
     link::{INBOUND_QUEUE, Inbound, Link},
-    owners::{Snapshot, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
+    owners::{Snapshot, Tables, UDP_TABLE_HEADER, UDP4_ROW_SIZE, UDP6_ROW_SIZE, UdpOwners},
     reset, tcp_table_owner,
     udp::{self, Policy},
 };
@@ -55,7 +56,9 @@ use crate::{
 };
 use krot_udp_proto::metrics::DropReason;
 
-const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp)\0";
+/// Later IP fragments carry no transport header and match neither `tcp` nor `udp`: without
+/// `fragment` they would leave unseen, around the verdict of their first fragment.
+const FILTER: &[u8] = b"outbound and !loopback and !impostor and (tcp or udp or fragment)\0";
 const FIREWALL_RULE: &str = "KROT-app-relay";
 const OUTBOUND: u32 = 1 << 17;
 const AF_INET: u32 = 2;
@@ -287,6 +290,34 @@ fn read_port_table(tcp: bool, v6: bool, table: &mut Vec<u8>) -> Option<&[u8]> {
     None
 }
 
+/// The performance counter, the clock of WinDivert's capture timestamps.
+fn performance_counter() -> i64 {
+    let mut count = 0;
+    // SAFETY: the out-pointer is valid; the call cannot fail on Windows XP and later.
+    unsafe { QueryPerformanceCounter(&mut count) };
+    count
+}
+
+/// The UDP tables of the system, read into `buffer`.
+struct SystemTables<'a> {
+    buffer: &'a mut Vec<u8>,
+}
+
+impl Tables for SystemTables<'_> {
+    fn read(&mut self, v6: bool) -> Option<Vec<u8>> {
+        read_port_table(false, v6, self.buffer).map(<[u8]>::to_vec)
+    }
+
+    fn stamp(&mut self) -> i64 {
+        performance_counter()
+    }
+
+    fn wait(&mut self, time: Duration) -> Instant {
+        std::thread::sleep(time);
+        Instant::now()
+    }
+}
+
 fn tcp_port_owner(origin: &Origin, buffer: &mut Vec<u8>) -> Option<u32> {
     let v6 = origin.local.is_ipv6();
     [v6, !v6].into_iter().find_map(|v6| {
@@ -393,6 +424,15 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
         }
         failures = 0;
         let now = Instant::now();
+        // When the driver captured the datagram, by the performance counter. A stamp that is
+        // missing or ahead of the counter is replaced by the moment of receipt, which is later
+        // than the capture: the safe side, since it can only cause another reading.
+        let received_at = performance_counter();
+        let captured = if (1..=received_at).contains(&address.timestamp) {
+            address.timestamp
+        } else {
+            received_at
+        };
         let current = shared.generation.load(Ordering::Acquire);
         if current != generation {
             generation = current;
@@ -449,7 +489,10 @@ fn packets(api: Api, device: Arc<Device>, relay_port: u16, shared: Arc<Shared>) 
                         udp_snapshot.rules(
                             now,
                             local,
-                            |v6| read_port_table(false, v6, &mut udp_table).map(<[u8]>::to_vec),
+                            captured,
+                            &mut SystemTables {
+                                buffer: &mut udp_table,
+                            },
                             |pids| {
                                 pids.iter()
                                     .filter_map(|&pid| matcher.decide(pid, now, &system))
@@ -940,3 +983,6 @@ pub(super) fn launch(config: &Path, prompt: super::Prompt) -> Result<()> {
     tasks::runas(program.as_os_str(), &parameters, false)
         .context("Права администратора не предоставлены: перехват не запущен.")
 }
+
+#[cfg(test)]
+mod tests;
