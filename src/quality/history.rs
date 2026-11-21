@@ -37,12 +37,21 @@ pub fn load(path: &Path) -> Result<History> {
 
 /// Adds a finished test. A file that cannot be read is left as it is, so that nothing the user
 /// may still need is overwritten.
+/// Tests finish on their own tasks; one at a time reads and rewrites the file.
 pub fn append(path: &Path, test: TestStatus) -> Result<()> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writing = WRITING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut history = load(path)?;
     history.version = 1;
     history.tests.push(test);
     if history.tests.len() > KEEP {
         history.tests.drain(..history.tests.len() - KEEP);
+    }
+    // Long stability tests are large: the oldest ones give way until the file fits.
+    while history.tests.len() > 1 && serde_json::to_vec_pretty(&history)?.len() >= MAX_BYTES {
+        history.tests.remove(0);
     }
     crate::config::atomic_json(path, &history, Some(MAX_BYTES))
 }

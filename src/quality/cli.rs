@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
-use super::{DEFAULT_LIMIT_MB, Kind, MAX_STABILITY, MIN_STABILITY, TestStatus, report};
+use super::{
+    DEFAULT_LIMIT_MB, Kind, MAX_LIMIT_MB, MAX_STABILITY, MIN_STABILITY, TestStatus, report,
+};
 use crate::background::Client;
 use crate::config::Store;
 use crate::link::bytes_text;
@@ -83,6 +85,10 @@ pub async fn run(
         Kind::Speed
     };
     let limit_mb = limit.unwrap_or(DEFAULT_LIMIT_MB);
+    ensure!(
+        (1..=MAX_LIMIT_MB).contains(&limit_mb),
+        "Лимит объёма теста — от 1 до {MAX_LIMIT_MB} МБ."
+    );
     ensure!(
         store.sidecar(".background.json").exists(),
         "Фоновый КРОТ не запущен."

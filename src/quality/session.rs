@@ -36,7 +36,8 @@ impl<H: russh::client::Handler + 'static> Session for russh::client::Handle<H> {
     }
     fn exec(&self, command: String) -> BoxFuture<'_, Option<Pipe>> {
         Box::pin(async move {
-            let mut guard = Closing(Some(self.channel_open_session().await.ok()?));
+            let channel = tokio::time::timeout(EXEC_REPLY, self.channel_open_session());
+            let mut guard = Closing(Some(channel.await.ok()?.ok()?));
             let opened = async {
                 let channel = guard.0.as_mut()?;
                 channel.exec(true, command).await.ok()?;

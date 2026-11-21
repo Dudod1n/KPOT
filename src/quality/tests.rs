@@ -30,6 +30,8 @@ struct Fake {
     abandoned: AtomicU64,
     commands: Mutex<Vec<String>>,
     gone: AtomicBool,
+    /// The login shell prints a long greeting before every command's output.
+    banner: bool,
 }
 
 impl Fake {
@@ -44,6 +46,7 @@ impl Fake {
             abandoned: AtomicU64::new(0),
             commands: Mutex::default(),
             gone: AtomicBool::new(false),
+            banner: false,
         }
     }
 }
@@ -83,6 +86,11 @@ async fn serve_download(fake: Arc<Fake>, mut server: tokio::io::DuplexStream, li
     let _ = server.shutdown().await;
 }
 
+/// What a chatty login shell prints before a command's own output.
+fn greeting() -> String {
+    "Welcome to the server! Unauthorized access is prohibited.\n".repeat(20)
+}
+
 async fn serve_upload(fake: Arc<Fake>, mut server: tokio::io::DuplexStream) {
     let mut buffer = vec![0u8; fake.chunk];
     let mut count = 0u64;
@@ -93,7 +101,14 @@ async fn serve_upload(fake: Arc<Fake>, mut server: tokio::io::DuplexStream) {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let _ = server.write_all(format!("  {count}\n").as_bytes()).await;
+    let banner = if fake.banner {
+        greeting()
+    } else {
+        String::new()
+    };
+    let _ = server
+        .write_all(format!("{banner}  {count}\n").as_bytes())
+        .await;
     let _ = server.shutdown().await;
 }
 
@@ -124,8 +139,15 @@ impl Session for Served {
                     let _ = server.shutdown().await;
                 });
             } else if command.contains(PROBE) {
+                let banner = if fake.banner {
+                    greeting()
+                } else {
+                    String::new()
+                };
                 tokio::spawn(async move {
-                    let _ = server.write_all(b"KROT-TEST-OK\n").await;
+                    let _ = server
+                        .write_all(format!("{banner}KROT-TEST-OK\n").as_bytes())
+                        .await;
                     let _ = server.shutdown().await;
                 });
             } else if command.contains(DOWNLOAD) {
@@ -415,7 +437,8 @@ async fn lost_pings_in_a_row_are_a_stall() {
         (9.0..13.0).contains(&stall.at_s) && (13_000..21_000).contains(&stall.duration_ms),
         "{stall:?}"
     );
-    assert!(report.ping_lost >= 2);
+    // A ping goes out every two seconds while earlier ones wait: 15 s without answers lose 7–8.
+    assert!((7..=8).contains(&report.ping_lost), "{report:?}");
     assert_eq!(report.skipped, vec![NO_EXEC.to_owned()]);
 }
 
@@ -596,4 +619,77 @@ fn history_keeps_the_latest_tests_and_leaves_a_broken_file() {
     std::fs::write(&path, "{broken").unwrap();
     assert!(history::append(&path, TestStatus::default()).is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+}
+
+#[test]
+fn history_drops_the_oldest_tests_to_stay_within_its_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tunnels.json.tests.json");
+    let large = || TestStatus {
+        state: "done".into(),
+        report: TestReport {
+            samples: vec![Sample::default(); 4000],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for _ in 0..12 {
+        history::append(&path, large()).unwrap();
+    }
+    let short = TestStatus {
+        id: "short".into(),
+        ..Default::default()
+    };
+    history::append(&path, short).unwrap();
+    let saved = history::load(&path).unwrap();
+    assert_eq!(saved.tests.last().unwrap().id, "short");
+    assert!(saved.tests.len() < 13);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_greeting_of_the_login_shell_hides_neither_the_marker_nor_the_count() {
+    let mut fake = Fake::new(Shell::Runs);
+    fake.banner = true;
+    let fake = Arc::new(fake);
+    let (gate, _session) = tunnel(&fake);
+    published(&gate).await;
+    let tests = Tests::new(None);
+    let id = tests.start(&gate, speed("t", 1)).unwrap();
+    let report = finished(&tests, &id).await.report;
+    assert!(
+        report.skipped.is_empty() && report.notes.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(report.up_bytes, MIB);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_speed_test_names_a_stopped_tunnel() {
+    let mut fake = Fake::new(Shell::Runs);
+    fake.chunk = 1024;
+    let fake = Arc::new(fake);
+    let (gate, session) = tunnel(&fake);
+    published(&gate).await;
+    let tests = Tests::new(None);
+    let id = tests.start(&gate, speed("t", 100)).unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // The session's agent stops first, the gate a moment later.
+    session.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(gate);
+    let status = finished(&tests, &id).await;
+    assert_eq!(status.error, Stop::Tunnel.message());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_finished_test_stays_readable_after_a_newer_one_starts() {
+    let fake = Arc::new(Fake::new(Shell::Refuses));
+    let (gate, _session) = tunnel(&fake);
+    published(&gate).await;
+    let tests = Tests::new(None);
+    let first = tests.start(&gate, speed("t", 1)).unwrap();
+    finished(&tests, &first).await;
+    let second = tests.start(&gate, speed("t", 1)).unwrap();
+    assert_eq!(tests.status(&first).unwrap().state, "done");
+    assert_eq!(tests.snapshot()["t"].id, second);
 }

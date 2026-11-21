@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::link::bytes_text;
@@ -54,6 +54,8 @@ pub const MAX_STABILITY: Duration = Duration::from_secs(24 * 3600);
 const MIB: u64 = 1024 * 1024;
 
 const NOT_FOUND: &str = "Тест не найден.";
+/// Replaced tests kept readable by their ID.
+const EARLIER: usize = 16;
 const MARKER: &str = "KROT-TEST-OK";
 const PROBE: &str = "echo KROT-TEST-OK";
 /// `head -c` of GNU, BusyBox and BSD; random data, so that SSH compression changes nothing.
@@ -347,8 +349,9 @@ async fn probe_shell(access: &Access) -> Result<Option<bool>, Stop> {
             let mut pipe = session.exec(command).await?;
             let mut output = Vec::new();
             let read = async {
-                let mut buffer = [0u8; 256];
-                while output.len() < 256 {
+                // A login shell may print a banner before the marker.
+                let mut buffer = [0u8; 4096];
+                while output.len() < 64 * 1024 {
                     match pipe.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
                         Ok(read) => output.extend_from_slice(&buffer[..read]),
@@ -530,14 +533,21 @@ async fn upload(
         let confirm = async {
             pipe.shutdown().await.ok()?;
             let mut output = Vec::new();
-            let mut buffer = [0u8; 64];
-            while output.len() < 64 {
+            let mut buffer = [0u8; 4096];
+            while output.len() < 64 * 1024 {
                 match pipe.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
                     Ok(read) => output.extend_from_slice(&buffer[..read]),
                 }
             }
-            String::from_utf8_lossy(&output).trim().parse::<u64>().ok()
+            // The count is the last line: a login shell may print something before it.
+            String::from_utf8_lossy(&output)
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())?
+                .trim()
+                .parse::<u64>()
+                .ok()
         };
         confirmed = tokio::time::timeout(CONFIRM, confirm).await.ok().flatten();
     }
@@ -677,7 +687,33 @@ async fn speed(
     run: Shared,
     limit: u64,
 ) -> Result<(), Stop> {
-    let access = current(&sessions)?;
+    let result = speed_steps(&sessions, run, limit).await;
+    if result != Err(Stop::Session) {
+        return result;
+    }
+    // The session's agent stops a moment before a stopped tunnel drops its gate.
+    let mut sessions = sessions;
+    let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if sessions.changed().await.is_err() {
+                return true;
+            }
+            if sessions.borrow().is_some() {
+                return false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    Err(if stopped { Stop::Tunnel } else { Stop::Session })
+}
+
+async fn speed_steps(
+    sessions: &watch::Receiver<Option<Access>>,
+    run: Shared,
+    limit: u64,
+) -> Result<(), Stop> {
+    let access = current(sessions)?;
     lock(&run).phase = "Задержка без нагрузки".into();
     for _ in 0..IDLE_PINGS {
         let next = Instant::now() + IDLE_PING_GAP;
@@ -747,13 +783,20 @@ async fn stability(
     current(&sessions)?;
     lock(&run).phase = "Проверка стабильности".into();
     let pinging = async {
-        let mut next = origin;
+        // A ping goes out every two seconds even while earlier ones wait for their answer, so
+        // that a stall loses as many pings as it lasts. They end with the test.
+        let mut pings = tokio::task::JoinSet::new();
+        let mut tick = tokio::time::interval_at(origin, STABILITY_PING_GAP);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
+            tick.tick().await;
+            while pings.try_join_next().is_some() {}
             if let Ok(access) = current(&sessions) {
-                let _ = ping_once(&access, &run).await;
+                let run = run.clone();
+                pings.spawn(async move {
+                    let _ = ping_once(&access, &run).await;
+                });
             }
-            next += STABILITY_PING_GAP;
-            tokio::time::sleep_until(next.max(Instant::now())).await;
         }
     };
     let transferring = async {
@@ -834,6 +877,8 @@ struct Job {
 /// result after it ends.
 pub struct Tests {
     jobs: Mutex<HashMap<String, Job>>,
+    /// Tests replaced by a newer one of their tunnel, the latest last.
+    earlier: Mutex<std::collections::VecDeque<Job>>,
     history: Option<PathBuf>,
 }
 
@@ -842,6 +887,7 @@ impl Tests {
     pub fn new(history: Option<PathBuf>) -> Self {
         Self {
             jobs: Mutex::default(),
+            earlier: Mutex::default(),
             history,
         }
     }
@@ -930,7 +976,7 @@ impl Tests {
                 }
             }
         };
-        jobs.insert(
+        let replaced = jobs.insert(
             request.id.clone(),
             Job {
                 id: id.clone(),
@@ -938,11 +984,30 @@ impl Tests {
                 cancel,
             },
         );
+        drop(jobs);
+        // A finished test stays readable by its ID for a while, for the client that waits for it.
+        if let Some(replaced) = replaced {
+            let mut earlier = self.earlier();
+            if earlier.len() == EARLIER {
+                earlier.pop_front();
+            }
+            earlier.push_back(replaced);
+        }
         tokio::spawn(task);
         Ok(id)
     }
+    fn earlier(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<Job>> {
+        self.earlier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
     fn find<T>(&self, id: &str, then: impl FnOnce(&Job) -> T) -> Option<T> {
-        self.jobs().values().find(|job| job.id == id).map(then)
+        let jobs = self.jobs();
+        if let Some(job) = jobs.values().find(|job| job.id == id) {
+            return Some(then(job));
+        }
+        drop(jobs);
+        self.earlier().iter().find(|job| job.id == id).map(then)
     }
     pub fn status(&self, id: &str) -> Option<TestStatus> {
         self.find(id, |job| lock(&job.run).status(&job.id, Instant::now()))
