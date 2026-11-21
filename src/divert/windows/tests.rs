@@ -129,3 +129,88 @@ fn udp_tables_under_a_stream_of_new_endpoints() {
         }
     }
 }
+
+/// Writes a line of the driver test past the test harness capture.
+fn driver_report(text: &str) {
+    let _ = writeln!(std::io::stderr(), "windivert: {text}");
+}
+
+/// The real driver captures an application's outbound datagram. Runs with `--ignored` where
+/// WinDivert.dll and WinDivert64.sys lie next to the test binary and the process is an
+/// administrator, as on the CI Windows runner. Only datagrams to TEST-NET-1 are diverted, and
+/// they never leave. A datagram larger than the MTU is reported, not checked: whether it is
+/// captured whole or in fragments depends on the network adapter.
+#[test]
+#[ignore]
+fn windivert_captures_outbound_udp() {
+    use super::{Address, load};
+    const TARGET: [u8; 4] = [192, 0, 2, 1];
+    const PORT: u16 = 47999;
+    let api = load().expect("WinDivert files next to the test binary");
+    let filter = format!(
+        "outbound and ip.DstAddr == {}.{}.{}.{}\0",
+        TARGET[0], TARGET[1], TARGET[2], TARGET[3]
+    );
+    // SAFETY: the filter is NUL-terminated; layer 0 is the network layer, no flags.
+    let device = unsafe { (api.open)(filter.as_ptr(), 0, 0, 0) };
+    if device == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        // SAFETY: reads the calling thread's last error code.
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        panic!("WinDivertOpen failed with error {code}");
+    }
+    let device = device as usize;
+    let (sender, receiver) = mpsc::channel();
+    // The thread stays blocked in the driver after the test; the process ends with it.
+    std::thread::spawn(move || {
+        let mut buffer = vec![0u8; 65535];
+        loop {
+            // SAFETY: a zeroed WINDIVERT_ADDRESS is valid; the buffer outlives the call.
+            let mut address: Address = unsafe { std::mem::zeroed() };
+            let mut length = 0u32;
+            // SAFETY: the handle is never closed while the process runs; the pointers are
+            // valid for the call.
+            let received = unsafe {
+                (api.recv)(
+                    device as _,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    &mut length,
+                    &mut address,
+                )
+            };
+            if received == 0 || sender.send(buffer[..length as usize].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    socket
+        .send_to(b"krot-capture", (std::net::Ipv4Addr::from(TARGET), PORT))
+        .unwrap();
+    let packet = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the datagram was not captured");
+    let header = usize::from(packet[0] & 0x0f) * 4;
+    assert_eq!(packet[0] >> 4, 4, "IPv4");
+    assert_eq!(packet[9], 17, "UDP");
+    assert_eq!(packet[16..20], TARGET);
+    assert_eq!(
+        u16::from_be_bytes([packet[header + 2], packet[header + 3]]),
+        PORT
+    );
+    assert_eq!(&packet[header + 8..], b"krot-capture");
+    driver_report("the driver opened and captured the datagram");
+
+    socket
+        .send_to(&[7u8; 4000], (std::net::Ipv4Addr::from(TARGET), PORT))
+        .unwrap();
+    while let Ok(packet) = receiver.recv_timeout(Duration::from_secs(2)) {
+        let field = u16::from_be_bytes([packet[6], packet[7]]);
+        driver_report(&format!(
+            "a 4000-byte datagram: captured {} bytes, fragment offset {}, more fragments {}",
+            packet.len(),
+            (field & 0x1fff) * 8,
+            field & 0x2000 != 0
+        ));
+    }
+}

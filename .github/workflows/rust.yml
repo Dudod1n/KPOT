@@ -107,6 +107,18 @@ jobs:
       - run: python -m unittest discover -s tests -p 'test_*.py' -v
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # The hosted runner is an administrator and loads the signed driver, so the capture path
+      # runs against the real WinDivert. Its files go next to the actual test binary, which
+      # cargo places by its own layout.
+      - if: runner.os == 'Windows'
+        name: Test capture with the WinDivert driver
+        shell: bash
+        run: |
+          dir=$(cargo test --locked --lib --no-run --message-format=json \
+            | python -c "import sys, json, os; print(next(os.path.dirname(m['executable']) for m in map(json.loads, sys.stdin) if m.get('executable')))")
+          echo "test binary directory: $dir"
+          python scripts/fetch_windivert.py --output "$dir"
+          cargo test --locked --lib windivert_captures -- --ignored --nocapture
       - if: runner.os == 'Linux'
         run: dbus-run-session -- cargo test --locked --test tray_linux -- --ignored
       - if: runner.os == 'Linux'
