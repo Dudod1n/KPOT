@@ -23,9 +23,8 @@ labels: bug
 
 ## Журнал или скриншот
 
-Приложите журнал для диагностики: `krot-cli diagnostics` показывает пути файлов
+Приложите журнал для диагностики: `krot-cli diagnostics` показывает путь файла
 (по умолчанию `%APPDATA%\krot\config.json.log` в Windows и
-`~/.config/krot/config.json.log` в Linux; в Windows для перехвата приложений —
-ещё `config.json.divert.log`). Достаточно строк за время ошибки.
+`~/.config/krot/config.json.log` в Linux). Достаточно строк за время ошибки.
 
 Удалите пароли, токены, закрытые ключи и личные адреса серверов перед публикацией.

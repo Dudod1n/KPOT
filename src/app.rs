@@ -73,7 +73,7 @@ enum Command {
         #[arg(long)]
         tunnel: Option<String>,
     },
-    /// Показать пути файлов журнала фонового процесса и помощника перехвата
+    /// Показать путь файла журнала фонового процесса и помощника перехвата
     Diagnostics,
     /// Остановить фон и все туннели, сохранив выбор для следующего запуска
     Stop,
@@ -151,24 +151,28 @@ pub fn run() -> Result<()> {
             }
             Some(Command::Check) => { let config = store.load()?; println!("Конфигурация корректна. Туннелей: {}. SSH не запускается.",config.tunnels.len()); Ok(()) }
             Some(Command::Path) => { println!("{}",store.path.display()); Ok(()) }
-            Some(Command::Serve) => journaled("Фоновый процесс", journal::background_path(&store),
-                || runtime.block_on(background::serve(store))),
-            Some(Command::Divert { remember }) => journaled("Помощник перехвата", journal::divert_path(&store),
-                || crate::divert::run(store, remember)),
+            Some(Command::Serve) => {
+                journal::init(journal::background_path(&store));
+                // The start is recorded by the process once it owns the configuration.
+                let result = runtime.block_on(background::serve(store));
+                journal::finished("Фоновый процесс", &result);
+                result
+            }
+            // The elevated helper writes no file: its events reach the background journal.
+            Some(Command::Divert { remember }) => crate::divert::run(store, remember),
             Some(Command::Diagnostics) => {
-                for (name, path) in [("фонового процесса", journal::background_path(&store)), ("помощника перехвата (Windows)", journal::divert_path(&store))] {
-                    println!("Журнал {name}: {}", path.display());
-                    for part in [path.clone(), journal::rotated_path(&path)] {
-                        match std::fs::metadata(&part) {
-                            Ok(metadata) => println!("  {} — {} КиБ", part.display(), metadata.len().div_ceil(1024)),
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                if part == path { println!("  ещё не создан"); }
-                            }
-                            Err(error) => println!("  {}: {error}", part.display()),
+                let path = journal::background_path(&store);
+                println!("Журнал фонового процесса и помощника перехвата: {}", path.display());
+                for part in [path.clone(), journal::rotated_path(&path)] {
+                    match std::fs::metadata(&part) {
+                        Ok(metadata) => println!("  {} — {} КиБ", part.display(), metadata.len().div_ceil(1024)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if part == path { println!("  ещё не создан"); }
                         }
+                        Err(error) => println!("  {}: {error}", part.display()),
                     }
                 }
-                println!("Пароли, парольные фразы и ключи в журнал не записываются. Перед публикацией удалите из него адреса серверов, если они личные.");
+                println!("Пароли, парольные фразы и ключи в журнал не записываются, а имена и адреса серверов и ID туннелей записываются: удалите их перед публикацией, если они личные.");
                 Ok(())
             }
             Some(Command::Elevation { action }) => {
@@ -270,15 +274,6 @@ pub fn run() -> Result<()> {
     if gui && let Err(ref error) = result {
         let _ = desktop::show_error(format!("Не удалось открыть КРОТ.\n\n{error:#}"));
     }
-    result
-}
-
-/// Runs a long-lived process with its journal: its end and panics are recorded.
-fn journaled(process: &str, path: PathBuf, run: impl FnOnce() -> Result<()>) -> Result<()> {
-    // The start is recorded by the process once it owns the configuration.
-    journal::init(path);
-    let result = run();
-    journal::finished(process, &result);
     result
 }
 

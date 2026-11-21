@@ -125,6 +125,10 @@ pub struct DivertReport {
     /// older background processes accept and answer with `stop`.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub udp: HashMap<String, crate::divert::link::HelperUdpStats>,
+    /// The helper's own events, such as panics, for the background journal: the elevated
+    /// helper writes no file in the user's directory. Left out while empty, like `udp`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -647,7 +651,7 @@ mod tests {
         };
         let encoded = serde_json::to_value(&report).unwrap();
         assert!(
-            encoded.get("udp").is_none(),
+            encoded.get("udp").is_none() && encoded.get("events").is_none(),
             "older background processes reject the field"
         );
         let mut with_udp = report.clone();

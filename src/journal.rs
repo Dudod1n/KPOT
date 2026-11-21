@@ -41,10 +41,6 @@ pub fn background_path(store: &Store) -> PathBuf {
     store.sidecar(".log")
 }
 
-pub fn divert_path(store: &Store) -> PathBuf {
-    store.sidecar(".divert.log")
-}
-
 pub fn rotated_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".1");
@@ -135,6 +131,37 @@ pub fn init(path: PathBuf) {
         }
         previous(info);
     }));
+}
+
+/// Panics kept by the interception helper until its next report.
+pub const MAX_PANICS: usize = 16;
+static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The elevated helper writes no file in the user's directory, where a link could turn the
+/// write onto another file: it keeps its panics for the background process instead.
+pub fn keep_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        keep_panic(&format!("Паника: {info}"));
+        previous(info);
+    }));
+}
+
+fn keep_panic(text: &str) {
+    if let Ok(mut panics) = PANICS.try_lock()
+        && panics.len() < MAX_PANICS
+    {
+        panics.push(clean(&hide_values(text)));
+    }
+}
+
+/// Panics kept since the last call.
+pub fn take_panics() -> Vec<String> {
+    std::mem::take(
+        &mut *PANICS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
 }
 
 thread_local! {
@@ -302,6 +329,17 @@ mod tests {
         journal.write(&time(), Level::Info, "последняя");
         assert!(fs::metadata(&path).unwrap().len() <= MAX_BYTES);
         assert!(fs::read_to_string(&path).unwrap().ends_with("последняя\n"));
+    }
+
+    #[test]
+    fn helper_panics_are_kept_bounded_and_hidden_for_the_report() {
+        for _ in 0..MAX_PANICS + 5 {
+            keep_panic("Паника: panicked at src/x.rs:1:1:\nvalue \"secret\"");
+        }
+        let panics = take_panics();
+        assert_eq!(panics.len(), MAX_PANICS);
+        assert_eq!(panics[0], "Паника: panicked at src/x.rs:1:1: value \"…\"");
+        assert!(take_panics().is_empty());
     }
 
     #[test]
