@@ -34,7 +34,8 @@ class PackageTests(unittest.TestCase):
                 for name in ['krot', 'krot-cli']:
                     (source / (name + suffix)).write_bytes((runner + name).encode())
                 (source / 'THIRD_PARTY_NOTICES.txt').write_text(runner + ' licenses')
-            for name in ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt']:
+            for name in ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt',
+                         'krot-1.2.3-windows-x64.msi']:
                 (builds / 'krot-rust-Windows-X64' / name).write_bytes(name.encode())
             # Windows chmod does not set Unix executable permission bits.
             with patch.object(packager, 'ROOT', root), patch.object(Path, 'chmod', autospec=True) as chmod:
@@ -42,7 +43,8 @@ class PackageTests(unittest.TestCase):
             for name in ['krot-linux-x64', 'krot-cli-linux-x64']:
                 chmod.assert_any_call(output / name, 0o755)
             self.assertEqual(notes.read_text(), '### Fixed\n- Port cleanup.\n')
-            self.assertEqual(len(list(output.iterdir())), 13)
+            self.assertEqual(len(list(output.iterdir())), 14)
+            self.assertEqual((output / 'krot-1.2.3-windows-x64.msi').read_bytes(), b'krot-1.2.3-windows-x64.msi')
             self.assertEqual((output / 'WinDivert64.sys').read_bytes(), b'WinDivert64.sys')
             lines = (output / 'SHA256SUMS').read_text().splitlines()
             sums = dict(reversed(line.split('  ', 1)) for line in lines)

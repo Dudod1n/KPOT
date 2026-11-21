@@ -38,11 +38,13 @@ def package(tag, builds, output, notes_path):
         source = builds / f'krot-rust-{runner}-X64'
         for path in [source / ('krot' + suffix), source / ('krot-cli' + suffix),
                      source / 'THIRD_PARTY_NOTICES.txt', *common,
-                     *(source / name for name in windivert if platform == 'windows')]:
+                     *(source / name for name in windivert if platform == 'windows'),
+                     *([source / f'krot-{version}-windows-x64.msi'] if platform == 'windows' else [])]:
             if not path.is_file() or not path.stat().st_size:
                 raise ValueError(f'Missing release input: {path}')
     output.mkdir(parents=True)
     readme = (f'КРОТ {version} — менеджер SSH-туннелей.\n\n'
+              'Это переносная копия: для установки в Windows используйте krot-*-windows-x64.msi.\n'
               'Распакуйте оба бинарника в каталог с правом записи.\n'
               'Запустите krot.exe на Windows или ./krot на Linux.\n'
               'Перед ручной заменой файлов полностью остановите КРОТ через меню трея.\n'
@@ -66,6 +68,10 @@ def package(tag, builds, output, notes_path):
         files = [*binaries, (notices, 'THIRD_PARTY_NOTICES.txt'),
                  *((path, path.name) for path in common)]
         if platform == 'windows':
+            # The installer: Program Files, the interception service, Start menu and removal.
+            # The installed copy updates from it, by this exact name.
+            installer = f'krot-{version}-windows-x64.msi'
+            shutil.copy2(source / installer, output / installer)
             # Also published on their own: a copy updated from an older version downloads them.
             for name in windivert:
                 shutil.copy2(source / name, output / name)

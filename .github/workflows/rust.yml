@@ -140,6 +140,27 @@ jobs:
       - if: runner.os == 'Windows'
         name: Fetch the pinned WinDivert files
         run: python scripts/fetch_windivert.py --output target/release
+      # Authenticode signing (#93) goes here once a certificate exists: krot.exe and
+      # krot-cli.exe before the installer is built, the installer right after it, all before
+      # the artifact is uploaded and SHA256SUMS is computed. No certificate is used yet.
+      - if: runner.os == 'Windows'
+        name: Build the installer
+        shell: bash
+        run: |
+          dotnet tool install --tool-path "$RUNNER_TEMP/wix" wix --version 5.0.2
+          python scripts/build_msi.py --binaries target/release --wix "$RUNNER_TEMP/wix/wix.exe"
+          # The same binaries under a higher version, only to check an upgrade below.
+          python scripts/build_msi.py --binaries target/release --wix "$RUNNER_TEMP/wix/wix.exe" \
+            --version 255.0.0 --output "$RUNNER_TEMP/krot-upgrade.msi"
+      # The hosted runner is a disposable administrator: the package is installed, used,
+      # upgraded and removed on it for real.
+      - if: runner.os == 'Windows'
+        name: Install, upgrade and remove the installer
+        shell: bash
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['package']['version'])")
+          python -X utf8 scripts/check_installer.py --package "target/release/krot-$version-windows-x64.msi" \
+            --version "$version" --upgrade "$RUNNER_TEMP/krot-upgrade.msi" --upgrade-version 255.0.0
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: krot-rust-${{ runner.os }}-${{ runner.arch }}
@@ -152,3 +173,4 @@ jobs:
             target/release/WinDivert.dll
             target/release/WinDivert64.sys
             target/release/WinDivert-LICENSE.txt
+            target/release/krot-*-windows-x64.msi

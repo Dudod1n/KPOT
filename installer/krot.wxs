@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows Installer package of КРОТ (WiX Toolset 5). scripts/build_msi.py builds it:
+    Version   numeric version, e.g. 0.7.2
+    Binaries  directory with krot.exe, krot-cli.exe, the WinDivert files and THIRD_PARTY_NOTICES.txt
+    Root      repository root, for LICENSE and assets\krot.ico
+
+  Everything goes to Program Files, where only administrators write: the interception
+  service runs from there as LocalSystem. The package never touches users' profiles; their
+  configuration stays where it is when КРОТ is removed.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="КРОТ" Manufacturer="Проект КРОТ" Version="$(var.Version)"
+           UpgradeCode="69DBAA5B-52F6-4F26-ABF4-8DC037C8A21B" Scope="perMachine"
+           Language="1049" Codepage="1251" Compressed="yes" InstallerVersion="500">
+    <SummaryInformation Description="КРОТ — менеджер SSH-туннелей" Manufacturer="Проект КРОТ" Codepage="1251" />
+    <!-- The previous version goes first, as a whole: no file of two versions mixes. -->
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="Уже установлена более новая версия КРОТа." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="krot.ico" SourceFile="$(var.Root)\assets\krot.ico" />
+    <Property Id="ARPPRODUCTICON" Value="krot.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Dudod1n/KPOT" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Dudod1n/KPOT/issues" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="KROT" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <!-- Reserved for the service's own journal: SYSTEM and administrators only. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="KROT" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Program" Directory="INSTALLFOLDER">
+      <Component Id="KrotExe">
+        <File Id="KrotExe" Source="$(var.Binaries)\krot.exe" KeyPath="yes" />
+        <ServiceInstall Id="KrotDivert" Name="KrotDivert" DisplayName="КРОТ: перехват приложений"
+                        Description="Запускает помощник перехвата трафика приложений для установленного КРОТа."
+                        Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem"
+                        Arguments="service" Vital="yes" />
+        <ServiceControl Id="KrotDivert" Name="KrotDivert" Start="install" Stop="both"
+                        Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="KrotCli">
+        <File Id="KrotCli" Source="$(var.Binaries)\krot-cli.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="WinDivertDll">
+        <File Id="WinDivertDll" Source="$(var.Binaries)\WinDivert.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="WinDivertSys">
+        <File Id="WinDivertSys" Source="$(var.Binaries)\WinDivert64.sys" KeyPath="yes" />
+      </Component>
+      <Component Id="Licenses">
+        <File Id="License" Source="$(var.Root)\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+        <File Id="Notices" Source="$(var.Binaries)\THIRD_PARTY_NOTICES.txt" />
+        <File Id="WinDivertLicense" Source="$(var.Binaries)\WinDivert-LICENSE.txt" />
+      </Component>
+      <!-- КРОТ tells the installed copy from portable ones by this value. -->
+      <Component Id="InstallDir">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="InstallDir" Type="string"
+                       Value="[INSTALLFOLDER]" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenu" Directory="ProgramMenuFolder">
+      <Shortcut Id="StartMenu" Name="КРОТ" Description="Менеджер SSH-туннелей"
+                Target="[#KrotExe]" WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="StartMenu" Type="integer" Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <Component Id="Data" Directory="DATAFOLDER">
+      <CreateFolder>
+        <PermissionEx Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+      </CreateFolder>
+      <RemoveFile Id="DataFiles" Name="*" On="uninstall" />
+      <RemoveFolder Id="DataFolder" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="DataDir" Type="string"
+                     Value="[DATAFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <!--
+      Before the files and HKLM\SOFTWARE\KROT go: ends the running КРОТ of this installation,
+      removes the logon and interception tasks and the Run values that start it, and the
+      firewall rules of the service's helpers. Not on an upgrade: the new version keeps them.
+    -->
+    <CustomAction Id="Cleanup" FileRef="KrotExe" ExeCommand="uninstall-cleanup"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="Cleanup" Before="RemoveRegistryValues"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="КРОТ" Level="1">
+      <ComponentGroupRef Id="Program" />
+      <ComponentRef Id="StartMenu" />
+      <ComponentRef Id="Data" />
+    </Feature>
+  </Package>
+</Wix>
