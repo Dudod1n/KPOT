@@ -129,9 +129,29 @@ struct Divert {
     udp: HashMap<String, crate::divert::link::HelperUdpStats>,
     logs: HashMap<String, Vec<String>>,
     error: String,
+    /// Whether the journal last recorded the helper as attached.
+    journaled: bool,
 }
 
 impl Divert {
+    /// Records when the helper attaches and when its reports stop: a helper killed, for
+    /// example by an antivirus, leaves no record of its own. Returns whether it recorded.
+    fn journal_presence(&mut self) -> bool {
+        let attached = self.attached();
+        if attached == self.journaled {
+            return false;
+        }
+        self.journaled = attached;
+        if attached {
+            crate::journal::write(crate::journal::Level::Info, "Помощник перехвата подключён.");
+        } else {
+            crate::journal::write(
+                crate::journal::Level::Warn,
+                "Помощник перехвата отключился: отчёты больше не приходят.",
+            );
+        }
+        true
+    }
     fn attached(&self) -> bool {
         self.seen
             .is_some_and(|seen| seen.elapsed() < DIVERT_TIMEOUT)
@@ -892,7 +912,9 @@ impl Service {
                 let report: DivertReport =
                     serde_json::from_value(payload).context("Некорректный отчёт перехвата.")?;
                 ensure!(
-                    report.error.chars().count() <= 400 && report.logs.len() <= 1000,
+                    report.error.chars().count() <= 400
+                        && report.logs.len() <= 1000
+                        && report.events.len() <= crate::journal::MAX_PANICS,
                     "Отчёт перехвата превышает допустимый размер."
                 );
                 if report.version != env!("CARGO_PKG_VERSION") {
@@ -900,12 +922,21 @@ impl Service {
                 }
                 let divert = &mut owned.divert;
                 if !report.error.is_empty() {
+                    if divert.error != report.error {
+                        let text = format!("Помощник перехвата: {}", report.error);
+                        crate::journal::write(crate::journal::Level::Error, &text);
+                    }
                     divert.error = report.error;
                     divert.seen = None;
                     return Ok(json!({"rules": []}));
                 }
                 divert.error.clear();
                 divert.seen = Some(Instant::now());
+                divert.journal_presence();
+                for event in &report.events {
+                    let text = format!("Помощник перехвата: {event}");
+                    crate::journal::write(crate::journal::Level::Error, &text);
+                }
                 divert.stats = report.stats;
                 divert.udp = report.udp;
                 for (rule, line) in report.logs {
@@ -1029,7 +1060,15 @@ impl Service {
                     Err(error) if error.is::<crate::quality::Refusal>() => {
                         json!({"ok":false,"error":error.to_string()})
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        // The reason stays in the owner-only journal; values are hidden there too.
+                        crate::journal::write(
+                            crate::journal::Level::Warn,
+                            &crate::journal::hide_values(&format!(
+                                "Команда «{}» не выполнена: {error:#}",
+                                request.command.chars().take(40).collect::<String>()
+                            )),
+                        );
                         json!({"ok":false,"error":"Не удалось выполнить команду. Проверьте данные и обновите состояние КРОТ."})
                     }
                 };
@@ -1058,6 +1097,7 @@ impl Service {
 pub async fn serve(store: Store) -> Result<()> {
     let guard = crate::update::startup_guard().await?;
     let _lease: File = store.lock()?;
+    crate::journal::started("Фоновый процесс");
     let config = store.load()?;
     // Broken application rules must not keep the tunnels from starting.
     let apps = crate::apps::load(&store).unwrap_or_default();
@@ -1132,6 +1172,7 @@ pub async fn serve(store: Store) -> Result<()> {
                 crate::tray::Action::Open => {
                     if crate::app::open_desktop(&store).await.is_err() {
                         eprintln!("КРОТ: не удалось открыть окно из трея.");
+                        crate::journal::write(crate::journal::Level::Warn, "Не удалось открыть окно из трея.");
                     }
                 }
                 crate::tray::Action::Stop => { service.shutdown.cancel(); break; }
@@ -1139,6 +1180,7 @@ pub async fn serve(store: Store) -> Result<()> {
             _ = tray_poll.tick() => {
                 // Keep the previous icon while a command holds the state.
                 if let Ok(mut owned) = service.owned.try_lock() {
+                    owned.divert.journal_presence();
                     let (states, waiting) = owned.manager.states().await;
                     tray.update(crate::tray::Status::count(&owned.config.tunnels, &states, &waiting));
                     if owned.divert.attached() {
@@ -1644,6 +1686,7 @@ mod startup_tests {
             "version": version,
             "stats": {"rule": {"connections": 2, "total": 9, "sent": 10, "received": 20}},
             "logs": [["rule", "10:00:00 10.0.0.1:443 через туннель"], ["gone", "x"]],
+            "events": ["Паника: panicked at src/x.rs:1:1: boom"],
         });
         let reply = service.execute("divert_sync", report).await.unwrap();
         // The tunnel is not running, so the application is cut off rather than proxied.
@@ -1659,9 +1702,21 @@ mod startup_tests {
         assert_eq!(runtime.state, "blocked");
         assert_eq!((runtime.connections, runtime.total), (2, 9));
         assert_eq!(runtime.logs, ["10:00:00 10.0.0.1:443 через туннель"]);
+        // The report recorded the attach; the journal records the next change only.
+        assert!(service.owned.lock().await.divert.journaled);
+        assert!(!service.owned.lock().await.divert.journal_presence());
 
         // A helper that stopped reporting no longer counts as intercepting.
         service.owned.lock().await.divert.seen = Instant::now().checked_sub(DIVERT_TIMEOUT * 2);
+        {
+            // A killed helper says nothing: the background records that its reports stopped.
+            let divert = &mut service.owned.lock().await.divert;
+            assert!(divert.journal_presence() && !divert.journaled);
+            assert!(!divert.journal_presence());
+        }
+        let too_many =
+            json!({"version": version, "events": vec!["x"; crate::journal::MAX_PANICS + 1]});
+        assert!(service.execute("divert_sync", too_many).await.is_err());
         let state = snapshot(&service).await;
         assert!(!state.divert_attached);
         assert_eq!(state.app_runtimes["rule"].connections, 0);

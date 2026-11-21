@@ -109,13 +109,21 @@ impl Tray {
                     #[cfg(windows)]
                     worker_hwnd,
                 );
-                if result.is_err() {
+                if let Err(error) = result {
                     eprintln!("КРОТ: системный трей недоступен; туннели продолжают работать.");
+                    crate::journal::write(
+                        crate::journal::Level::Warn,
+                        &format!("Системный трей недоступен: {error:#}"),
+                    );
                 }
                 let _ = done.send(());
             });
         if spawned.is_err() {
             eprintln!("КРОТ: не удалось создать поток системного трея.");
+            crate::journal::write(
+                crate::journal::Level::Warn,
+                "Не удалось создать поток системного трея.",
+            );
         }
         (
             Self {

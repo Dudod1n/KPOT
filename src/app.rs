@@ -8,7 +8,7 @@ use crate::{
     autostart,
     background::{self, Client},
     config::{Store, default_config_path},
-    desktop, launcher,
+    desktop, journal, launcher,
 };
 
 #[derive(Parser)]
@@ -73,6 +73,8 @@ enum Command {
         #[arg(long)]
         tunnel: Option<String>,
     },
+    /// Показать путь файла журнала фонового процесса и помощника перехвата
+    Diagnostics,
     /// Измерить скорость или стабильность работающего туннеля
     Test {
         /// ID или имя туннеля
@@ -163,8 +165,30 @@ pub fn run() -> Result<()> {
             }
             Some(Command::Check) => { let config = store.load()?; println!("Конфигурация корректна. Туннелей: {}. SSH не запускается.",config.tunnels.len()); Ok(()) }
             Some(Command::Path) => { println!("{}",store.path.display()); Ok(()) }
-            Some(Command::Serve) => runtime.block_on(background::serve(store)),
+            Some(Command::Serve) => {
+                journal::init(journal::background_path(&store));
+                // The start is recorded by the process once it owns the configuration.
+                let result = runtime.block_on(background::serve(store));
+                journal::finished("Фоновый процесс", &result);
+                result
+            }
+            // The elevated helper writes no file: its events reach the background journal.
             Some(Command::Divert { remember }) => crate::divert::run(store, remember),
+            Some(Command::Diagnostics) => {
+                let path = journal::background_path(&store);
+                println!("Журнал фонового процесса и помощника перехвата: {}", path.display());
+                for part in [path.clone(), journal::rotated_path(&path)] {
+                    match std::fs::metadata(&part) {
+                        Ok(metadata) => println!("  {} — {} КиБ", part.display(), metadata.len().div_ceil(1024)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if part == path { println!("  ещё не создан"); }
+                        }
+                        Err(error) => println!("  {}: {error}", part.display()),
+                    }
+                }
+                println!("Пароли, парольные фразы и ключи в журнал не записываются, а имена и адреса серверов и ID туннелей записываются: удалите их перед публикацией, если они личные.");
+                Ok(())
+            }
             Some(Command::Elevation { action }) => {
                 use crate::tasks::{Kind, registered, remembering, set_remembering};
                 #[cfg(not(windows))]
