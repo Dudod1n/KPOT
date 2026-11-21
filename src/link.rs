@@ -374,6 +374,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
 pub struct Link {
     counters: Arc<Counters>,
     meter: Mutex<Meter>,
+    /// The current session for the speed and stability tests.
+    gate: crate::quality::Gate,
 }
 
 impl Default for Link {
@@ -391,7 +393,11 @@ impl Link {
         Self {
             counters: Arc::default(),
             meter: Mutex::new(Meter::new(Instant::now(), wall)),
+            gate: crate::quality::Gate::default(),
         }
+    }
+    pub fn gate(&self) -> &crate::quality::Gate {
+        &self.gate
     }
     pub fn counters(&self) -> Arc<Counters> {
         self.counters.clone()

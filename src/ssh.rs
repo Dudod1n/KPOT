@@ -315,6 +315,10 @@ impl Manager {
             .map(|(id, link)| (id, link.stats()))
             .collect()
     }
+    /// The measurement of a started tunnel, which also leads to its session for tests.
+    pub async fn link(&self, id: &str) -> Option<Arc<crate::link::Link>> {
+        self.0.state.lock().await.links.get(id).cloned()
+    }
     fn announce(&self, notice: UdpNotice) {
         if let Some(sink) = self.0.udp_sink.lock().unwrap().as_ref() {
             let _ = sink.send(notice);
@@ -883,6 +887,13 @@ impl Manager {
                 })
                 .await;
             });
+        }
+        {
+            // Tests run among the forwardings and stop with them, before the session is closed.
+            let (link, connection) = (link.clone(), connection.clone());
+            attempt
+                .copies
+                .spawn(async move { link.gate().serve(connection).await });
         }
         let counters = link.counters();
         let mut check = tokio::time::interval(Duration::from_millis(100));

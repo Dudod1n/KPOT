@@ -100,6 +100,9 @@ pub struct Snapshot {
     /// Delay, losses, reconnects and traffic of each started tunnel's SSH session.
     #[serde(default)]
     pub links: HashMap<String, crate::link::LinkStats>,
+    /// The last speed or stability test of each tunnel, by tunnel.
+    #[serde(default)]
+    pub tests: HashMap<String, crate::quality::TestStatus>,
 }
 
 const DIVERT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -602,6 +605,7 @@ struct Service {
     shutdown: CancellationToken,
     closed: CancellationToken,
     activation: AtomicU64,
+    tests: crate::quality::Tests,
 }
 
 impl Service {
@@ -675,6 +679,7 @@ impl Service {
                     udp_runtimes,
                     udp_metrics,
                     links: owned.manager.link_snapshot().await,
+                    tests: self.tests.snapshot(),
                     apps: owned.apps.rules.clone(),
                     app_runtimes,
                     apps_unavailable: unavailable.into(),
@@ -969,6 +974,9 @@ impl Service {
                 owned.manager.answer(&id, value).await?;
                 Ok(Value::Null)
             }
+            "test_start" | "test_status" | "test_cancel" => {
+                self.tests.execute(&owned.manager, command, payload).await
+            }
             "shutdown" if payload.is_null() => {
                 self.shutdown.cancel();
                 Ok(Value::Null)
@@ -1017,6 +1025,9 @@ impl Service {
                     Ok(value) => json!({"ok":true,"value":value}),
                     Err(error) if error.is::<StaleConfig>() => {
                         json!({"ok":false,"error":CONFIG_CHANGED})
+                    }
+                    Err(error) if error.is::<crate::quality::Refusal>() => {
+                        json!({"ok":false,"error":error.to_string()})
                     }
                     Err(_) => {
                         json!({"ok":false,"error":"Не удалось выполнить команду. Проверьте данные и обновите состояние КРОТ."})
@@ -1075,6 +1086,7 @@ pub async fn serve(store: Store) -> Result<()> {
         shutdown: CancellationToken::new(),
         closed: CancellationToken::new(),
         activation: AtomicU64::new(0),
+        tests: crate::quality::Tests::new(Some(store.sidecar(".tests.json"))),
     });
     // SIGTERM closes tunnels like Ctrl+C; registered before the address is published.
     #[cfg(unix)]
@@ -1507,6 +1519,7 @@ mod startup_tests {
             shutdown: CancellationToken::new(),
             closed: CancellationToken::new(),
             activation: AtomicU64::new(0),
+            tests: crate::quality::Tests::new(None),
         };
         let rule = AppRule {
             id: "rule".into(),
@@ -1610,6 +1623,7 @@ mod startup_tests {
             shutdown: CancellationToken::new(),
             closed: CancellationToken::new(),
             activation: AtomicU64::new(0),
+            tests: crate::quality::Tests::new(None),
         };
         async fn snapshot(service: &Service) -> Snapshot {
             serde_json::from_value(service.execute("snapshot", Value::Null).await.unwrap()).unwrap()
