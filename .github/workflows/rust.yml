@@ -115,7 +115,7 @@ jobs:
         shell: bash
         run: |
           dir=$(cargo test --locked --lib --no-run --message-format=json \
-            | python -c "import sys, json, os; print(next(os.path.dirname(m['executable']) for m in map(json.loads, sys.stdin) if m.get('executable')))")
+            | python -X utf8 -c "import sys, json, os; print(next(os.path.dirname(m['executable']) for m in map(json.loads, sys.stdin) if m.get('executable')))")
           echo "test binary directory: $dir"
           python scripts/fetch_windivert.py --output "$dir"
           cargo test --locked --lib windivert_captures -- --ignored --nocapture

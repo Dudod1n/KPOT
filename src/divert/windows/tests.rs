@@ -138,10 +138,11 @@ fn driver_report(text: &str) {
 /// The real driver captures an application's outbound datagram. Runs with `--ignored` where
 /// WinDivert.dll and WinDivert64.sys lie next to the test binary and the process is an
 /// administrator, as on the CI Windows runner. Only datagrams to TEST-NET-1 are diverted, and
-/// they never leave. A datagram larger than the MTU is reported, not checked: whether it is
-/// captured whole or in fragments depends on the network adapter.
+/// they never leave. The handle has the highest priority, so a running KROT, whose filter also
+/// matches, does not take them first. A datagram larger than the MTU is reported, not checked:
+/// whether it is captured whole or in fragments depends on the network adapter.
 #[test]
-#[ignore]
+#[ignore = "administrator, WinDivert files next to the test binary: cargo test --lib windivert_captures -- --ignored"]
 fn windivert_captures_outbound_udp() {
     use super::{Address, load};
     const TARGET: [u8; 4] = [192, 0, 2, 1];
@@ -151,8 +152,9 @@ fn windivert_captures_outbound_udp() {
         "outbound and ip.DstAddr == {}.{}.{}.{}\0",
         TARGET[0], TARGET[1], TARGET[2], TARGET[3]
     );
+    const HIGHEST_PRIORITY: i16 = 30000;
     // SAFETY: the filter is NUL-terminated; layer 0 is the network layer, no flags.
-    let device = unsafe { (api.open)(filter.as_ptr(), 0, 0, 0) };
+    let device = unsafe { (api.open)(filter.as_ptr(), 0, HIGHEST_PRIORITY, 0) };
     if device == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
         // SAFETY: reads the calling thread's last error code.
         let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -178,7 +180,14 @@ fn windivert_captures_outbound_udp() {
                     &mut address,
                 )
             };
-            if received == 0 || sender.send(buffer[..length as usize].to_vec()).is_err() {
+            let packet = if received == 0 {
+                // SAFETY: reads the calling thread's last error code.
+                Err(unsafe { windows_sys::Win32::Foundation::GetLastError() })
+            } else {
+                Ok(buffer[..length as usize].to_vec())
+            };
+            let failed = packet.is_err();
+            if sender.send(packet).is_err() || failed {
                 return;
             }
         }
@@ -189,7 +198,8 @@ fn windivert_captures_outbound_udp() {
         .unwrap();
     let packet = receiver
         .recv_timeout(Duration::from_secs(5))
-        .expect("the datagram was not captured");
+        .expect("the datagram was not captured")
+        .unwrap_or_else(|code| panic!("WinDivertRecv failed with error {code}"));
     let header = usize::from(packet[0] & 0x0f) * 4;
     assert_eq!(packet[0] >> 4, 4, "IPv4");
     assert_eq!(packet[9], 17, "UDP");
@@ -204,7 +214,10 @@ fn windivert_captures_outbound_udp() {
     socket
         .send_to(&[7u8; 4000], (std::net::Ipv4Addr::from(TARGET), PORT))
         .unwrap();
+    let mut captured = 0;
     while let Ok(packet) = receiver.recv_timeout(Duration::from_secs(2)) {
+        let packet = packet.unwrap_or_else(|code| panic!("WinDivertRecv failed with error {code}"));
+        captured += 1;
         let field = u16::from_be_bytes([packet[6], packet[7]]);
         driver_report(&format!(
             "a 4000-byte datagram: captured {} bytes, fragment offset {}, more fragments {}",
@@ -213,4 +226,7 @@ fn windivert_captures_outbound_udp() {
             field & 0x2000 != 0
         ));
     }
+    driver_report(&format!(
+        "a 4000-byte datagram: {captured} packets captured"
+    ));
 }
