@@ -513,6 +513,22 @@ enum Banner {
     Missing(&'static str),
 }
 
+/// The server's identification line as safe text: RFC 4253 allows only printable US-ASCII,
+/// and anything else, such as a terminal escape sequence, is shown as `\xNN` rather than
+/// written to the user's terminal.
+pub(super) fn printable_banner(line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut text = String::with_capacity(line.len());
+    for &byte in line {
+        if (0x20..=0x7e).contains(&byte) {
+            text.push(char::from(byte));
+        } else {
+            text.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    text.trim_end().to_string()
+}
+
 /// Reads up to the server's `SSH-` line; lines before it are allowed by RFC 4253.
 async fn read_banner(stream: &mut TcpStream) -> Banner {
     let mut consumed = Vec::new();
@@ -522,7 +538,7 @@ async fn read_banner(stream: &mut TcpStream) -> Banner {
         while let Some(end) = consumed[start..].iter().position(|&b| b == b'\n') {
             let line = &consumed[start..start + end];
             if line.starts_with(b"SSH-") {
-                let text = String::from_utf8_lossy(line).trim_end().to_string();
+                let text = printable_banner(line);
                 let after = consumed.len() - (start + end + 1);
                 return Banner::Found {
                     consumed,
@@ -813,6 +829,22 @@ mod tests {
         let kex =
             shake(serve_once(b"SSH-2.0-Test\r\n\x00\x00\x00\x0c\x0a\x14garbage!!!").await).await;
         assert_eq!(kex.outcome, Outcome::KexFailed);
+    }
+
+    #[test]
+    fn banners_keep_printable_ascii_and_show_the_rest_escaped() {
+        assert_eq!(
+            printable_banner(b"SSH-2.0-OpenSSH_9.6 Ubuntu\r"),
+            "SSH-2.0-OpenSSH_9.6 Ubuntu"
+        );
+        assert_eq!(
+            printable_banner(b"SSH-2.0-x\x1b]0;title\x07"),
+            "SSH-2.0-x\\x1b]0;title\\x07"
+        );
+        assert_eq!(
+            printable_banner("SSH-2.0-ё".as_bytes()),
+            "SSH-2.0-\\xd1\\x91"
+        );
     }
 
     #[test]
