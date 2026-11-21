@@ -161,8 +161,11 @@ impl Desktop {
         let directory = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+        // The installer brings the driver files; nothing is written into its directory.
         let missing = match &directory {
-            Some(directory) if cfg!(windows) => crate::divert::missing_components(directory),
+            Some(directory) if cfg!(windows) && !crate::service::installed() => {
+                crate::divert::missing_components(directory)
+            }
             _ => Vec::new(),
         };
         let (Some(directory), false) = (directory, missing.is_empty()) else {
@@ -355,10 +358,15 @@ impl Desktop {
                     if !unavailable.is_empty() {
                         ui.colored_label(pal.warn, &unavailable);
                     }
+                    let installed = crate::service::installed();
                     if detached {
                         ui.colored_label(
                             pal.warn,
-                            "Перехват не запущен: приложения ходят в сеть напрямую. Для перехвата нужны права администратора.",
+                            if installed {
+                                "Перехват не запущен: приложения ходят в сеть напрямую. Перехват выполняет служба КРОТа."
+                            } else {
+                                "Перехват не запущен: приложения ходят в сеть напрямую. Для перехвата нужны права администратора."
+                            },
                         );
                         if !failure.is_empty() {
                             ui.colored_label(pal.error, &failure);
@@ -368,13 +376,21 @@ impl Desktop {
                                 ui.spinner();
                                 ui.label("Скачиваем файлы WinDivert…");
                             });
-                        } else if ui.add(style::primary("Предоставить права…", pal)).clicked() {
+                        } else if ui
+                            .add(style::primary(
+                                if installed { "Запустить перехват" } else { "Предоставить права…" },
+                                pal,
+                            ))
+                            .clicked()
+                        {
                             self.grant_divert(ctx);
                         }
-                        ui.label(
-                            RichText::new("Если файлов WinDivert нет рядом с КРОТом, они будут скачаны из его релиза на GitHub.")
-                                .color(pal.dim),
-                        );
+                        if !installed {
+                            ui.label(
+                                RichText::new("Если файлов WinDivert нет рядом с КРОТом, они будут скачаны из его релиза на GitHub.")
+                                    .color(pal.dim),
+                            );
+                        }
                     }
                 });
             ui.add_space(12.0);

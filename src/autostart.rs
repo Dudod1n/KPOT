@@ -587,11 +587,42 @@ pub fn migrate(path: &Path) {
         else {
             return;
         };
-        let owned = registry::value(&name)
-            .ok()
-            .flatten()
-            .is_some_and(|value| windows_owned(&value, &path));
-        if !owned || refused.exists() || crate::tasks::elevated() {
+        let value = registry::value(&name).ok().flatten();
+        let owned = value
+            .as_ref()
+            .is_some_and(|value| windows_owned(value, &path));
+        let elevated = crate::tasks::elevated();
+        // After installation autostart moves from a portable copy to the installed one.
+        if crate::service::installed() {
+            use crate::tasks::{Kind, copies, register, unregister_others, unregister_own};
+            // Only another copy's task moves: a task of this copy that the user turned off
+            // stays off. A task that cannot be moved is not retried at every start.
+            if !owned
+                && !elevated
+                && !refused.exists()
+                && copies(&path, Kind::Logon).is_ok_and(|(own, others)| !own && others)
+            {
+                // `register` removes the other copy's task where Windows lets it.
+                let registered = register(&path, Kind::Logon).is_ok();
+                if !registered || unregister_others(&path, Kind::Logon, false).is_err() {
+                    // Two tasks would start КРОТ twice at logon: the other copy's one stays.
+                    if registered {
+                        let _ = unregister_own(&path, Kind::Logon);
+                    }
+                    let _ = std::fs::write(&refused, b"");
+                }
+                return;
+            }
+            if owned
+                && (refused.exists() || elevated)
+                && let Ok(command) = launch_command(&path).map(|command| windows_command(&command))
+                && value.as_ref().is_some_and(|value| value.0 != command)
+            {
+                let _ = registry::set(&name, Some(&command));
+                return;
+            }
+        }
+        if !owned || refused.exists() || elevated {
             return;
         }
         if crate::tasks::register(&path, crate::tasks::Kind::Logon).is_ok() {

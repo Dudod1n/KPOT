@@ -38,7 +38,8 @@ def package(tag, builds, output, notes_path):
         source = builds / f'krot-rust-{runner}-X64'
         for path in [source / ('krot' + suffix), source / ('krot-cli' + suffix),
                      source / 'THIRD_PARTY_NOTICES.txt', *common,
-                     *(source / name for name in windivert if platform == 'windows')]:
+                     *(source / name for name in windivert if platform == 'windows'),
+                     *([source / f'krot-{version}-windows-x64.msi'] if platform == 'windows' else [])]:
             if not path.is_file() or not path.stat().st_size:
                 raise ValueError(f'Missing release input: {path}')
     output.mkdir(parents=True)
@@ -66,6 +67,10 @@ def package(tag, builds, output, notes_path):
         files = [*binaries, (notices, 'THIRD_PARTY_NOTICES.txt'),
                  *((path, path.name) for path in common)]
         if platform == 'windows':
+            # The installer: Program Files, the interception service, Start menu and removal.
+            # The installed copy updates from it, by this exact name.
+            installer = f'krot-{version}-windows-x64.msi'
+            shutil.copy2(source / installer, output / installer)
             # Also published on their own: a copy updated from an older version downloads them.
             for name in windivert:
                 shutil.copy2(source / name, output / name)
@@ -73,7 +78,8 @@ def package(tag, builds, output, notes_path):
             with zipfile.ZipFile(output / f'krot-{version}-windows-x64.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
                 for path, name in files:
                     archive.write(path, name)
-                archive.writestr('README.txt', readme)
+                archive.writestr('README.txt', 'Это переносная копия: для установки в Windows '
+                                 f'используйте {installer}.\n' + readme)
         else:
             import io
             with tarfile.open(output / f'krot-{version}-linux-x64.tar.gz', 'w:gz') as archive:

@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod proxy;
 pub mod quality;
 pub mod relay;
+pub mod service;
 pub mod ssh;
 pub mod tasks;
 pub mod tray;
