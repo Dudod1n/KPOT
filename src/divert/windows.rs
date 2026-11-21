@@ -926,7 +926,19 @@ async fn serve(store: Store) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run(store: Store) -> Result<()> {
+/// Registration of the remembered task, which the helper finishes before it exits: a consent
+/// is remembered even when another helper already serves the configuration.
+pub(super) struct Registration(pub(super) Option<std::thread::JoinHandle<()>>);
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(super) fn run(store: Store, registration: Registration) -> Result<()> {
     // One helper per configuration: two would fight over the same packets.
     let _lease = Store::new(store.sidecar(".divert"))?.lock()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -934,6 +946,8 @@ pub(super) fn run(store: Store) -> Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(serve(store));
+    // `exit` runs no destructors.
+    drop(registration);
     // The packet thread blocks in the driver; ending the process closes its handle.
     std::process::exit(if result.is_ok() { 0 } else { 1 })
 }

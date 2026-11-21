@@ -166,14 +166,21 @@ pub fn run() -> Result<()> {
                         // The task goes first: if Windows refuses to delete it, remembering stays
                         // on and the status keeps telling that the task still gives the rights.
                         #[cfg(windows)]
-                        crate::tasks::unregister(&store.path, Kind::Divert)?;
+                        // A Task Scheduler that cannot be read has no task to remove.
+                        if let Err(error) = crate::tasks::unregister(&store.path, Kind::Divert, true)
+                            && registered(&store.path, Kind::Divert, true).unwrap_or(false)
+                        {
+                            return Err(error);
+                        }
                         set_remembering(&store.path, false)?;
                     }
                     _ => {}
                 }
-                let enabled = remembering(&store.path) && registered(&store.path, Kind::Divert, false)?;
+                // A Task Scheduler that cannot be read gives no rights either: the status is
+                // "off", not a failure of the command.
+                let enabled = remembering(&store.path) && registered(&store.path, Kind::Divert, false).unwrap_or(false);
                 println!("Перехват без запроса прав: {}.", if enabled {"включён"} else {"выключен"});
-                if !enabled && registered(&store.path, Kind::Divert, true)? {
+                if !enabled && registered(&store.path, Kind::Divert, true).unwrap_or(false) {
                     println!("Задание планировщика с правами администратора осталось. Удалите его: krot-cli elevation disable.");
                 }
                 Ok(())
