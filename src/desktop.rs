@@ -20,6 +20,7 @@ mod apps_view;
 #[cfg(test)]
 mod screenshots;
 mod style;
+mod test_view;
 use apps_view::{AppForm, app_form_view};
 use style::Pal;
 
@@ -353,6 +354,8 @@ enum Operation {
     SaveApp(String),
     /// A UDP choice for a tunnel or a rule.
     Udp,
+    /// Start or cancel a speed or stability test.
+    Test,
     Settings,
     Answer,
     Shutdown,
@@ -2197,6 +2200,8 @@ impl Desktop {
             ui.add_space(12.0);
             self.tunnel_udp(ui, ctx, tunnel, pal);
         }
+        ui.add_space(12.0);
+        self.tunnel_test(ui, ctx, tunnel, state == "running", pal);
     }
     /// UDP through the server relay: its state, its numbers and the switch.
     fn tunnel_udp(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tunnel: &Tunnel, pal: &Pal) {
@@ -6546,5 +6551,55 @@ mod tests {
                 .len(),
             2
         );
+    }
+    #[test]
+    fn a_running_tunnel_offers_tests_and_shows_their_progress_and_result() {
+        use crate::quality::{Kind, TestReport, TestStatus};
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.initialized = true;
+        app.snapshot = Some(snapshot());
+        app.selected = Some("native-tunnel".into());
+        let output = render(&mut app, &ctx, [1000.0, 900.0]);
+        assert!(text_rect(&output, "Тест скорости").is_some());
+        assert!(text_rect(&output, "Стабильность 30 мин").is_some());
+        assert!(text_rect(&output, "Отменить тест").is_none());
+
+        let mut running = snapshot();
+        let status = TestStatus {
+            id: "test".into(),
+            state: "running".into(),
+            phase: "Скачивание: 1,0 МБ".into(),
+            elapsed_s: 4,
+            report: TestReport {
+                kind: Kind::Speed,
+                down_bps: Some(42_000_000),
+                down_bytes: 50 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        running.tests.insert("native-tunnel".into(), status.clone());
+        app.snapshot = Some(running);
+        let output = render(&mut app, &ctx, [1000.0, 900.0]);
+        assert!(text_rect(&output, "Тест связи: идёт").is_some());
+        assert!(text_rect(&output, "Тест скорости · Скачивание: 1,0 МБ · прошло 4 с").is_some());
+        assert!(text_rect(&output, "Отменить тест").is_some());
+        assert!(text_rect(&output, "Тест скорости").is_none());
+
+        let mut done = snapshot();
+        done.tests.insert(
+            "native-tunnel".into(),
+            TestStatus {
+                state: "done".into(),
+                ..status
+            },
+        );
+        app.snapshot = Some(done);
+        let output = render(&mut app, &ctx, [1000.0, 900.0]);
+        assert!(text_rect(&output, "Тест связи: завершён").is_some());
+        assert!(text_rect(&output, "Скачивание 42,0 Мбит/с (50,0 МБ).").is_some());
+        assert!(text_rect(&output, "Тест скорости").is_some());
     }
 }

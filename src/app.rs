@@ -75,6 +75,20 @@ enum Command {
     },
     /// Показать путь файла журнала фонового процесса и помощника перехвата
     Diagnostics,
+    /// Измерить скорость или стабильность работающего туннеля
+    Test {
+        /// ID или имя туннеля
+        tunnel: String,
+        /// Тест стабильности заданной длительности вместо теста скорости: 10m, 30m, 1h
+        #[arg(long, value_name = "ВРЕМЯ")]
+        stability: Option<String>,
+        /// Лимит объёма в каждую сторону, МБ (по умолчанию 100)
+        #[arg(long, value_name = "МБ")]
+        limit: Option<u64>,
+        /// Отчёт в JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Остановить фон и все туннели, сохранив выбор для следующего запуска
     Stop,
     /// Автозапуск после входа в учётную запись
@@ -239,6 +253,9 @@ pub fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&crate::udp::report::metrics(&snapshot, tunnel.as_deref()))?);
                 Ok(())
             }),
+            Some(Command::Test { tunnel, stability, limit, json }) => {
+                runtime.block_on(crate::quality::cli::run(&store, &tunnel, stability, limit, json))
+            }
             Some(command @ (Command::Background | Command::Status | Command::Stop)) => runtime.block_on(async {
                 if !matches!(command,Command::Background) && !store.sidecar(".background.json").exists() { println!("Фоновый КРОТ не запущен."); return Ok(()); }
                 let client = if matches!(command,Command::Background) { background::ensure_running(&store).await? } else { Client::new(&store) };

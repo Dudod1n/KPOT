@@ -386,6 +386,138 @@ class RustIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn('не разрешает выполнять команды', runtime['message'])
         await self.exchange(tunnel.port, socks=True)
 
+    async def cli_long(self, *args, timeout=90):
+        proc = await asyncio.create_subprocess_exec(
+            str(BINARY), '--config', str(self.store.path), *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        return proc.returncode, out.decode('utf-8'), err.decode('utf-8')
+
+    async def finished_test(self, test, timeout=60):
+        async with asyncio.timeout(timeout):
+            while True:
+                status = await self.request('test_status', {'id': test})
+                if status['state'] != 'running':
+                    return status
+                await asyncio.sleep(.1)
+
+    async def tunnel_unharmed(self, tunnel):
+        """The tunnel still forwards over its first session."""
+        await self.exchange(tunnel.port)
+        snapshot = await self.request('snapshot')
+        self.assertEqual(snapshot['runtimes'][tunnel.id]['state'], 'running')
+        self.assertEqual(snapshot['links'][tunnel.id]['reconnects'], 0)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell on the server')
+    async def test_speed_test_measures_the_tunnels_session_within_its_limit(self):
+        home = self.path / 'home'
+        home.mkdir()
+        server = await self.server(shell_home=home)
+        tunnel = self.tunnel(server)
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        code, out, err = await self.cli_long('test', tunnel.id, '--limit', '1', '--json')
+        self.assertEqual(code, 0, err)
+        self.assertIn('делит канал с трафиком приложений', err)
+        report = json.loads(out)
+        self.assertEqual((report['kind'], report['tunnel']), ('speed', tunnel.id))
+        self.assertEqual((report['down_bytes'], report['up_bytes']), (1 << 20, 1 << 20))
+        self.assertGreater(report['down_bps'], 0)
+        self.assertGreater(report['up_bps'], 0)
+        self.assertEqual(report['idle_rtt']['count'], 10)
+        self.assertEqual((report['skipped'], report['notes']), ([], []))
+        self.assertTrue([c for c, _ in self.commands if 'head -c' in c and c.endswith(' 1048576')])
+        await self.tunnel_unharmed(tunnel)
+        code, out, err = await self.cli_long('test', tunnel.name, '--limit', '1')
+        self.assertEqual(code, 0, err)
+        self.assertIn('Тест скорости туннеля «test»', out)
+        self.assertIn('Скачивание', out)
+        history = json.loads(Path(f'{self.store.path}.tests.json').read_text(encoding='utf-8'))
+        self.assertEqual([t['state'] for t in history['tests']], ['done', 'done'])
+        # The snapshot carries the last test of the tunnel for the window.
+        self.assertEqual((await self.request('snapshot'))['tests'][tunnel.id]['state'], 'done')
+
+    async def test_speed_test_without_commands_on_the_server_measures_the_delay(self):
+        server = await self.server()
+        tunnel = self.tunnel(server)
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+        code, out, err = await self.cli_long('test', tunnel.id, '--json')
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        self.assertEqual(report['idle_rtt']['count'], 10)
+        self.assertIsNone(report['down_bps'])
+        self.assertIn('не разрешает выполнять команды', report['skipped'][0])
+        await self.tunnel_unharmed(tunnel)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell on the server')
+    async def test_a_failed_or_cancelled_test_channel_leaves_the_tunnel(self):
+        home = self.path / 'home'
+        home.mkdir()
+        server = await self.server(shell_home=home)
+        tunnel = self.tunnel(server)
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        await self.wait(tunnel)
+
+        async def downloading():
+            async with asyncio.timeout(20):
+                while True:
+                    running = [p for c, p in self.commands if 'urandom' in c and p.returncode is None]
+                    if running:
+                        return running[0]
+                    await asyncio.sleep(.05)
+
+        # The server ends the download: the step ends, the tunnel and its session stay.
+        test = (await self.request('test_start', {'id': tunnel.id, 'kind': 'speed', 'limit_mb': 10000}))['id']
+        with self.assertRaisesRegex(ValueError, 'уже идёт'):
+            await self.request('test_start', {'id': tunnel.id, 'kind': 'speed'})
+        kill_group(await downloading())
+        status = await self.finished_test(test)
+        self.assertEqual(status['state'], 'done', status)
+        self.assertTrue(status['report']['notes'][0].startswith('Скачивание остановилось'), status)
+        self.assertLess(status['report']['down_bytes'], 10000 << 20)
+        await self.tunnel_unharmed(tunnel)
+
+        # A cancelled test closes its channel; the server's command ends.
+        self.commands.clear()
+        test = (await self.request('test_start', {'id': tunnel.id, 'kind': 'speed', 'limit_mb': 10000}))['id']
+        process = await downloading()
+        await self.request('test_cancel', {'id': test})
+        status = await self.finished_test(test)
+        self.assertEqual(status['state'], 'cancelled')
+        await asyncio.wait_for(process.wait(), 10)
+        await self.tunnel_unharmed(tunnel)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'needs a Linux shell on the server')
+    async def test_stability_test_goes_on_after_a_reconnect(self):
+        home = self.path / 'home'
+        home.mkdir()
+        server = await self.server(shell_home=home)
+        tunnel = self.tunnel(server)
+        tunnel.reconnect = True
+        await self.start(Config(tunnels=[tunnel]))
+        await self.request('start', tunnel.id)
+        first = await self.wait(tunnel)
+        run = asyncio.create_task(self.cli_long('test', tunnel.id, '--stability', '20s', '--json'))
+        await asyncio.sleep(6)
+        for connection in list(self.connections):
+            connection.abort()
+        code, out, err = await run
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        self.assertEqual(report['kind'], 'stability')
+        self.assertEqual(report['reconnects'], 1, report)
+        self.assertEqual([e['kind'] for e in report['events']], ['disconnected', 'reconnected'])
+        self.assertEqual(len(report['samples']), 1)
+        self.assertEqual(report['down_bytes'], 256 * 1024)
+        self.assertGreater(report['ping_sent'], 4)
+        status = (await self.request('snapshot'))['runtimes'][tunnel.id]
+        self.assertEqual(status['state'], 'running')
+        self.assertNotEqual(status['started_at'], first['started_at'])
+
     async def test_cli_checks_without_display_or_writing_configuration(self):
         code, out, err = await self.cli('check')
         self.assertEqual(code, 0, err)
