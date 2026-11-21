@@ -464,16 +464,18 @@ mod system {
         Ok(())
     }
 
-    /// Removes the tasks of every copy; an elevated task may need administrator consent.
-    pub fn unregister(config: &Path, kind: Kind) -> Result<()> {
+    /// Removes the tasks of every copy. A task that an elevated process registered may refuse
+    /// the user's deletion: with `consent` Windows then asks for administrator rights. The
+    /// helper's task is always registered so, a logon task when an older КРОТ ran elevated.
+    pub fn unregister(config: &Path, kind: Kind, consent: bool) -> Result<()> {
         let (prefix, _) = names(config, kind)?;
         for name in listed(&prefix)? {
             if schtasks(&["/delete", "/tn", &name, "/f"])?.status.success() {
                 continue;
             }
             ensure!(
-                kind == Kind::Divert,
-                "Не удалось удалить задание автозапуска {name}."
+                consent,
+                "Не удалось удалить задание планировщика Windows {name}."
             );
             runas(
                 schtasks_path().as_os_str(),
