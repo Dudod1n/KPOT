@@ -2142,6 +2142,16 @@ impl Desktop {
                 ui.colored_label(color, &runtime.message);
             }
         }
+        if let Some(stats) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.links.get(&tunnel.id))
+            .filter(|stats| state == "running" && stats.connected_since.is_some())
+        {
+            for line in crate::link::card_lines(stats) {
+                ui.label(RichText::new(line).monospace().color(pal.dim));
+            }
+        }
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             let action = match state.as_str() {

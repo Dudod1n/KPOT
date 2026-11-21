@@ -137,8 +137,13 @@ fn parse(data: &[u8]) -> Option<Packet> {
                 octets.copy_from_slice(&data[at..at + 16]);
                 IpAddr::V6(Ipv6Addr::from(octets))
             };
-            // Extension headers are left alone: such packets pass unchanged.
-            (data[6], address(8), address(24), 8, 40)
+            // Extension headers are left alone: such packets pass unchanged. The exception is
+            // the first fragment of a UDP datagram, whose ports decide the fate of the rest.
+            let (protocol, transport) = match udp::fragment(data) {
+                Some((_, Some(transport))) => (UDP, transport),
+                _ => (data[6], 40),
+            };
+            (protocol, address(8), address(24), 8, transport)
         }
         _ => return None,
     };
@@ -263,8 +268,8 @@ pub struct Flow {
 #[derive(Default)]
 pub struct Nat {
     flows: HashMap<(IpAddr, u16), Flow>,
-    /// First fragments of captured datagrams that were dropped: their followers go too.
-    fragments: HashMap<(IpAddr, IpAddr, u16), Instant>,
+    /// First fragments of covered datagrams that were dropped: their followers go too.
+    fragments: HashMap<udp::FragmentKey, Instant>,
     /// Rules whose tunnel failed an IPv6 connection, until when their IPv6 is refused.
     ipv6_refused: HashMap<String, Instant>,
 }
@@ -348,13 +353,16 @@ pub fn handle(
     udp: &dyn Fn(&str) -> udp::Policy,
 ) -> Verdict {
     // Later fragments carry no ports: they follow the fate of their first fragment.
-    if let Some((key, false)) = udp::fragment(data) {
-        return if nat.fragments.contains_key(&key) {
-            Verdict::Drop
-        } else {
-            Verdict::Pass
-        };
-    }
+    let first = match udp::fragment(data) {
+        Some((key, None)) => {
+            return if nat.fragments.contains_key(&key) {
+                Verdict::Drop
+            } else {
+                Verdict::Pass
+            };
+        }
+        first => first.map(|(key, _)| key),
+    };
     let Some(packet) = parse(data) else {
         return Verdict::Pass;
     };
@@ -367,23 +375,23 @@ pub fn handle(
         let Some(rule) = owner(UDP, &view) else {
             return Verdict::Pass;
         };
-        return match udp(&rule) {
-            udp::Policy::Direct => Verdict::Pass,
+        let verdict = match udp(&rule) {
+            udp::Policy::Direct => return Verdict::Pass,
             // Without the relay names are resolved by this computer; everything else would
             // bypass the tunnel.
-            udp::Policy::Block if packet.destination_port == DNS_PORT => Verdict::Pass,
+            udp::Policy::Block if packet.destination_port == DNS_PORT => return Verdict::Pass,
             udp::Policy::Block => Verdict::Blocked { rule },
             udp::Policy::Tunnel { quic: false } if packet.destination_port == QUIC_PORT => {
                 Verdict::Quic { rule }
             }
-            udp::Policy::Tunnel { .. } => match udp::fragment(data) {
-                Some((key, true)) => {
-                    nat.fragments.insert(key, now);
-                    Verdict::Fragment { rule }
-                }
-                _ => Verdict::Capture { rule },
-            },
+            udp::Policy::Tunnel { .. } if first.is_some() => Verdict::Fragment { rule },
+            udp::Policy::Tunnel { .. } => return Verdict::Capture { rule },
         };
+        // The datagram is dropped: so is the rest of it, whatever verdict dropped it.
+        if let Some(key) = first {
+            nat.fragments.insert(key, now);
+        }
+        return verdict;
     }
     if packet.source_port == relay_port {
         let key = (packet.destination, packet.destination_port);
@@ -1118,6 +1126,119 @@ mod tests {
             ),
             Verdict::Pass
         );
+    }
+
+    #[test]
+    fn fragmented_datagrams_of_blocked_rules_and_quic_are_dropped_whole() {
+        // IPv4: the fragment field; IPv6: a fragment header after a destination options one.
+        let fragment = |destination: &str, id: u16, more: bool, offset: u16| {
+            let ipv6 = destination.starts_with('[');
+            let source = if ipv6 {
+                "[fd00::5]:50003"
+            } else {
+                "192.168.1.5:50003"
+            };
+            let mut packet = tcp(source, destination, 0);
+            let field =
+                offset << if ipv6 { 3 } else { 0 } | u16::from(more) << if ipv6 { 0 } else { 13 };
+            if ipv6 {
+                packet[6] = 60;
+                let mut headers = vec![44, 0, 0, 0, 0, 0, 0, 0, UDP, 0];
+                headers.extend(field.to_be_bytes());
+                headers.extend(u32::from(id).to_be_bytes());
+                packet.splice(40..40, headers);
+            } else {
+                packet[9] = UDP;
+                packet[4..6].copy_from_slice(&id.to_be_bytes());
+                packet[6..8].copy_from_slice(&field.to_be_bytes());
+            }
+            packet
+        };
+        type Policy = fn(&str) -> udp::Policy;
+        let cases: [(&str, Policy, Verdict); 5] = [
+            (
+                "8.8.8.8:3478",
+                blocked,
+                Verdict::Blocked {
+                    rule: "rule".into(),
+                },
+            ),
+            (
+                "[2001:db8::8]:3478",
+                blocked,
+                Verdict::Blocked {
+                    rule: "rule".into(),
+                },
+            ),
+            (
+                "8.8.8.8:443",
+                tunnel,
+                Verdict::Quic {
+                    rule: "rule".into(),
+                },
+            ),
+            (
+                "[2001:db8::8]:443",
+                tunnel,
+                Verdict::Quic {
+                    rule: "rule".into(),
+                },
+            ),
+            (
+                "[2001:db8::8]:3478",
+                tunnel,
+                Verdict::Fragment {
+                    rule: "rule".into(),
+                },
+            ),
+        ];
+        for (destination, policy, verdict) in cases {
+            let (mut nat, now) = (Nat::default(), Instant::now());
+            let mut send =
+                |packet: &mut Vec<u8>, owner: &mut dyn FnMut(u8, &Origin) -> Option<String>| {
+                    handle(packet, RELAY, &mut nat, now, owner, &policy)
+                };
+            assert_eq!(
+                send(&mut fragment(destination, 900, true, 0), &mut covered),
+                verdict,
+                "{destination}"
+            );
+            for offset in [185, 370] {
+                assert_eq!(
+                    send(
+                        &mut fragment(destination, 900, offset == 185, offset),
+                        &mut covered
+                    ),
+                    Verdict::Drop,
+                    "{destination}"
+                );
+            }
+            // Datagrams of other processes and their followers pass.
+            assert_eq!(
+                send(&mut fragment(destination, 901, true, 0), &mut foreign),
+                Verdict::Pass
+            );
+            assert_eq!(
+                send(&mut fragment(destination, 901, false, 185), &mut covered),
+                Verdict::Pass,
+                "{destination}"
+            );
+        }
+        // Blocked name resolution passes whole.
+        let (mut nat, now) = (Nat::default(), Instant::now());
+        for (more, offset) in [(true, 0), (false, 185)] {
+            assert_eq!(
+                handle(
+                    &mut fragment("8.8.8.8:53", 902, more, offset),
+                    RELAY,
+                    &mut nat,
+                    now,
+                    &mut covered,
+                    &blocked
+                ),
+                Verdict::Pass
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "krot"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 default-run = "krot"
 rust-version = "1.90"
@@ -39,7 +39,7 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_System_LibraryLoader", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_System_LibraryLoader", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "=0.17.2"
@@ -49,6 +49,10 @@ ashpd = { version = "=0.11.1", default-features = false, features = ["tokio", "r
 futures-util = "0.3"
 raw-window-handle = "0.6"
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+# Paused time for tests of timers; adds no crates.
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 sha2 = "0.10"

@@ -1,0 +1,5 @@
+# The Rust version for local builds, CI and releases. Update it in a separate pull request.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
