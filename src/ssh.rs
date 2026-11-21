@@ -1,5 +1,6 @@
 //! Native SSH transport, forwarding, and application-owned connection lifetime.
 use crate::config::{Endpoint, Tunnel, atomic_json, unbracket, validate_tunnel};
+use crate::journal::Level;
 use anyhow::{Result, anyhow, bail};
 use russh::client::{self, ChannelOpenHandle};
 use russh::keys::{self, HashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate};
@@ -271,15 +272,15 @@ impl Manager {
         .flatten()
             == Some(true);
         attempt.cleanup().await;
-        self.log(
-            &tunnel.id,
-            if removed {
-                "UDP: помощник удалён с сервера."
-            } else {
-                "UDP: помощник не удалён с сервера: сервер недоступен или для входа нужен пароль."
-            },
-        )
-        .await;
+        let (level, message) = if removed {
+            (Level::Info, "UDP: помощник удалён с сервера.")
+        } else {
+            (
+                Level::Warn,
+                "UDP: помощник не удалён с сервера: сервер недоступен или для входа нужен пароль.",
+            )
+        };
+        self.log(&tunnel.id, level, message).await;
     }
     /// UDP state of every tunnel that has one, with the metrics of running transports.
     pub async fn udp_snapshot(
@@ -344,7 +345,12 @@ impl Manager {
         if let Some(line) = line
             && let Some(tunnel) = state.runtimes.get_mut(id)
         {
-            push_log(tunnel, &line);
+            let level = if status == "unavailable" {
+                Level::Warn
+            } else {
+                Level::Info
+            };
+            push_log(id, tunnel, level, &line);
         }
     }
     pub async fn start(&self, tunnel: Tunnel) -> Result<()> {
@@ -364,7 +370,7 @@ impl Manager {
         let runtime = state.runtimes.entry(tunnel.id.clone()).or_default();
         runtime.started_at = None;
         runtime.hop.clear();
-        update(runtime, "connecting", "Подключение…");
+        update(&tunnel.id, runtime, "connecting", "Подключение…");
         let cancel = CancellationToken::new();
         let manager = self.clone();
         let task_cancel = cancel.clone();
@@ -392,7 +398,7 @@ impl Manager {
         let runtime = state.runtimes.entry(id.into()).or_default();
         runtime.started_at = None;
         runtime.hop.clear();
-        update(runtime, "stopped", "Туннель остановлен");
+        update(id, runtime, "stopped", "Туннель остановлен");
         Ok(())
     }
     pub async fn close(&self) -> Result<()> {
@@ -409,10 +415,10 @@ impl Manager {
         for (id, task) in tasks {
             let _ = task.join.await;
             let mut state = self.0.state.lock().await;
-            let runtime = state.runtimes.entry(id).or_default();
+            let runtime = state.runtimes.entry(id.clone()).or_default();
             runtime.started_at = None;
             runtime.hop.clear();
-            update(runtime, "stopped", "Туннель остановлен");
+            update(&id, runtime, "stopped", "Туннель остановлен");
         }
         Ok(())
     }
@@ -572,9 +578,14 @@ impl Manager {
             return Ok(());
         }
     }
-    async fn log(&self, id: &str, message: &str) {
+    async fn log(&self, id: &str, level: Level, message: &str) {
         let mut state = self.0.state.lock().await;
-        push_log(state.runtimes.entry(id.into()).or_default(), message);
+        push_log(
+            id,
+            state.runtimes.entry(id.into()).or_default(),
+            level,
+            message,
+        );
     }
     async fn state(&self, id: &str, status: &str, message: &str, hop: Option<&str>) {
         let mut state = self.0.state.lock().await;
@@ -587,7 +598,7 @@ impl Manager {
         } else {
             None
         };
-        update(runtime, status, message);
+        update(id, runtime, status, message);
     }
     /// Marks the tunnel as running on `port` in one step, so a snapshot that shows it
     /// running also shows where it listens.
@@ -596,7 +607,7 @@ impl Manager {
         let runtime = state.runtimes.entry(id.into()).or_default();
         runtime.started_at = Some(now());
         runtime.port = Some(port);
-        update(runtime, "running", "Туннель работает");
+        update(id, runtime, "running", "Туннель работает");
     }
     async fn run(&self, tunnel: Tunnel, cancel: CancellationToken) {
         let credentials = Credentials::default();
@@ -781,7 +792,12 @@ impl Manager {
             if launched.uploaded {
                 state.udp.entry(tunnel.id.clone()).or_default().uploads += 1;
                 if let Some(runtime) = state.runtimes.get_mut(&tunnel.id) {
-                    push_log(runtime, "UDP: помощник загружен на сервер.");
+                    push_log(
+                        &tunnel.id,
+                        runtime,
+                        Level::Info,
+                        "UDP: помощник загружен на сервер.",
+                    );
                 }
             }
             state.udp_links.insert(tunnel.id.clone(), transport.clone());
@@ -897,7 +913,7 @@ impl Manager {
                     let Ok((socket, origin)) = accepted else {
                         // Retry a transient error; reconnect with a new listener if it persists.
                         match backoff.failed() {
-                            1 => self.log(&tunnel.id, "Ошибка приёма соединения на локальном порту; повторяем.").await,
+                            1 => self.log(&tunnel.id, Level::Warn, "Ошибка приёма соединения на локальном порту; повторяем.").await,
                             ACCEPT_ATTEMPTS.. => return Err(ACCEPT_FAILED),
                             _ => {}
                         }
@@ -1158,15 +1174,22 @@ fn now() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
 }
-fn update(runtime: &mut Runtime, state: &str, message: &str) {
+fn update(id: &str, runtime: &mut Runtime, state: &str, message: &str) {
     if state != "running" {
         runtime.port = None;
     }
     runtime.state = state.into();
     runtime.message = message.into();
-    push_log(runtime, message);
+    let level = match state {
+        "error" => Level::Error,
+        "reconnecting" => Level::Warn,
+        _ => Level::Info,
+    };
+    push_log(id, runtime, level, message);
 }
-fn push_log(runtime: &mut Runtime, message: &str) {
+/// The window's journal of the tunnel and, with its ID, the diagnostic file.
+fn push_log(id: &str, runtime: &mut Runtime, level: Level, message: &str) {
+    crate::journal::write(level, &format!("Туннель {id}: {message}"));
     runtime
         .logs
         .push_back(log_line(&chrono::Local::now(), message));
@@ -2161,8 +2184,8 @@ mod tests {
     #[test]
     fn log_entries_keep_the_tunnel_state() {
         let mut runtime = Runtime::default();
-        update(&mut runtime, "running", "Туннель работает");
-        push_log(&mut runtime, "Ошибка приёма соединения");
+        update("t", &mut runtime, "running", "Туннель работает");
+        push_log("t", &mut runtime, Level::Warn, "Ошибка приёма соединения");
         assert_eq!(
             (runtime.state.as_str(), runtime.message.as_str()),
             ("running", "Туннель работает")
@@ -2173,7 +2196,7 @@ mod tests {
     fn runtime_log_is_bounded() {
         let mut runtime = Runtime::default();
         for _ in 0..350 {
-            update(&mut runtime, "connecting", "test");
+            update("t", &mut runtime, "connecting", "test");
         }
         assert_eq!(runtime.logs.len(), 300);
     }

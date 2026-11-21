@@ -859,9 +859,11 @@ async fn serve(store: Store) -> Result<()> {
     }
     let mut failures = 0;
     let mut pending: Vec<(String, String)> = Vec::new();
+    let mut events: Vec<String> = Vec::new();
     // A stopped КРОТ is noticed within seconds, so an update never waits long for the helper.
     while failures < 3 {
         pending.append(&mut shared.logs.lock().unwrap());
+        events.append(&mut crate::journal::take_panics());
         let stats = shared
             .counters
             .lock()
@@ -885,6 +887,7 @@ async fn serve(store: Store) -> Result<()> {
             logs: pending.clone(),
             error: String::new(),
             udp: shared.link.stats(),
+            events: events.clone(),
         };
         let reply = client.request("divert_sync", json!(report)).await.ok();
         // Another version of КРОТ took over: its own helper has to be started instead.
@@ -901,6 +904,7 @@ async fn serve(store: Store) -> Result<()> {
             Some(rules) => {
                 failures = 0;
                 pending.clear();
+                events.clear();
                 let mut current = shared.rules.lock().unwrap();
                 if *current != rules {
                     // A refusal holds only while the rule stays on the same running tunnel:
@@ -941,6 +945,7 @@ impl Drop for Registration {
 pub(super) fn run(store: Store, registration: Registration) -> Result<()> {
     // One helper per configuration: two would fight over the same packets.
     let _lease = Store::new(store.sidecar(".divert"))?.lock()?;
+    crate::journal::keep_panics();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

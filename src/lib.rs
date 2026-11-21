@@ -7,6 +7,7 @@ pub mod desktop;
 pub mod diagnose;
 pub mod divert;
 pub mod icons;
+pub mod journal;
 pub mod launcher;
 pub mod link;
 pub mod metrics;
