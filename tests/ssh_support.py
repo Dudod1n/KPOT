@@ -299,16 +299,29 @@ class SSHFixtures:
         self.commands.append((process.command, local))
 
         async def forward(source, target):
+            # Output for a channel the client closed is read on and dropped: `wait` returns
+            # only once every pipe of the command is closed.
             while data := await source.read(65536):
-                target.write(data)
-                await target.drain()
+                with contextlib.suppress(OSError):
+                    target.write(data)
+                    await target.drain()
 
         try:
             await process.redirect(stdin=local.stdin)
             # All output reaches the client before the exit status, like sshd sends it: with
             # `redirect` the status could overtake a short output and the client saw none.
-            await asyncio.gather(forward(local.stdout, process.stdout),
-                                 forward(local.stderr, process.stderr))
+            output = asyncio.gather(forward(local.stdout, process.stdout),
+                                    forward(local.stderr, process.stderr))
+            # A channel the client closes ends the command, like sshd closing its pipes; a
+            # forward blocked on the full channel window would not notice it otherwise.
+            closed = asyncio.ensure_future(process.channel.wait_closed())
+            await asyncio.wait({output, closed}, return_when=asyncio.FIRST_COMPLETED)
+            if not output.done():
+                kill_group(local)
+                local.stdin.close()
+                await output
+                return
+            closed.cancel()
             process.exit(await local.wait())
         finally:
             if local.returncode is None:
