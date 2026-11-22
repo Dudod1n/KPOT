@@ -100,6 +100,8 @@
         <RemoveFile Id="StaleReadme" Name="README.txt" On="both" />
         <RemoveFile Id="StaleIcon" Name="krot.ico" On="both" />
         <RemoveFile Id="StalePng" Name="krot.png" On="both" />
+        <!-- A folder that existed before the installation is otherwise left empty. -->
+        <RemoveFolder Id="InstallFolder" On="uninstall" />
       </Component>
     </ComponentGroup>
 
