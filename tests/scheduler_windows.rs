@@ -1,5 +1,5 @@
 #![cfg(windows)]
-#![allow(unused_variables, unreachable_code, clippy::all)]
+#![allow(unused, unreachable_code, clippy::all)]
 //! Tasks of the Windows Task Scheduler through the real `schtasks.exe`.
 //!
 //! The tests change the system scheduler, the user's `Run` key and, for the part that runs as a
