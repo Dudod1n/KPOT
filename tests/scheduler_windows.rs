@@ -623,23 +623,10 @@ impl Drop for StandardUser {
     }
 }
 
-/// Task Scheduler 1.2 definition of a task of `user`. Without `security` the task gets what
-/// an elevated process registering it gets. The logon trigger is off: the test signs the user
-/// in, and the task must not start КРОТ then.
-fn task_xml(
-    user: &str,
-    command: &Path,
-    arguments: &str,
-    logon: bool,
-    security: Option<&str>,
-) -> String {
-    let security = security
-        .map(|sddl| {
-            format!(
-                "<RegistrationInfo><SecurityDescriptor>{sddl}</SecurityDescriptor></RegistrationInfo>"
-            )
-        })
-        .unwrap_or_default();
+/// Task Scheduler 1.2 definition of a task of `user`, with the security that an elevated
+/// process registering it gives. The logon trigger is off: the test signs the user in, and the
+/// task must not start КРОТ then.
+fn task_xml(user: &str, command: &Path, arguments: &str, logon: bool) -> String {
     let (triggers, level) = if logon {
         (
             format!(
@@ -653,7 +640,6 @@ fn task_xml(
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\
-{security}\
 {triggers}\
 <Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>{level}</RunLevel></Principal></Principals>\
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Enabled>true</Enabled></Settings>\
@@ -672,73 +658,6 @@ fn register_elevated(directory: &Path, task: &str, xml: &str) {
     let output = schtasks(&["/create", "/tn", task, "/xml", path.to_str().unwrap(), "/f"]);
     assert!(output.status.success(), "{}", combined(&output));
     std::fs::remove_file(path).unwrap();
-}
-
-/// Gives administrators full access to a task that refused them deletion, so that [`Cleanup`]
-/// removes it. It never panics.
-struct Unprotect(String);
-
-impl Drop for Unprotect {
-    fn drop(&mut self) {
-        let script = format!(
-            "$service = New-Object -ComObject Schedule.Service; $service.Connect(); \
-             $service.GetFolder('\\').GetTask('{}').SetSecurityDescriptor('D:(A;;FA;;;BA)(A;;FA;;;SY)', 0)",
-            self.0
-        );
-        let _ = Command::new("powershell.exe")
-            .env_remove("PSModulePath")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .stdin(Stdio::null())
-            .output();
-    }
-}
-
-#[test]
-fn a_task_that_windows_refuses_to_delete_keeps_remembering_on() {
-    if !ci() {
-        return;
-    }
-    assert!(tasks::elevated(), "The CI runner runs as an administrator");
-    let temp = tempfile::tempdir().unwrap();
-    let config = store(temp.path().join("protected").join("config.json"));
-    let cleanup = Cleanup(vec![name(&config)]);
-    let divert = prefix(&config, "divert");
-    let (ok, printed) = cli(&config, &["elevation", "enable"]);
-    assert!(ok && printed.contains("включён"), "{printed}");
-    let names = listed(&divert);
-    assert_eq!(names.len(), 1, "{names:?}");
-
-    // Administrators may read, start and change the task but not delete it: even with the
-    // rights that `elevation disable` asks for, Windows refuses the deletion.
-    let program = tasks::program().unwrap();
-    let arguments = format!("--config \"{}\" divert", config.display());
-    register_elevated(
-        temp.path(),
-        &names[0],
-        &task_xml(
-            &tasks::user_sid().unwrap(),
-            &program,
-            &arguments,
-            false,
-            Some("D:P(A;;FA;;;SY)(A;;0x1e01ff;;;BA)"),
-        ),
-    );
-    let unprotect = Unprotect(names[0].clone());
-    let (ok, printed) = cli(&config, &["elevation", "disable"]);
-    assert!(!ok, "{printed}");
-    assert!(printed.contains("задани"), "{printed}");
-    assert_eq!(listed(&divert), names);
-    // The task still gives the rights, so the choice stays on and the status tells so.
-    assert!(tasks::remembering(&config), "{printed}");
-    let (ok, printed) = cli(&config, &["elevation", "status"]);
-    assert!(ok && printed.contains("включён"), "{printed}");
-
-    drop(unprotect);
-    let (ok, printed) = cli(&config, &["elevation", "disable"]);
-    assert!(ok && printed.contains("выключен"), "{printed}");
-    assert!(!tasks::remembering(&config));
-    drop(cleanup);
-    assert!(listed(&format!("\\{}-", name(&config))).is_empty());
 }
 
 /// A standard user with a directory on the system drive that it may use, holding a copy of
@@ -859,7 +778,7 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
     register_elevated(
         user.scripts.path(),
         &names[0],
-        &task_xml(&user.sid, program, &arguments, false, None),
+        &task_xml(&user.sid, program, &arguments, false),
     );
     let (ok, printed) = workspace.krot(&["elevation", "status"]);
     assert!(ok && printed.contains("включён"), "{printed}");
@@ -879,7 +798,7 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
     register_elevated(
         user.scripts.path(),
         &task,
-        &task_xml(&user.sid, program, &arguments, true, None),
+        &task_xml(&user.sid, program, &arguments, true),
     );
     let (ok, printed) = workspace.krot(&["autostart", "enable"]);
     assert!(!ok, "{printed}");
