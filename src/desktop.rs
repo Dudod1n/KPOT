@@ -3182,12 +3182,14 @@ impl Desktop {
             ui.heading(format!("Доступен КРОТ {}", update.release.version));
             match &update.stage {
                 UpdateStage::Offer => {
-                    if !update.release.notes.is_empty() {
+                    // The text is already short; the bounded height keeps the buttons on screen.
+                    // A zoomed small window has no room for it, and the link still leads to it.
+                    let room = ctx.content_rect().height() - 330.0;
+                    if !update.release.notes.is_empty() && room >= 100.0 {
                         ui.label(RichText::new("Что нового:").strong());
-                        // The text is already short; the bounded height keeps the buttons on screen.
                         egui::ScrollArea::vertical()
                             .id_salt("update notes")
-                            .max_height(150.0)
+                            .max_height(room.min(150.0))
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 for note in &update.release.notes {
@@ -5051,14 +5053,19 @@ mod tests {
     }
     #[test]
     fn update_offer_lists_release_notes_and_opens_only_the_release_page() {
-        for (notes, size) in [
-            (vec![], [700.0, 500.0]),
+        for (notes, zoom) in [
+            (vec![], 1.0),
             (
                 vec!["Установщик MSI.".to_string(), "Журнал диагностики.".into()],
-                [700.0, 500.0],
+                1.0,
             ),
-            (vec!["Очень длинный пункт ".repeat(8); 5], [700.0, 500.0]),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.0),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.1),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.25),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.5),
         ] {
+            // The smallest window; zoom shrinks the logical size it offers.
+            let size = [700.0 / zoom, 500.0 / zoom];
             let ctx = egui::Context::default();
             configure(&ctx, "dark");
             let mut app = Desktop::new(None, true);
@@ -5068,11 +5075,9 @@ mod tests {
             app.pending_update = Some((release, false));
             render(&mut app, &ctx, size);
             let output = render(&mut app, &ctx, size);
-            assert_eq!(
-                text_rect(&output, "Что нового:").is_some(),
-                !notes.is_empty()
-            );
-            if let Some(first) = notes.first() {
+            let shown = !notes.is_empty() && zoom <= 1.1;
+            assert_eq!(text_rect(&output, "Что нового:").is_some(), shown);
+            if let Some(first) = notes.first().filter(|_| shown) {
                 let rect = text_rect(&output, &format!("• {first}")).unwrap();
                 assert!(ctx.content_rect().contains_rect(rect));
             }
@@ -5084,7 +5089,7 @@ mod tests {
                 "Позже",
             ] {
                 let rect = text_rect(&output, label).unwrap_or_else(|| panic!("{label}"));
-                assert!(ctx.content_rect().contains_rect(rect), "{label} {size:?}");
+                assert!(ctx.content_rect().contains_rect(rect), "{label} {zoom}");
             }
         }
         let ctx = egui::Context::default();
