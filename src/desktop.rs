@@ -3182,6 +3182,29 @@ impl Desktop {
             ui.heading(format!("Доступен КРОТ {}", update.release.version));
             match &update.stage {
                 UpdateStage::Offer => {
+                    // The text is already short; the bounded height keeps the buttons on screen.
+                    // A zoomed small window has no room for it, and the link still leads to it.
+                    let room = ctx.content_rect().height() - 330.0;
+                    if !update.release.notes.is_empty() && room >= 100.0 {
+                        ui.label(RichText::new("Что нового:").strong());
+                        egui::ScrollArea::vertical()
+                            .id_salt("update notes")
+                            .max_height(room.min(150.0))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for note in &update.release.notes {
+                                    ui.label(format!("• {note}"));
+                                }
+                            });
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Полный список изменений:").color(pal.dim));
+                        ui.hyperlink_to(
+                            "github.com/Dudod1n/KPOT/releases/latest",
+                            crate::update::RELEASE_PAGE,
+                        );
+                    });
+                    ui.add_space(6.0);
                     ui.label("Обновить программу и перезапустить КРОТ?");
                     ui.label(
                         RichText::new(
@@ -5027,6 +5050,66 @@ mod tests {
             original
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn update_offer_lists_release_notes_and_opens_only_the_release_page() {
+        for (notes, zoom) in [
+            (vec![], 1.0),
+            (
+                vec!["Установщик MSI.".to_string(), "Журнал диагностики.".into()],
+                1.0,
+            ),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.0),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.1),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.25),
+            (vec!["Очень длинный пункт ".repeat(8); 5], 1.5),
+        ] {
+            // The smallest window; zoom shrinks the logical size it offers.
+            let size = [700.0 / zoom, 500.0 / zoom];
+            let ctx = egui::Context::default();
+            configure(&ctx, "dark");
+            let mut app = Desktop::new(None, true);
+            app.snapshot = Some(snapshot());
+            let mut release = crate::update::Release::for_test("0.6.0");
+            release.notes = notes.clone();
+            app.pending_update = Some((release, false));
+            render(&mut app, &ctx, size);
+            let output = render(&mut app, &ctx, size);
+            let shown = !notes.is_empty() && zoom <= 1.1;
+            assert_eq!(text_rect(&output, "Что нового:").is_some(), shown);
+            if let Some(first) = notes.first().filter(|_| shown) {
+                let rect = text_rect(&output, &format!("• {first}")).unwrap();
+                assert!(ctx.content_rect().contains_rect(rect));
+            }
+            for label in [
+                "Полный список изменений:",
+                "github.com/Dudod1n/KPOT/releases/latest",
+                "Обновить",
+                "Пропустить версию",
+                "Позже",
+            ] {
+                let rect = text_rect(&output, label).unwrap_or_else(|| panic!("{label}"));
+                assert!(ctx.content_rect().contains_rect(rect), "{label} {zoom}");
+            }
+        }
+        let ctx = egui::Context::default();
+        configure(&ctx, "dark");
+        let mut app = Desktop::new(None, true);
+        app.snapshot = Some(snapshot());
+        app.pending_update = Some((crate::update::Release::for_test("0.6.0"), false));
+        render(&mut app, &ctx, [700.0, 500.0]);
+        let output = click_label(&mut app, &ctx, "github.com/Dudod1n/KPOT/releases/latest");
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(command,
+                    egui::OutputCommand::OpenUrl(url)
+                        if url.url == "https://github.com/Dudod1n/KPOT/releases/latest"
+                ))
+        );
+        assert!(app.update.is_some());
     }
     #[test]
     fn manual_update_result_preserves_a_form_opened_while_checking() {

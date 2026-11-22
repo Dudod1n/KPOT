@@ -95,6 +95,18 @@ class PackageTests(unittest.TestCase):
                         packager.package(tag, root / 'builds', root / 'output', root / 'notes')
                     self.assertFalse((root / 'output').exists())
 
+    def test_release_notes_start_with_the_summary_block_of_the_version(self):
+        entry = ('**Кратко:**\n\n- Установщик MSI.\n- Журнал диагностики.\n\n'
+                 '### Добавлено\n\n- Подробности.\n')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'CHANGELOG.md').write_text(
+                '# Changes\n\n## Не выпущено\n\n**Кратко:**\n\n- Будущее.\n\n'
+                '## 1.2.3 — 2026-12-01\n\n' + entry + '\n## 1.2.2\n\n**Кратко:**\n\n- Старое.\n',
+                encoding='utf-8')
+            with patch.object(packager, 'ROOT', root):
+                self.assertEqual(packager.release_notes('1.2.3'), entry)
+
 
 if __name__ == '__main__':
     unittest.main()
