@@ -78,15 +78,14 @@ fn combined(output: &Output) -> String {
     text
 }
 
-/// Runs `program` and returns its success and output. A program that does not finish in two
-/// minutes, for example one that waits for an elevation prompt, fails the test.
+/// Runs `program` with `config` and returns its success and output.
 fn krot(
     program: &Path,
     config: &Path,
     arguments: &[&str],
     environment: &[(&str, &Path)],
 ) -> (bool, String) {
-    let mut child = Command::new(program)
+    let child = Command::new(program)
         .arg("--config")
         .arg(config)
         .args(arguments)
@@ -96,16 +95,42 @@ fn krot(
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    finish(child, &format!("{} {arguments:?}", program.display()))
+}
+
+/// Waits for `child` and returns its success and output. Threads read its pipes, so a long
+/// output never blocks it. A program that does not finish in two minutes, for example one
+/// that waits for an elevation prompt, is ended and fails the test.
+fn finish(mut child: std::process::Child, what: &str) -> (bool, String) {
+    use std::io::Read;
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = read(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = read(child.stderr.take().map(|pipe| Box::new(pipe) as _));
     let deadline = Instant::now() + Duration::from_secs(120);
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() > deadline {
             let _ = child.kill();
-            panic!("{} {arguments:?} did not finish", program.display());
+            panic!("{what} did not finish");
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-    let output = child.wait_with_output().unwrap();
-    (output.status.success(), combined(&output))
+    };
+    let output = Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    };
+    (status.success(), combined(&output))
 }
 
 fn cli(config: &Path, arguments: &[&str]) -> (bool, String) {
@@ -295,17 +320,27 @@ fn without_scheduler(config: &Path, arguments: &[&str]) -> (bool, String) {
             },
         },
     };
+    /// Closing the job ends the processes in it.
+    struct Job(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
     // SAFETY: an unnamed job; the limits are a plain structure of the size passed.
     let job = unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        assert!(!job.is_null(), "{}", std::io::Error::last_os_error());
+        let job = Job(CreateJobObjectW(std::ptr::null(), std::ptr::null()));
+        assert!(!job.0.is_null(), "{}", std::io::Error::last_os_error());
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         limits.BasicLimitInformation.LimitFlags =
             JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         limits.BasicLimitInformation.ActiveProcessLimit = 1;
         assert!(
             SetInformationJobObject(
-                job,
+                job.0,
                 JobObjectExtendedLimitInformation,
                 (&raw const limits).cast(),
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -316,7 +351,7 @@ fn without_scheduler(config: &Path, arguments: &[&str]) -> (bool, String) {
         job
     };
     // The process joins the job before its first instruction, so it never starts a child.
-    let child = Command::new(env!("CARGO_BIN_EXE_krot-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_krot-cli"))
         .arg("--config")
         .arg(config)
         .args(arguments)
@@ -328,11 +363,11 @@ fn without_scheduler(config: &Path, arguments: &[&str]) -> (bool, String) {
         .unwrap();
     // SAFETY: the handles are valid and closed here; the entry has the declared size.
     unsafe {
-        assert!(
-            AssignProcessToJobObject(job, child.as_raw_handle()) != 0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
+        if AssignProcessToJobObject(job.0, child.as_raw_handle()) == 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = child.kill();
+            panic!("{error}");
+        }
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         assert!(snapshot != INVALID_HANDLE_VALUE);
         let mut entry: THREADENTRY32 = std::mem::zeroed();
@@ -352,12 +387,10 @@ fn without_scheduler(config: &Path, arguments: &[&str]) -> (bool, String) {
         CloseHandle(snapshot);
         assert_eq!(resumed, 1, "The suspended process has one thread");
     }
-    let output = child.wait_with_output().unwrap();
-    // SAFETY: the job handle is owned here.
-    unsafe {
-        CloseHandle(job);
-    }
-    (output.status.success(), combined(&output))
+    finish(
+        child,
+        &format!("krot-cli {arguments:?} without the Task Scheduler"),
+    )
 }
 
 #[test]
@@ -446,6 +479,7 @@ exit $process.ExitCode
     (
         "remove.ps1",
         r#"$name = $env:KROT_TEST_USER
+$failed = @()
 & taskkill.exe /f /fi "USERNAME eq $name" 2>&1 | Out-Null
 $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
 if ($user) {
@@ -455,14 +489,18 @@ if ($user) {
         if ($profiles.Count -eq 0) { break }
         try { $profiles | Remove-CimInstance -ErrorAction Stop; break } catch { Start-Sleep -Seconds 1 }
     }
-    Remove-LocalUser -Name $name
+    if (@(Get-CimInstance Win32_UserProfile -Filter "SID='$sid'").Count -gt 0) { $failed += "profile of $name" }
+    try { Remove-LocalUser -Name $name -ErrorAction Stop } catch { $failed += "account ${name}: $_" }
 }
 $policy = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-if ($env:KROT_TEST_CONSENT -eq 'absent') {
-    Remove-ItemProperty -Path $policy -Name ConsentPromptBehaviorUser -ErrorAction SilentlyContinue
-} elseif ($env:KROT_TEST_CONSENT) {
-    Set-ItemProperty -Path $policy -Name ConsentPromptBehaviorUser -Value ([int]$env:KROT_TEST_CONSENT) -Type DWord
-}
+try {
+    if ($env:KROT_TEST_CONSENT -eq 'absent') {
+        Remove-ItemProperty -Path $policy -Name ConsentPromptBehaviorUser -ErrorAction Stop
+    } elseif ($env:KROT_TEST_CONSENT) {
+        Set-ItemProperty -Path $policy -Name ConsentPromptBehaviorUser -Value ([int]$env:KROT_TEST_CONSENT) -Type DWord -ErrorAction Stop
+    }
+} catch { $failed += "UAC policy: $_" }
+if ($failed.Count -gt 0) { [Console]::Error.WriteLine(($failed -join '; ')); exit 1 }
 "#,
     ),
     (
@@ -512,7 +550,11 @@ struct StandardUser {
     sid: String,
     consent: Option<String>,
     scripts: tempfile::TempDir,
+    /// One test user at a time: each saves and restores the UAC policy.
+    _turn: std::sync::MutexGuard<'static, ()>,
 }
+
+static ACCOUNTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl StandardUser {
     fn create() -> Self {
@@ -523,6 +565,9 @@ impl StandardUser {
             sid: String::new(),
             consent: None,
             scripts: scripts(),
+            _turn: ACCOUNTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         };
         let output = powershell(
             user.scripts.path(),
@@ -554,7 +599,15 @@ impl StandardUser {
         let stderr = self.scripts.path().join(format!("{run}.err"));
         let arguments = arguments
             .iter()
-            .map(|argument| format!("\"{}\"", argument.to_str().unwrap()))
+            .map(|argument| {
+                let argument = argument.to_str().unwrap();
+                // Plain quoting: a quote or a final backslash would join it with the next one.
+                assert!(
+                    !argument.contains('"') && !argument.ends_with('\\'),
+                    "{argument}"
+                );
+                format!("\"{argument}\"")
+            })
             .collect::<Vec<_>>()
             .join(" ");
         let output = powershell(
@@ -594,16 +647,22 @@ impl StandardUser {
 
     /// The `Run` entry of `config` exists in this user's own registry.
     fn run_key(&self, config: &Path) -> bool {
+        self.reg(config, "query", &[])
+    }
+
+    /// Runs `reg.exe <verb>` on the `Run` entry of `config` in this user's own registry.
+    fn reg(&self, config: &Path, verb: &str, more: &[&str]) -> bool {
         let reg = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32")
             .join("reg.exe");
         let name = name(config);
-        let arguments: [&OsStr; 4] = [
-            "query".as_ref(),
+        let mut arguments: Vec<&OsStr> = vec![
+            verb.as_ref(),
             RUN_KEY.as_ref(),
             "/v".as_ref(),
             name.as_ref(),
         ];
+        arguments.extend(more.iter().map(OsStr::new));
         self.run(config.parent().unwrap(), &reg, &arguments).0
     }
 }
@@ -643,10 +702,19 @@ fn task_xml(user: &str, command: &Path, arguments: &str, logon: bool) -> String 
 {triggers}\
 <Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>{level}</RunLevel></Principal></Principals>\
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Enabled>true</Enabled></Settings>\
-<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{arguments}</Arguments></Exec></Actions>\
+<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>\
 </Task>\r\n",
-        command.display()
+        escape(&command.display().to_string()),
+        escape(arguments)
     )
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Registers `task` from this elevated process, replacing a task of that name.
@@ -731,6 +799,12 @@ fn a_standard_user_turns_autostart_on_and_off_through_its_own_logon_task() {
     let config = workspace.config.clone();
     let cleanup = Cleanup(vec![name(&config)]);
     let logon = prefix(&config, "logon");
+
+    // The check of the user's Run key tells an entry from none.
+    assert!(workspace.user.reg(&config, "add", &["/d", "test", "/f"]));
+    assert!(workspace.user.run_key(&config));
+    assert!(workspace.user.reg(&config, "delete", &["/f"]));
+    assert!(!workspace.user.run_key(&config));
 
     let (ok, printed) = workspace.krot(&["elevation", "status"]);
     assert!(ok && printed.contains("выключен"), "{printed}");
