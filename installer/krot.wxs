@@ -25,6 +25,13 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Dudod1n/KPOT" />
     <Property Id="ARPHELPLINK" Value="https://github.com/Dudod1n/KPOT/issues" />
     <Property Id="ARPNOMODIFY" Value="1" />
+    <!--
+      The package's files replace whatever lies in the folder, whatever its version: a
+      portable copy unpacked there may be of the same or a higher version, and Windows
+      Installer would keep it, decided before any file is removed. Every file of the package
+      lies in КРОТ's own folder, so no shared file is downgraded.
+    -->
+    <Property Id="REINSTALLMODE" Value="amus" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="KROT" />
@@ -68,6 +75,33 @@
       <Component Id="InstallDir">
         <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="InstallDir" Type="string"
                        Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <!--
+          The folder may exist before the installation, for example with a portable copy
+          unpacked by hand. The service runs its programs from here as LocalSystem, so the
+          rights are set explicitly: only SYSTEM and administrators change anything.
+        -->
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;AC)" />
+        </CreateFolder>
+        <!--
+          Files of a portable copy in this folder that the package does not hold, such as
+          README.txt, go at installation, and all of them at removal, so that nothing of
+          КРОТ remains. Only the names of КРОТ's own files are removed, never the whole
+          folder: INSTALLFOLDER can be set on the command line.
+        -->
+        <RemoveFile Id="StaleKrot" Name="krot.exe" On="both" />
+        <RemoveFile Id="StaleKrotCli" Name="krot-cli.exe" On="both" />
+        <RemoveFile Id="StaleWinDivertDll" Name="WinDivert.dll" On="both" />
+        <RemoveFile Id="StaleWinDivertSys" Name="WinDivert64.sys" On="both" />
+        <RemoveFile Id="StaleWinDivertLicense" Name="WinDivert-LICENSE.txt" On="both" />
+        <RemoveFile Id="StaleNotices" Name="THIRD_PARTY_NOTICES.txt" On="both" />
+        <RemoveFile Id="StaleLicense" Name="LICENSE" On="both" />
+        <RemoveFile Id="StaleLicenseTxt" Name="LICENSE.txt" On="both" />
+        <RemoveFile Id="StaleReadme" Name="README.txt" On="both" />
+        <RemoveFile Id="StaleIcon" Name="krot.ico" On="both" />
+        <RemoveFile Id="StalePng" Name="krot.png" On="both" />
+        <!-- A folder that existed before the installation is otherwise left empty. -->
+        <RemoveFolder Id="InstallFolder" On="uninstall" />
       </Component>
     </ComponentGroup>
 
@@ -95,9 +129,22 @@
     -->
     <CustomAction Id="Cleanup" FileRef="KrotExe" ExeCommand="uninstall-cleanup"
                   Execute="deferred" Impersonate="no" Return="ignore" />
+    <!--
+      Before the files are replaced: ends КРОТ running from the installation folder, for
+      example a portable copy unpacked there. Windows would otherwise replace the files of a
+      running program only at reboot, and the service would start the older krot.exe. The
+      program runs from the package itself, since nothing is installed yet. The trailing
+      backslash is doubled so that it does not escape the closing quote.
+    -->
+    <Binary Id="KrotPrepare" SourceFile="$(var.Binaries)\krot.exe" />
+    <CustomAction Id="StopInstalledFolder" BinaryRef="KrotPrepare"
+                  ExeCommand="install-prepare &quot;[INSTALLFOLDER]\&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="Cleanup" Before="RemoveRegistryValues"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="StopInstalledFolder" Before="RemoveFiles"
+              Condition="NOT REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
     <Feature Id="Main" Title="КРОТ" Level="1">

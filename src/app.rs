@@ -124,6 +124,9 @@ enum Command {
     /// Очистка перед удалением установленного КРОТа; её запускает установщик
     #[command(hide = true)]
     UninstallCleanup,
+    /// Завершение КРОТа в каталоге установки перед заменой файлов; её запускает установщик
+    #[command(hide = true)]
+    InstallPrepare { directory: PathBuf },
 }
 
 #[cfg(windows)]
@@ -172,6 +175,15 @@ pub fn run() -> Result<()> {
             return crate::service::cleanup();
             #[cfg(not(windows))]
             anyhow::bail!("Установщик есть только в Windows.");
+        }
+        Some(Command::InstallPrepare { directory }) => {
+            #[cfg(windows)]
+            return crate::service::prepare_install(&directory);
+            #[cfg(not(windows))]
+            {
+                let _ = directory;
+                anyhow::bail!("Установщик есть только в Windows.");
+            }
         }
         _ => {}
     }
@@ -264,7 +276,7 @@ pub fn run() -> Result<()> {
             }
             Some(Command::ApplyUpdate { manifest }) => runtime.block_on(crate::update::apply_install(&manifest)),
             Some(Command::ApplyPackage { manifest }) => runtime.block_on(crate::update::apply_package(&manifest)),
-            Some(Command::Service | Command::DivertService | Command::UninstallCleanup) => unreachable!(),
+            Some(Command::Service | Command::DivertService | Command::UninstallCleanup | Command::InstallPrepare { .. }) => unreachable!(),
             Some(Command::Autostart {action}) => {
                 if action != "status" { store.load()?; autostart::set_enabled(&store.path,action == "enable")?; }
                 println!("Автозапуск после входа: {}.",if autostart::is_enabled(&store.path)? {"включён"} else {"выключен"});

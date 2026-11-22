@@ -32,6 +32,10 @@ WRITE_RIGHTS = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0
 INHERIT_ONLY = 2
 
 
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def step(text):
     print(f'== {text}', flush=True)
 
@@ -202,8 +206,30 @@ def main():
     own_task = task_name('krot-0123456789abcdef', installed)
     foreign_task = task_name('krot-0123456789abcdef', r'C:\Portable\KROT\krot.exe')
 
+    step('a running portable copy is already in the folder, with rights too wide')
+    INSTALL.mkdir(parents=True)
+    # A program of a higher version than the package's krot.exe, which Windows Installer would
+    # keep, and one that runs, so that its file is in use while the package replaces it.
+    stale = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'PING.EXE'
+    (INSTALL / 'krot.exe').write_bytes(stale.read_bytes())
+    for name in ('README.txt', 'krot.ico', 'LICENSE'):
+        (INSTALL / name).write_text('portable copy', encoding='utf-8')
+    subprocess.run(['icacls', str(INSTALL), '/grant', '*S-1-5-32-545:(OI)(CI)M'], check=True, capture_output=True)
+    portable = subprocess.Popen([str(INSTALL / 'krot.exe'), '-n', '600', '127.0.0.1'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     step('install')
-    msiexec(work / 'install.log', '/i', str(args.package.resolve()))
+    try:
+        msiexec(work / 'install.log', '/i', str(args.package.resolve()))
+        assert portable.poll() is not None, 'the portable copy in the folder still runs'
+    finally:
+        if portable.poll() is None:
+            portable.kill()
+    assert sha256(INSTALL / 'krot.exe') != sha256(stale), 'the portable krot.exe stayed in place'
+    log = (work / 'install.log').read_text(encoding='utf-16', errors='replace')
+    # Windows Installer records a file that only a reboot replaces this way.
+    assert 'ReplacedInUseFiles = 1' not in log, 'a file waits for a reboot'
+    assert sorted(path.name for path in INSTALL.iterdir()) == sorted(FILES), list(INSTALL.iterdir())
     check_installed(args.version)
     check_interception(config)
     cli(config, 'autostart', 'enable')
