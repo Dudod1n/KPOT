@@ -424,6 +424,7 @@ try {
 }
 $null = $process.Handle
 if (-not $process.WaitForExit(60000)) {
+    & tasklist.exe /v /fo csv | Select-String -Pattern 'schtasks|consent|krot|reg.exe|dllhost|WerFault' | ForEach-Object { [Console]::Error.WriteLine($_.Line) }
     $process.Kill()
     exit 201
 }
