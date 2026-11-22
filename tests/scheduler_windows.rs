@@ -714,6 +714,29 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
             .arg(file.parent().unwrap())
             .output()
             .unwrap();
+        let sddl = Command::new("powershell.exe")
+            .env_remove("PSModulePath")
+            .args(["-NoProfile", "-Command", &format!("$s = New-Object -ComObject Schedule.Service; $s.Connect(); 'root=' + $s.GetFolder('\\').GetSecurityDescriptor(4); 'task=' + $s.GetFolder('\\').GetTask('{}').GetSecurityDescriptor(4)", names[0])])
+            .output()
+            .unwrap();
+        let probe = directory.join("probe.json");
+        let own = user.krot(&program, &probe, &["autostart", "enable"]);
+        let own_status = user.krot(&program, &probe, &["autostart", "status"]);
+        let own_list = listed(&format!("\\{}-", name(&probe)));
+        let (_, all_after) = user.run(&directory, &schtasks_exe, &list);
+        let _ = cli(&probe, &["autostart", "disable"]);
+        for task in &own_list {
+            let _ = schtasks(&["/delete", "/tn", task, "/f"]);
+        }
+        eprintln!(
+            "sddl: {}\nown enable: {own:?}\nown status: {own_status:?}\nown tasks: {own_list:?}\nuser root list after: {}",
+            combined(&sddl),
+            all_after
+                .lines()
+                .filter(|line| !line.starts_with("\"\\Microsoft"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         let admin = schtasks(&["/query", "/tn", &names[0], "/xml"]);
         panic!(
             "The user reads the task: {printed}\nuser list ({} lines): {}\nfile: {}\nfolder: {}\nadmin: {}",
