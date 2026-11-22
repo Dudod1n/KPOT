@@ -1,4 +1,5 @@
 #![cfg(windows)]
+#![allow(unused_variables, unreachable_code)]
 //! Tasks of the Windows Task Scheduler through the real `schtasks.exe`.
 //!
 //! The tests change the system scheduler, the user's `Run` key and, for the part that runs as a
@@ -612,7 +613,20 @@ impl Drop for StandardUser {
 /// Task Scheduler 1.2 definition of a task of `user`, as an elevated process registers it:
 /// administrators and LocalSystem have full access, the user may read and start it only. The
 /// logon trigger is off: the test signs the user in, and the task must not start КРОТ then.
-fn user_task_xml(user: &str, command: &Path, arguments: &str, logon: bool) -> String {
+fn user_task_xml(
+    user: &str,
+    command: &Path,
+    arguments: &str,
+    logon: bool,
+    sd: Option<&str>,
+) -> String {
+    let security = sd
+        .map(|sd| {
+            format!(
+                "<RegistrationInfo><SecurityDescriptor>{sd}</SecurityDescriptor></RegistrationInfo>"
+            )
+        })
+        .unwrap_or_default();
     let (triggers, level) = if logon {
         (
             format!(
@@ -626,7 +640,7 @@ fn user_task_xml(user: &str, command: &Path, arguments: &str, logon: bool) -> St
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\
-<RegistrationInfo><SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;{user})</SecurityDescriptor></RegistrationInfo>\
+{security}\
 {triggers}\
 <Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>{level}</RunLevel></Principal></Principals>\
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Enabled>true</Enabled></Settings>\
@@ -683,135 +697,95 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
     let names = listed(&divert);
     assert_eq!(names.len(), 1, "{names:?}");
     let arguments = format!("--config \"{}\" divert", config.display());
+    let arguments = format!("--config \"{}\" divert", config.display());
+    let logon_task = names[0].replacen("-divert-", "-logon-", 1);
+    let logon_arguments = format!("--config \"{}\" serve", config.display());
+    let mut report = String::new();
+    // A: default security, as an elevated process registers it.
     register_elevated(
         user.scripts.path(),
         &names[0],
-        &user_task_xml(&user.sid, &program, &arguments, false),
+        &user_task_xml(&user.sid, &program, &arguments, false, None),
     );
-    let schtasks_exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-        .join("System32")
-        .join("schtasks.exe");
-    let query: [&OsStr; 4] = [
-        "/query".as_ref(),
-        "/tn".as_ref(),
-        names[0].as_ref(),
-        "/xml".as_ref(),
-    ];
-    let (ok, printed) = user.run(&directory, &schtasks_exe, &query);
-    if !ok {
-        let list: [&OsStr; 4] = [
-            "/query".as_ref(),
-            "/fo".as_ref(),
-            "csv".as_ref(),
-            "/nh".as_ref(),
-        ];
-        let (_, all) = user.run(&directory, &schtasks_exe, &list);
-        let file = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32\\Tasks")
-            .join(names[0].trim_start_matches('\\'));
-        let acl = Command::new("icacls.exe").arg(&file).output().unwrap();
-        let folder = Command::new("icacls.exe")
-            .arg(file.parent().unwrap())
-            .output()
-            .unwrap();
-        let sddl = Command::new("powershell.exe")
-            .env_remove("PSModulePath")
-            .args(["-NoProfile", "-Command", &format!("$s = New-Object -ComObject Schedule.Service; $s.Connect(); 'root=' + $s.GetFolder('\\').GetSecurityDescriptor(4); 'task=' + $s.GetFolder('\\').GetTask('{}').GetSecurityDescriptor(4)", names[0])])
-            .output()
-            .unwrap();
-        let probe = directory.join("probe.json");
-        let own = user.krot(&program, &probe, &["autostart", "enable"]);
-        let own_status = user.krot(&program, &probe, &["autostart", "status"]);
-        let own_list = listed(&format!("\\{}-", name(&probe)));
-        let (_, all_after) = user.run(&directory, &schtasks_exe, &list);
-        let _ = cli(&probe, &["autostart", "disable"]);
-        for task in &own_list {
-            let _ = schtasks(&["/delete", "/tn", task, "/f"]);
-        }
-        eprintln!(
-            "sddl: {}\nown enable: {own:?}\nown status: {own_status:?}\nown tasks: {own_list:?}\nuser root list after: {}",
-            combined(&sddl),
-            all_after
-                .lines()
-                .filter(|line| !line.starts_with("\"\\Microsoft"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        let admin = schtasks(&["/query", "/tn", &names[0], "/xml"]);
-        panic!(
-            "The user reads the task: {printed}\nuser list ({} lines): {}\nfile: {}\nfolder: {}\nadmin: {}",
-            all.lines().count(),
-            all.lines()
-                .filter(|line| !line.starts_with("\"\\Microsoft"))
-                .collect::<Vec<_>>()
-                .join("\n")
-                + &format!(
-                    "\nplain query: {}",
-                    user.run(
-                        &directory,
-                        &schtasks_exe,
-                        &["/query".as_ref(), "/tn".as_ref(), names[0].as_ref()]
-                    )
-                    .1
-                ),
-            combined(&acl),
-            combined(&folder),
-            text(&admin.stdout)
-        );
-    }
-    let (ok, printed) = user.krot(&program, &config, &["elevation", "status"]);
-    assert!(ok, "{printed}");
-    assert!(printed.contains("включён"), "{printed}");
-
-    // Windows refuses to delete the task and denies the elevation request: turning
-    // remembering off fails and keeps the choice, so the status still tells the truth.
-    let (ok, printed) = user.krot(&program, &config, &["elevation", "disable"]);
-    assert!(!ok, "{printed}");
-    assert!(printed.contains("задани"), "{printed}");
-    assert_eq!(listed(&divert), names);
-    assert!(tasks::remembering(&config), "{printed}");
-    let (ok, printed) = user.krot(&program, &config, &["elevation", "status"]);
-    assert!(ok && printed.contains("включён"), "{printed}");
-
-    // #66: a logon task that an elevated КРОТ of an older version registered. Turning
-    // autostart on or off fails instead of leaving the task and the Run key both to start КРОТ.
-    let task = names[0].replacen("-divert-", "-logon-", 1);
-    let arguments = format!("--config \"{}\" serve", config.display());
     register_elevated(
         user.scripts.path(),
-        &task,
-        &user_task_xml(&user.sid, &program, &arguments, true),
+        &logon_task,
+        &user_task_xml(&user.sid, &program, &logon_arguments, true, None),
     );
-    assert_eq!(listed(&logon), std::slice::from_ref(&task));
-    let (ok, printed) = user.krot(&program, &config, &["autostart", "enable"]);
-    assert!(!ok, "{printed}");
-    assert!(printed.contains("задани"), "{printed}");
-    assert!(!user.run_key(&config));
-    assert_eq!(listed(&logon), std::slice::from_ref(&task));
-    let (ok, printed) = user.krot(&program, &config, &["autostart", "disable"]);
-    assert!(!ok, "{printed}");
-    assert!(printed.contains("задани"), "{printed}");
-    assert!(!user.run_key(&config));
-    assert_eq!(listed(&logon), [task]);
-    let (ok, printed) = user.krot(&program, &config, &["autostart", "status"]);
-    assert!(ok && printed.contains("включён"), "{printed}");
-
-    drop(cleanup);
-    let left = listed(&format!("\\{}-", name(&config)));
-    assert!(left.is_empty(), "{left:?}");
-    let (account, sid) = (user.name.clone(), user.sid.clone());
-    drop(user);
-    let probe = scripts();
-    let output = powershell(
-        probe.path(),
-        "left.ps1",
-        &account,
-        &[("KROT_TEST_SID", sid.as_ref())],
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "user=False profiles=0 hive=False",
-        "{}",
-        combined(&output)
-    );
+    for step in [
+        &["elevation", "status"][..],
+        &["elevation", "disable"],
+        &["elevation", "status"],
+        &["autostart", "enable"],
+        &["autostart", "status"],
+        &["autostart", "disable"],
+        &["autostart", "status"],
+    ] {
+        let result = user.krot(&program, &config, step);
+        report.push_str(&format!(
+            "A {step:?}: {result:?} remembering={} run={} divert={:?} logon={:?}\n",
+            tasks::remembering(&config),
+            user.run_key(&config),
+            listed(&divert),
+            listed(&logon)
+        ));
+    }
+    let _ = user.krot(&program, &config, &["autostart", "disable"]);
+    tasks::set_remembering(&config, true).unwrap();
+    // B: the user may do anything but delete.
+    for (mask, label) in [("0x1e01ff", "B"), ("0x1201bf", "C")] {
+        let sd = format!("D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;{mask};;;{})", user.sid);
+        register_elevated(
+            user.scripts.path(),
+            &names[0],
+            &user_task_xml(&user.sid, &program, &arguments, false, Some(&sd)),
+        );
+        register_elevated(
+            user.scripts.path(),
+            &logon_task,
+            &user_task_xml(&user.sid, &program, &logon_arguments, true, Some(&sd)),
+        );
+        for step in [
+            &["elevation", "status"][..],
+            &["elevation", "disable"],
+            &["elevation", "status"],
+            &["autostart", "enable"],
+            &["autostart", "status"],
+            &["autostart", "disable"],
+            &["autostart", "status"],
+        ] {
+            let result = user.krot(&program, &config, step);
+            report.push_str(&format!(
+                "{label} {step:?}: {result:?} remembering={} run={} divert={:?} logon={:?}\n",
+                tasks::remembering(&config),
+                user.run_key(&config),
+                listed(&divert),
+                listed(&logon)
+            ));
+        }
+        let _ = user.krot(&program, &config, &["autostart", "disable"]);
+        tasks::set_remembering(&config, true).unwrap();
+    }
+    panic!("probe:\n{report}");
+    #[allow(unreachable_code)]
+    {
+        drop(cleanup);
+        let left = listed(&format!("\\{}-", name(&config)));
+        assert!(left.is_empty(), "{left:?}");
+        let (account, sid) = (user.name.clone(), user.sid.clone());
+        drop(user);
+        let probe = scripts();
+        let output = powershell(
+            probe.path(),
+            "left.ps1",
+            &account,
+            &[("KROT_TEST_SID", sid.as_ref())],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "user=False profiles=0 hive=False",
+            "{}",
+            combined(&output)
+        );
+    }
 }
