@@ -25,6 +25,13 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Dudod1n/KPOT" />
     <Property Id="ARPHELPLINK" Value="https://github.com/Dudod1n/KPOT/issues" />
     <Property Id="ARPNOMODIFY" Value="1" />
+    <!--
+      The package's files replace whatever lies in the folder, whatever its version: a
+      portable copy unpacked there may be of the same or a higher version, and Windows
+      Installer would keep it, decided before any file is removed. Every file of the package
+      lies in КРОТ's own folder, so no shared file is downgraded.
+    -->
+    <Property Id="REINSTALLMODE" Value="amus" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="KROT" />
@@ -77,10 +84,10 @@
           <PermissionEx Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;AC)" />
         </CreateFolder>
         <!--
-          Files of a portable copy in this folder go before the package's own are installed:
-          Windows Installer keeps a file of the same or a higher version, and the service
-          would then start an older krot.exe that has no service in it. Only the names of
-          КРОТ's own files are removed, at installation and at removal.
+          Files of a portable copy in this folder that the package does not hold, such as
+          README.txt, go at installation, and all of them at removal, so that nothing of
+          КРОТ remains. Only the names of КРОТ's own files are removed, never the whole
+          folder: INSTALLFOLDER can be set on the command line.
         -->
         <RemoveFile Id="StaleKrot" Name="krot.exe" On="both" />
         <RemoveFile Id="StaleKrotCli" Name="krot-cli.exe" On="both" />
