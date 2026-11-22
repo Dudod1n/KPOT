@@ -626,7 +626,7 @@ fn user_task_xml(user: &str, command: &Path, arguments: &str, logon: bool) -> St
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\
-<RegistrationInfo><SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;{user})</SecurityDescriptor></RegistrationInfo>\
+<RegistrationInfo><SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;{user})</SecurityDescriptor></RegistrationInfo>\
 {triggers}\
 <Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>{level}</RunLevel></Principal></Principals>\
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Enabled>true</Enabled></Settings>\
