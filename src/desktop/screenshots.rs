@@ -467,8 +467,15 @@ fn scenes() -> Vec<(&'static str, Setup)> {
             "11d-update",
             Box::new(|app| {
                 base(app, 0, 0);
+                let mut release = crate::update::Release::for_test("0.7.2");
+                release.notes = vec![
+                    "Windows: установщик MSI и служба перехвата приложений без запроса прав администратора.".into(),
+                    "Журнал диагностики фонового процесса: krot-cli diagnostics.".into(),
+                    "Тест скорости и стабильности туннеля в карточке и в krot-cli test.".into(),
+                    "Исправлено: задания планировщика снова создаются.".into(),
+                ];
                 app.update = Some(UpdateDialog {
-                    release: crate::update::Release::for_test("0.7.0"),
+                    release,
                     manual: false,
                     stage: UpdateStage::Offer,
                     error: String::new(),

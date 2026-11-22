@@ -12,6 +12,12 @@ use std::{
 };
 
 const LATEST: &str = "https://api.github.com/repos/Dudod1n/KPOT/releases/latest";
+/// The only release page the update window opens; links from the release text are never used.
+pub const RELEASE_PAGE: &str = "https://github.com/Dudod1n/KPOT/releases/latest";
+/// The heading of the hand-written summary at the start of a CHANGELOG version entry.
+const SUMMARY_HEADING: &str = "**Кратко:**";
+const MAX_NOTES: usize = 5;
+const MAX_NOTE_CHARS: usize = 160;
 const MAX_METADATA: usize = 1024 * 1024;
 const MAX_ASSET: u64 = 256 * 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(45);
@@ -19,6 +25,8 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(45);
 #[derive(Clone, Debug)]
 pub struct Release {
     pub version: String,
+    /// Short plain-text list of what is new, taken from the untrusted release description.
+    pub notes: Vec<String>,
     assets: Vec<Asset>,
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -33,6 +41,7 @@ impl Release {
     pub(crate) fn for_test(version: &str) -> Self {
         Self {
             version: version.into(),
+            notes: vec![],
             assets: vec![],
         }
     }
@@ -42,6 +51,8 @@ struct GithubRelease {
     tag_name: String,
     draft: bool,
     prerelease: bool,
+    #[serde(default)]
+    body: Option<String>,
     assets: Vec<Asset>,
 }
 #[derive(Serialize, Deserialize)]
@@ -71,8 +82,88 @@ fn parse_release(data: &[u8], current: &str, skip: Option<&str>) -> Result<Optio
     ensure!(raw.assets.len() <= 64, "Слишком много файлов в релизе.");
     Ok(Some(Release {
         version: candidate.to_string(),
+        notes: release_notes(raw.body.as_deref().unwrap_or_default()),
         assets: raw.assets,
     }))
+}
+/// Reduces markdown from the network to plain text: no links, markup, HTML or control characters.
+fn plain_text(line: &str) -> String {
+    let mut text = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `[text](target)` and `![text](target)` keep only the text.
+            ']' => {
+                if chars.peek() == Some(&'(') {
+                    for c in chars.by_ref() {
+                        if c == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
+            // HTML tags and autolinks are dropped whole; `<туннель>` in a command stays.
+            '<' if chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?')) =>
+            {
+                for c in chars.by_ref() {
+                    if c == '>' {
+                        break;
+                    }
+                }
+            }
+            '[' | '`' | '*' => {}
+            '!' if chars.peek() == Some(&'[') => {}
+            c if c.is_control()
+                || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}' | '\u{feff}') =>
+            {
+                text.push(' ');
+            }
+            c => text.push(c),
+        }
+    }
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= MAX_NOTE_CHARS {
+        return text;
+    }
+    let mut short: String = text.chars().take(MAX_NOTE_CHARS - 1).collect();
+    short.truncate(short.trim_end().len());
+    short.push('…');
+    short
+}
+fn list_item(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    line.strip_prefix("- ").or_else(|| line.strip_prefix("* "))
+}
+/// The summary block if the release has one, otherwise each section with its first item.
+fn release_notes(body: &str) -> Vec<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut notes = Vec::new();
+    if let Some(start) = lines.iter().position(|line| line.trim() == SUMMARY_HEADING) {
+        for line in lines[start + 1..]
+            .iter()
+            .skip_while(|line| line.trim().is_empty())
+        {
+            let Some(item) = list_item(line) else { break };
+            notes.push(plain_text(item));
+        }
+    } else {
+        let mut section = None;
+        for line in &lines {
+            if let Some(heading) = line.strip_prefix("### ") {
+                section = Some(plain_text(heading));
+            } else if let Some(item) = list_item(line)
+                && let Some(heading) = section.take()
+            {
+                notes.push(plain_text(&format!("{heading}: {item}")));
+            }
+        }
+    }
+    notes.retain(|note| !note.is_empty());
+    notes.truncate(MAX_NOTES);
+    notes
 }
 fn skipped(store: &Store) -> Result<Option<String>> {
     let path = store.sidecar(".updates.json");
@@ -572,6 +663,59 @@ mod tests {
                     .is_none()
             );
         }
+    }
+    fn notes(body: serde_json::Value) -> Vec<String> {
+        let mut data: serde_json::Value = serde_json::from_slice(&release("1.0.0")).unwrap();
+        data["body"] = body;
+        parse_release(&serde_json::to_vec(&data).unwrap(), "0.9.0", None)
+            .unwrap()
+            .unwrap()
+            .notes
+    }
+    #[test]
+    fn release_notes_take_the_summary_block_as_plain_text() {
+        let body = "**Кратко:**\n\n\
+            - Новый [установщик](https://evil.test/a) ![x](https://evil.test/i.png) MSI.\n\
+            - Журнал <b>диагностики</b> <https://evil.test> `krot-cli diagnostics`.\n\
+            * Команда `krot-cli test <туннель>` и **тест**\u{202e} \u{1b}[31mскорости\u{7}.\n\
+            - \n\
+            - Четвёртый.\n- Пятый.\n- Шестой.\n\
+            \n### Добавлено\n\n- Подробности.\n";
+        assert_eq!(
+            notes(body.into()),
+            [
+                "Новый установщик x MSI.",
+                "Журнал диагностики krot-cli diagnostics.",
+                "Команда krot-cli test <туннель> и тест 31mскорости .",
+                "Четвёртый.",
+                "Пятый.",
+            ]
+        );
+        let long = format!("**Кратко:**\n- {}\n", "длинно ".repeat(100));
+        let [note] = notes(long.into()).try_into().unwrap();
+        assert_eq!(note.chars().count(), MAX_NOTE_CHARS);
+        assert!(note.ends_with("длинн…"));
+    }
+    #[test]
+    fn release_notes_without_summary_list_sections_and_first_items() {
+        let body = "### Добавлено\n\n- Журнал для [диагностики](https://evil.test).\n- Второй.\n\n\
+            ### Изменено\n\nТекст без списка.\n\n### Исправлено\n\n- Задания планировщика.\n";
+        assert_eq!(
+            notes(body.into()),
+            [
+                "Добавлено: Журнал для диагностики.",
+                "Исправлено: Задания планировщика.",
+            ]
+        );
+        assert!(notes(serde_json::Value::Null).is_empty());
+        assert!(notes("Просто текст.".into()).is_empty());
+        assert!(
+            parse_release(&release("1.0.0"), "0.9.0", None)
+                .unwrap()
+                .unwrap()
+                .notes
+                .is_empty()
+        );
     }
     #[test]
     fn skip_is_private_sidecar_and_leaves_config_unchanged() {
