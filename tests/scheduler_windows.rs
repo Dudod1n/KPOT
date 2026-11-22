@@ -838,7 +838,7 @@ fn a_standard_user_turns_autostart_on_and_off_through_its_own_logon_task() {
 /// `elevation status` and `elevation disable` report "off" while the task stays and
 /// `autostart enable` does not finish.
 #[test]
-#[ignore = "an elevated process's tasks are invisible to the standard user: Dudod1n/KPOT#ISSUE"]
+#[ignore = "an elevated process's tasks are invisible to the standard user: Dudod1n/KPOT#125"]
 fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_registered() {
     if !ci() {
         return;
