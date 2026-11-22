@@ -609,7 +609,8 @@ impl Drop for StandardUser {
     }
 }
 
-/// Task Scheduler 1.2 definition of a task of `user`, as an elevated process registers it. The
+/// Task Scheduler 1.2 definition of a task of `user`, as an elevated process registers it:
+/// administrators and LocalSystem have full access, the user may read and start it only. The
 /// logon trigger is off: the test signs the user in, and the task must not start КРОТ then.
 fn user_task_xml(user: &str, command: &Path, arguments: &str, logon: bool) -> String {
     let (triggers, level) = if logon {
@@ -625,6 +626,7 @@ fn user_task_xml(user: &str, command: &Path, arguments: &str, logon: bool) -> St
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\
+<RegistrationInfo><SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;{user})</SecurityDescriptor></RegistrationInfo>\
 {triggers}\
 <Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>{level}</RunLevel></Principal></Principals>\
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Enabled>true</Enabled></Settings>\
@@ -686,6 +688,17 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
         &names[0],
         &user_task_xml(&user.sid, &program, &arguments, false),
     );
+    let schtasks_exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("schtasks.exe");
+    let query: [&OsStr; 4] = [
+        "/query".as_ref(),
+        "/tn".as_ref(),
+        names[0].as_ref(),
+        "/xml".as_ref(),
+    ];
+    let (ok, printed) = user.run(&directory, &schtasks_exe, &query);
+    assert!(ok, "The user reads the task: {printed}");
     let (ok, printed) = user.krot(&program, &config, &["elevation", "status"]);
     assert!(ok, "{printed}");
     assert!(printed.contains("включён"), "{printed}");
