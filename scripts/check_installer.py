@@ -32,6 +32,10 @@ WRITE_RIGHTS = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0
 INHERIT_ONLY = 2
 
 
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def step(text):
     print(f'== {text}', flush=True)
 
@@ -202,8 +206,19 @@ def main():
     own_task = task_name('krot-0123456789abcdef', installed)
     foreign_task = task_name('krot-0123456789abcdef', r'C:\Portable\KROT\krot.exe')
 
+    step('a portable copy is already in the folder, with rights too wide')
+    INSTALL.mkdir(parents=True)
+    # A program of a higher version than the package's krot.exe: Windows Installer would keep it.
+    stale = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'where.exe'
+    (INSTALL / 'krot.exe').write_bytes(stale.read_bytes())
+    for name in ('README.txt', 'krot.ico', 'LICENSE'):
+        (INSTALL / name).write_text('portable copy', encoding='utf-8')
+    subprocess.run(['icacls', str(INSTALL), '/grant', '*S-1-5-32-545:(OI)(CI)M'], check=True, capture_output=True)
+
     step('install')
     msiexec(work / 'install.log', '/i', str(args.package.resolve()))
+    assert sha256(INSTALL / 'krot.exe') != sha256(stale), 'the portable krot.exe stayed in place'
+    assert sorted(path.name for path in INSTALL.iterdir()) == sorted(FILES), list(INSTALL.iterdir())
     check_installed(args.version)
     check_interception(config)
     cli(config, 'autostart', 'enable')

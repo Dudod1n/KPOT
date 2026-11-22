@@ -68,6 +68,31 @@
       <Component Id="InstallDir">
         <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="InstallDir" Type="string"
                        Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <!--
+          The folder may exist before the installation, for example with a portable copy
+          unpacked by hand. The service runs its programs from here as LocalSystem, so the
+          rights are set explicitly: only SYSTEM and administrators change anything.
+        -->
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;AC)" />
+        </CreateFolder>
+        <!--
+          Files of a portable copy in this folder go before the package's own are installed:
+          Windows Installer keeps a file of the same or a higher version, and the service
+          would then start an older krot.exe that has no service in it. Only the names of
+          КРОТ's own files are removed, at installation and at removal.
+        -->
+        <RemoveFile Id="StaleKrot" Name="krot.exe" On="both" />
+        <RemoveFile Id="StaleKrotCli" Name="krot-cli.exe" On="both" />
+        <RemoveFile Id="StaleWinDivertDll" Name="WinDivert.dll" On="both" />
+        <RemoveFile Id="StaleWinDivertSys" Name="WinDivert64.sys" On="both" />
+        <RemoveFile Id="StaleWinDivertLicense" Name="WinDivert-LICENSE.txt" On="both" />
+        <RemoveFile Id="StaleNotices" Name="THIRD_PARTY_NOTICES.txt" On="both" />
+        <RemoveFile Id="StaleLicense" Name="LICENSE" On="both" />
+        <RemoveFile Id="StaleLicenseTxt" Name="LICENSE.txt" On="both" />
+        <RemoveFile Id="StaleReadme" Name="README.txt" On="both" />
+        <RemoveFile Id="StaleIcon" Name="krot.ico" On="both" />
+        <RemoveFile Id="StalePng" Name="krot.png" On="both" />
       </Component>
     </ComponentGroup>
 
