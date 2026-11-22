@@ -698,7 +698,32 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
         "/xml".as_ref(),
     ];
     let (ok, printed) = user.run(&directory, &schtasks_exe, &query);
-    assert!(ok, "The user reads the task: {printed}");
+    if !ok {
+        let list: [&OsStr; 4] = [
+            "/query".as_ref(),
+            "/fo".as_ref(),
+            "csv".as_ref(),
+            "/nh".as_ref(),
+        ];
+        let (_, all) = user.run(&directory, &schtasks_exe, &list);
+        let file = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32\\Tasks")
+            .join(names[0].trim_start_matches('\\'));
+        let acl = Command::new("icacls.exe").arg(&file).output().unwrap();
+        let folder = Command::new("icacls.exe")
+            .arg(file.parent().unwrap())
+            .output()
+            .unwrap();
+        let admin = schtasks(&["/query", "/tn", &names[0], "/xml"]);
+        panic!(
+            "The user reads the task: {printed}\nuser list ({} lines): {}\nfile: {}\nfolder: {}\nadmin: {}",
+            all.lines().count(),
+            all.lines().take(8).collect::<Vec<_>>().join("\n"),
+            combined(&acl),
+            combined(&folder),
+            text(&admin.stdout)
+        );
+    }
     let (ok, printed) = user.krot(&program, &config, &["elevation", "status"]);
     assert!(ok, "{printed}");
     assert!(printed.contains("включён"), "{printed}");
