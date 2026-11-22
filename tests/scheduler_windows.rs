@@ -479,6 +479,9 @@ fn powershell(scripts: &Path, script: &str, user: &str, environment: &[(&str, &O
             "-File",
         ])
         .arg(scripts.join(script))
+        // The modules of PowerShell 7, which runs the CI steps, do not load in Windows
+        // PowerShell: without the variable it finds its own.
+        .env_remove("PSModulePath")
         .env("KROT_TEST_USER", user)
         .envs(environment.iter().copied())
         .stdin(Stdio::null())
