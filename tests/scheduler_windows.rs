@@ -718,7 +718,19 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
         panic!(
             "The user reads the task: {printed}\nuser list ({} lines): {}\nfile: {}\nfolder: {}\nadmin: {}",
             all.lines().count(),
-            all.lines().take(8).collect::<Vec<_>>().join("\n"),
+            all.lines()
+                .filter(|line| !line.starts_with("\"\\Microsoft"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + &format!(
+                    "\nplain query: {}",
+                    user.run(
+                        &directory,
+                        &schtasks_exe,
+                        &["/query".as_ref(), "/tn".as_ref(), names[0].as_ref()]
+                    )
+                    .1
+                ),
             combined(&acl),
             combined(&folder),
             text(&admin.stdout)
