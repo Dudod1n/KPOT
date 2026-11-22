@@ -120,7 +120,7 @@ fn installed_run_value(name: &str, command: &str, program: &str) -> bool {
 #[cfg(windows)]
 pub(crate) use system::process_user;
 #[cfg(windows)]
-pub use system::{cleanup, install_dir, installed, request, run, system_program};
+pub use system::{cleanup, install_dir, installed, prepare_install, request, run, system_program};
 
 /// Only Windows has the service.
 #[cfg(not(windows))]
@@ -1111,11 +1111,12 @@ mod system {
             if !installed_program(Path::new(&image), directory) {
                 continue;
             }
-            // SAFETY: the handle is checked and closed.
+            // SAFETY: the handle is checked and closed. The wait lets Windows Installer replace
+            // the files right after: a file still mapped by a process is only replaced at reboot.
             unsafe {
-                let process = Owned(OpenProcess(PROCESS_TERMINATE, 0, pid));
-                if !process.0.is_null() {
-                    TerminateProcess(process.0, 1);
+                let process = Owned(OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid));
+                if !process.0.is_null() && TerminateProcess(process.0, 1) != 0 {
+                    WaitForSingleObject(process.0, 10_000);
                 }
             }
         }
@@ -1210,6 +1211,19 @@ mod system {
                 unsafe { RegDeleteValueW(key.0, name.as_ptr()) };
             }
         }
+    }
+
+    /// Run by the installer as LocalSystem before it replaces the files in `directory`: a
+    /// running КРОТ there, for example a portable copy unpacked into the same folder, would
+    /// keep its older files until a reboot, and the service would start the older program.
+    /// Copies in other folders go on running.
+    pub fn prepare_install(directory: &Path) -> Result<()> {
+        ensure!(
+            directory.is_absolute(),
+            "Каталог установки должен быть абсолютным путём."
+        );
+        stop_processes(directory);
+        Ok(())
     }
 
     /// Run by the uninstaller as LocalSystem before it removes the files: ends the running

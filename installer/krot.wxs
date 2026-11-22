@@ -120,9 +120,22 @@
     -->
     <CustomAction Id="Cleanup" FileRef="KrotExe" ExeCommand="uninstall-cleanup"
                   Execute="deferred" Impersonate="no" Return="ignore" />
+    <!--
+      Before the files are replaced: ends КРОТ running from the installation folder, for
+      example a portable copy unpacked there. Windows would otherwise replace the files of a
+      running program only at reboot, and the service would start the older krot.exe. The
+      program runs from the package itself, since nothing is installed yet. The trailing
+      backslash is doubled so that it does not escape the closing quote.
+    -->
+    <Binary Id="KrotPrepare" SourceFile="$(var.Binaries)\krot.exe" />
+    <CustomAction Id="StopInstalledFolder" BinaryRef="KrotPrepare"
+                  ExeCommand="install-prepare &quot;[INSTALLFOLDER]\&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="Cleanup" Before="RemoveRegistryValues"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="StopInstalledFolder" Before="RemoveFiles"
+              Condition="NOT REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
     <Feature Id="Main" Title="КРОТ" Level="1">
