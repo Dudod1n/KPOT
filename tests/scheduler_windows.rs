@@ -1,5 +1,5 @@
 #![cfg(windows)]
-#![allow(unused_variables, unreachable_code)]
+#![allow(unused_variables, unreachable_code, clippy::all)]
 //! Tasks of the Windows Task Scheduler through the real `schtasks.exe`.
 //!
 //! The tests change the system scheduler, the user's `Run` key and, for the part that runs as a
@@ -423,7 +423,7 @@ try {
     exit 200
 }
 $null = $process.Handle
-if (-not $process.WaitForExit(120000)) {
+if (-not $process.WaitForExit(60000)) {
     $process.Kill()
     exit 201
 }
@@ -721,14 +721,18 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
         &["autostart", "disable"],
         &["autostart", "status"],
     ] {
+        eprintln!("step {step:?}");
         let result = user.krot(&program, &config, step);
-        report.push_str(&format!(
-            "A {step:?}: {result:?} remembering={} run={} divert={:?} logon={:?}\n",
-            tasks::remembering(&config),
-            user.run_key(&config),
-            listed(&divert),
-            listed(&logon)
-        ));
+        eprintln!(
+            "{}",
+            format!(
+                "A {step:?}: {result:?} remembering={} run={} divert={:?} logon={:?}\n",
+                tasks::remembering(&config),
+                user.run_key(&config),
+                listed(&divert),
+                listed(&logon)
+            )
+        );
     }
     let _ = user.krot(&program, &config, &["autostart", "disable"]);
     tasks::set_remembering(&config, true).unwrap();
@@ -754,14 +758,18 @@ fn a_standard_user_keeps_the_choice_and_reports_tasks_that_an_elevated_process_r
             &["autostart", "disable"],
             &["autostart", "status"],
         ] {
+            eprintln!("step {step:?}");
             let result = user.krot(&program, &config, step);
-            report.push_str(&format!(
-                "{label} {step:?}: {result:?} remembering={} run={} divert={:?} logon={:?}\n",
-                tasks::remembering(&config),
-                user.run_key(&config),
-                listed(&divert),
-                listed(&logon)
-            ));
+            eprintln!(
+                "{}",
+                format!(
+                    "{label} {step:?}: {result:?} remembering={} run={} divert={:?} logon={:?}\n",
+                    tasks::remembering(&config),
+                    user.run_key(&config),
+                    listed(&divert),
+                    listed(&logon)
+                )
+            );
         }
         let _ = user.krot(&program, &config, &["autostart", "disable"]);
         tasks::set_remembering(&config, true).unwrap();
