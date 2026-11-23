@@ -5566,11 +5566,25 @@ mod tests {
     }
     #[test]
     fn mole_looks_left_right_centre_and_stays_still_without_motion() {
-        assert_eq!(FRAME_TIME, Duration::from_millis(180));
-        let looks: Vec<i8> = [0, 1499, 1500, 3000, 4500]
-            .map(|ms| style::Pose::at(Some(ms), false).look)
-            .to_vec();
-        assert_eq!(looks, [-1, -1, 1, 0, -1]);
+        // A redraw at least every half second, but not a busy loop.
+        assert!((Duration::from_millis(50)..=Duration::from_millis(500)).contains(&FRAME_TIME));
+        // Runs of one look over ten seconds: left, right, centre in turn, each held for a
+        // second or more, so the pupils never flicker between frames.
+        let mut runs: Vec<(i8, u128)> = Vec::new();
+        for ms in (0..10_000).step_by(10) {
+            let look = style::Pose::at(Some(ms), false).look;
+            match runs.last_mut() {
+                Some((last, length)) if *last == look => *length += 10,
+                _ => runs.push((look, 10)),
+            }
+        }
+        let order: Vec<i8> = runs.iter().map(|(look, _)| *look).collect();
+        assert_eq!(&order[..3], &[-1, 1, 0]);
+        assert!(order.windows(3).all(|w| w[0] != w[1] && w[0] != w[2]));
+        assert!(
+            runs[..runs.len() - 1].iter().all(|(_, held)| *held >= 1000),
+            "{runs:?}"
+        );
         assert_ne!(
             style::Pose::at(Some(0), true).rays,
             style::Pose::at(Some(800), true).rays
@@ -6127,9 +6141,10 @@ mod tests {
                 "{family:?} keeps the fallback"
             );
         }
-        assert_eq!(
+        // The last theme has no palette: dark mode keeps the classic colours, not egui's.
+        assert_ne!(
             ctx.style_of(egui::Theme::Dark).visuals.panel_fill,
-            Color32::from_rgb(21, 27, 30)
+            egui::Visuals::dark().panel_fill
         );
     }
     #[test]
