@@ -686,7 +686,9 @@ pub(super) async fn handshake(
         inner: stream,
         received: received.clone(),
     };
+    // The banner of the tunnels, so the check sees what the censor sees from them.
     let config = Arc::new(client::Config {
+        client_id: crate::ssh::client_id(),
         inactivity_timeout: Some(options.ssh_timeout),
         ..Default::default()
     });

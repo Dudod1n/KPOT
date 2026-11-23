@@ -212,7 +212,7 @@ async fn counted_streams_add_what_passes_in_each_direction() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_probe_pings_every_ten_seconds_and_survives_unanswered_pings() {
+async fn the_probe_pings_after_each_pause_and_survives_unanswered_pings() {
     let link = Arc::new(Link::new());
     link.connected();
     let answers = Arc::new(Mutex::new(vec![true, true, false, false, true]));
@@ -220,19 +220,22 @@ async fn the_probe_pings_every_ten_seconds_and_survives_unanswered_pings() {
     let probe = {
         let (link, answers, calls) = (link.clone(), answers.clone(), calls.clone());
         tokio::spawn(async move {
-            link.probe(|| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                let answer = answers.lock().unwrap().remove(0);
-                async move {
-                    if answer {
-                        tokio::time::sleep(30 * MS).await;
-                    } else {
-                        // Never answers; the probe gives up on it after the timeout.
-                        std::future::pending::<()>().await;
+            link.probe_with(
+                || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let answer = answers.lock().unwrap().remove(0);
+                    async move {
+                        if answer {
+                            tokio::time::sleep(30 * MS).await;
+                        } else {
+                            // Never answers; the probe gives up on it after the timeout.
+                            std::future::pending::<()>().await;
+                        }
+                        true
                     }
-                    true
-                }
-            })
+                },
+                || 10 * SECOND,
+            )
             .await
         })
     };
@@ -249,6 +252,18 @@ async fn the_probe_pings_every_ten_seconds_and_survives_unanswered_pings() {
     assert_eq!(stats.rtt.max_us, Some(30_000));
     assert!(!probe.is_finished());
     probe.abort();
+}
+
+#[test]
+fn pauses_between_pings_vary_within_bounds() {
+    let pauses: Vec<Duration> = (0..200).map(|_| ping_pause()).collect();
+    assert!(
+        pauses
+            .iter()
+            .all(|pause| (PING_INTERVAL_MIN..=PING_INTERVAL_MAX).contains(pause))
+    );
+    // Equal pauses would draw the periodic pattern the randomness is there to avoid.
+    assert!(pauses.iter().any(|pause| *pause != pauses[0]));
 }
 
 #[tokio::test(start_paused = true)]
