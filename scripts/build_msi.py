@@ -2,7 +2,8 @@
 
 The package takes the release binaries, the pinned WinDivert files and the license texts
 from --binaries. The executables must be signed before this step and the package after it,
-once a signing certificate exists (see docs/RELEASING.md).
+once a signing certificate exists (see docs/RELEASING.md). The wizard needs the UI extension
+in the wix cache: `wix extension add -g WixToolset.UI.wixext/5.0.2`.
 """
 import argparse
 from pathlib import Path
@@ -13,7 +14,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'installer' / 'krot.wxs'
-# The wizard's dialogs and their Russian texts; CI adds the extension with `wix extension add -g`.
+# The wizard's dialogs and their Russian texts.
 UI_EXTENSION = 'WixToolset.UI.wixext/5.0.2'
 INPUTS = ['krot.exe', 'krot-cli.exe', 'WinDivert.dll', 'WinDivert64.sys',
           'WinDivert-LICENSE.txt', 'THIRD_PARTY_NOTICES.txt']
