@@ -24,6 +24,20 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use zeroize::Zeroizing;
 
+/// Identification line sent in clear text before the key exchange. russh would send its own name
+/// and exact version, which no other client sends and a censor matches with one rule; this is
+/// the line of the platform's stock OpenSSH client. The key exchange offer still differs from
+/// OpenSSH's.
+#[cfg(windows)]
+pub const CLIENT_ID: &str = "SSH-2.0-OpenSSH_for_Windows_9.5";
+#[cfg(not(windows))]
+pub const CLIENT_ID: &str = "SSH-2.0-OpenSSH_9.6p1";
+
+/// [`CLIENT_ID`] in the form russh takes.
+pub fn client_id() -> russh::SshId {
+    russh::SshId::Standard(CLIENT_ID.into())
+}
+
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 /// About five seconds of consecutive accept errors.
@@ -1045,6 +1059,7 @@ impl Manager {
             };
             let stream = CancelIo::new(stream, attempt.cancel.clone());
             let config = Arc::new(client::Config {
+                client_id: client_id(),
                 nodelay: true,
                 keepalive_interval: Some(Duration::from_secs(15)),
                 keepalive_max: 3,
@@ -1964,6 +1979,16 @@ mod tests {
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response[3], 7);
         assert!(parse.await.unwrap().is_err());
+    }
+    #[test]
+    fn the_banner_names_neither_the_library_nor_its_version() {
+        let russh::SshId::Standard(line) = client_id() else {
+            panic!("russh appends the line ending itself only to a standard id");
+        };
+        assert_eq!(line, CLIENT_ID);
+        assert!(line.starts_with("SSH-2.0-OpenSSH_"));
+        assert!(!line.contains([' ', '\r', '\n']));
+        assert!(!line.to_ascii_lowercase().contains("russh"));
     }
     #[test]
     fn unsolicited_remote_routes_and_string_trust_answers_are_rejected() {

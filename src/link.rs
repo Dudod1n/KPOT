@@ -17,8 +17,11 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::metrics::{Summary, Windowed};
 
-/// Pause between pings, and how long a ping may wait for its answer before it counts as lost.
-pub const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// Bounds of the pause between pings, ten seconds on average. Each pause is drawn anew: a fixed
+/// one draws a strictly periodic pattern that tells a tunnel from an interactive session.
+pub const PING_INTERVAL_MIN: Duration = Duration::from_secs(7);
+pub const PING_INTERVAL_MAX: Duration = Duration::from_secs(13);
+/// How long a ping may wait for its answer before it counts as lost.
 pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// The first ping goes out soon after connecting, so that the delay shows at once.
 const FIRST_PING: Duration = Duration::from_secs(1);
@@ -420,7 +423,16 @@ impl Link {
     /// Pings the session and reads the counters until `ping` reports the session gone. `ping`
     /// resolves `true` on an answer; one without an answer in `PING_TIMEOUT` counts as lost
     /// and leaves the session alone.
-    pub async fn probe<P, F>(&self, mut ping: P)
+    pub async fn probe<P, F>(&self, ping: P)
+    where
+        P: FnMut() -> F,
+        F: Future<Output = bool>,
+    {
+        self.probe_with(ping, ping_pause).await
+    }
+
+    /// [`Link::probe`] with the pauses between pings taken from `pause`.
+    async fn probe_with<P, F>(&self, mut ping: P, mut pause: impl FnMut() -> Duration)
     where
         P: FnMut() -> F,
         F: Future<Output = bool>,
@@ -429,7 +441,7 @@ impl Link {
             let mut next = Instant::now() + FIRST_PING;
             loop {
                 tokio::time::sleep_until(next).await;
-                next += PING_INTERVAL;
+                next += pause();
                 let sent = Instant::now();
                 match tokio::time::timeout(PING_TIMEOUT, ping()).await {
                     Ok(true) => {
@@ -455,6 +467,14 @@ impl Link {
             () = sampling => {},
         }
     }
+}
+
+/// A pause between pings, uniform within [`PING_INTERVAL_MIN`]..=[`PING_INTERVAL_MAX`].
+fn ping_pause() -> Duration {
+    let millis = |bound: Duration| u64::try_from(bound.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(rand::random_range(
+        millis(PING_INTERVAL_MIN)..=millis(PING_INTERVAL_MAX),
+    ))
 }
 
 /// A rate in words: `4,2 Мбит/с`.
