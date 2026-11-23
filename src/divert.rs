@@ -662,7 +662,7 @@ pub fn launch(config: &std::path::Path, prompt: Prompt) -> anyhow::Result<()> {
 pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        if let Some(sid) = remember
+        let registration = if let Some(sid) = remember
             && crate::tasks::remembering(&store.path)
             && crate::tasks::elevated()
             && crate::tasks::user_sid().is_ok_and(|own| own == sid)
@@ -671,17 +671,51 @@ pub fn run(store: crate::config::Store, remember: Option<String>) -> anyhow::Res
             // consent registers anew, which also repairs a task that does not give the rights.
             // Apart from interception: registering lists every task of the system.
             let path = store.path.clone();
-            std::thread::spawn(move || {
+            Some(std::thread::spawn(move || {
                 let _ = crate::tasks::register(&path, crate::tasks::Kind::Divert);
-            });
-        }
-        windows::run(store)
+            }))
+        } else {
+            None
+        };
+        windows::run(store, windows::Registration(registration))
     }
     #[cfg(not(windows))]
     {
         let _ = (store, remember);
         anyhow::bail!("Перехват трафика приложений работает только в Windows.")
     }
+}
+
+/// Runs the helper that the interception service started: its assignment comes on standard
+/// input, and it reads nothing from the user's directory.
+pub fn run_assigned() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use anyhow::Context;
+        use std::io::Read;
+        let mut data = zeroize::Zeroizing::new(Vec::new());
+        std::io::stdin().take(4097).read_to_end(&mut data)?;
+        anyhow::ensure!(data.len() <= 4096, "Слишком длинное задание помощника.");
+        let assignment: crate::service::Assignment =
+            serde_json::from_slice(&data).context("Некорректное задание помощника.")?;
+        windows::run_assigned(assignment)
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("Перехват трафика приложений работает только в Windows.")
+    }
+}
+
+/// Removes the firewall rules of the service's helpers; the service and the uninstaller call it.
+#[cfg(windows)]
+pub(crate) fn clear_service_firewall() {
+    windows::clear_service_firewall();
+}
+
+/// Removes the firewall rule of one helper of the service, which the service ended.
+#[cfg(windows)]
+pub(crate) fn close_service_firewall(port: u16) {
+    windows::close_service_firewall(port);
 }
 
 #[cfg(test)]

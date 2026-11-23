@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows Installer package of КРОТ (WiX Toolset 5). scripts/build_msi.py builds it:
+    Version   numeric version, e.g. 0.7.2
+    Binaries  directory with krot.exe, krot-cli.exe, the WinDivert files and THIRD_PARTY_NOTICES.txt
+    Root      repository root, for LICENSE and assets\krot.ico
+
+  Everything goes to Program Files, where only administrators write: the interception
+  service runs from there as LocalSystem. The package never touches users' profiles; their
+  configuration stays where it is when КРОТ is removed.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="КРОТ" Manufacturer="Проект КРОТ" Version="$(var.Version)"
+           UpgradeCode="69DBAA5B-52F6-4F26-ABF4-8DC037C8A21B" Scope="perMachine"
+           Language="1049" Codepage="1251" Compressed="yes" InstallerVersion="500">
+    <SummaryInformation Description="КРОТ — менеджер SSH-туннелей" Manufacturer="Проект КРОТ" Codepage="1251" />
+    <!-- The previous version goes first, as a whole: no file of two versions mixes. -->
+    <!-- A build of the same version replaces the installed one instead of going next to it. -->
+    <MajorUpgrade Schedule="afterInstallInitialize" AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="Уже установлена более новая версия КРОТа." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="krot.ico" SourceFile="$(var.Root)\assets\krot.ico" />
+    <Property Id="ARPPRODUCTICON" Value="krot.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Dudod1n/KPOT" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Dudod1n/KPOT/issues" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <!--
+      The package's files replace whatever lies in the folder, whatever its version: a
+      portable copy unpacked there may be of the same or a higher version, and Windows
+      Installer would keep it, decided before any file is removed. Every file of the package
+      lies in КРОТ's own folder, so no shared file is downgraded.
+    -->
+    <Property Id="REINSTALLMODE" Value="amus" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="KROT" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <!-- Reserved for the service's own journal: SYSTEM and administrators only. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="KROT" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Program" Directory="INSTALLFOLDER">
+      <Component Id="KrotExe">
+        <File Id="KrotExe" Source="$(var.Binaries)\krot.exe" KeyPath="yes" />
+        <ServiceInstall Id="KrotDivert" Name="KrotDivert" DisplayName="КРОТ: перехват приложений"
+                        Description="Запускает помощник перехвата трафика приложений для установленного КРОТа."
+                        Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem"
+                        Arguments="service" Vital="yes" />
+        <ServiceControl Id="KrotDivert" Name="KrotDivert" Start="install" Stop="both"
+                        Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="KrotCli">
+        <File Id="KrotCli" Source="$(var.Binaries)\krot-cli.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="WinDivertDll">
+        <File Id="WinDivertDll" Source="$(var.Binaries)\WinDivert.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="WinDivertSys">
+        <File Id="WinDivertSys" Source="$(var.Binaries)\WinDivert64.sys" KeyPath="yes" />
+      </Component>
+      <!-- Unversioned files: one per component, so that their GUIDs can be generated. -->
+      <Component Id="License">
+        <File Id="License" Source="$(var.Root)\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="Notices">
+        <File Id="Notices" Source="$(var.Binaries)\THIRD_PARTY_NOTICES.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="WinDivertLicense">
+        <File Id="WinDivertLicense" Source="$(var.Binaries)\WinDivert-LICENSE.txt" KeyPath="yes" />
+      </Component>
+      <!-- КРОТ tells the installed copy from portable ones by this value. -->
+      <Component Id="InstallDir">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="InstallDir" Type="string"
+                       Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <!--
+          The folder may exist before the installation, for example with a portable copy
+          unpacked by hand. The service runs its programs from here as LocalSystem, so the
+          rights are set explicitly: only SYSTEM and administrators change anything.
+        -->
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;AC)" />
+        </CreateFolder>
+        <!--
+          Files of a portable copy in this folder that the package does not hold, such as
+          README.txt, go at installation, and all of them at removal, so that nothing of
+          КРОТ remains. Only the names of КРОТ's own files are removed, never the whole
+          folder: INSTALLFOLDER can be set on the command line.
+        -->
+        <RemoveFile Id="StaleKrot" Name="krot.exe" On="both" />
+        <RemoveFile Id="StaleKrotCli" Name="krot-cli.exe" On="both" />
+        <RemoveFile Id="StaleWinDivertDll" Name="WinDivert.dll" On="both" />
+        <RemoveFile Id="StaleWinDivertSys" Name="WinDivert64.sys" On="both" />
+        <RemoveFile Id="StaleWinDivertLicense" Name="WinDivert-LICENSE.txt" On="both" />
+        <RemoveFile Id="StaleNotices" Name="THIRD_PARTY_NOTICES.txt" On="both" />
+        <RemoveFile Id="StaleLicense" Name="LICENSE" On="both" />
+        <RemoveFile Id="StaleLicenseTxt" Name="LICENSE.txt" On="both" />
+        <RemoveFile Id="StaleReadme" Name="README.txt" On="both" />
+        <RemoveFile Id="StaleIcon" Name="krot.ico" On="both" />
+        <RemoveFile Id="StalePng" Name="krot.png" On="both" />
+        <!-- A folder that existed before the installation is otherwise left empty. -->
+        <RemoveFolder Id="InstallFolder" On="uninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenu" Directory="ProgramMenuFolder">
+      <Shortcut Id="StartMenu" Name="КРОТ" Description="Менеджер SSH-туннелей"
+                Target="[#KrotExe]" WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="StartMenu" Type="integer" Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <Component Id="Data" Directory="DATAFOLDER">
+      <CreateFolder>
+        <PermissionEx Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+      </CreateFolder>
+      <RemoveFile Id="DataFiles" Name="*" On="uninstall" />
+      <RemoveFolder Id="DataFolder" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\KROT" Name="DataDir" Type="string"
+                     Value="[DATAFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <!--
+      Before the files and HKLM\SOFTWARE\KROT go: ends the running КРОТ of this installation,
+      removes the logon and interception tasks and the Run values that start it, and the
+      firewall rules of the service's helpers. Not on an upgrade: the new version keeps them.
+    -->
+    <CustomAction Id="Cleanup" FileRef="KrotExe" ExeCommand="uninstall-cleanup"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!--
+      Before the files are replaced: ends КРОТ running from the installation folder, for
+      example a portable copy unpacked there. Windows would otherwise replace the files of a
+      running program only at reboot, and the service would start the older krot.exe. The
+      program runs from the package itself, since nothing is installed yet. The trailing
+      backslash is doubled so that it does not escape the closing quote.
+    -->
+    <Binary Id="KrotPrepare" SourceFile="$(var.Binaries)\krot.exe" />
+    <CustomAction Id="StopInstalledFolder" BinaryRef="KrotPrepare"
+                  ExeCommand="install-prepare &quot;[INSTALLFOLDER]\&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="Cleanup" Before="RemoveRegistryValues"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="StopInstalledFolder" Before="RemoveFiles"
+              Condition="NOT REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="КРОТ" Level="1">
+      <ComponentGroupRef Id="Program" />
+      <ComponentRef Id="StartMenu" />
+      <ComponentRef Id="Data" />
+    </Feature>
+  </Package>
+</Wix>

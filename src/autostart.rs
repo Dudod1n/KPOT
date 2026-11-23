@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", test))]
 use std::{collections::HashMap, fs, io::Write};
 
-pub(crate) fn registration(path: &Path) -> Result<(PathBuf, String)> {
+/// Canonical configuration path and the name of its autostart entries and tasks.
+pub fn registration(path: &Path) -> Result<(PathBuf, String)> {
     let path = Store::new(path)?.path;
     let text = path
         .to_str()
@@ -514,14 +515,28 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
         );
         if enabled {
             // A logon task starts without Explorer's startup delay; the Run key stays a fallback.
-            if crate::tasks::register(&path, crate::tasks::Kind::Logon).is_ok() {
-                if existing.is_some() {
-                    registry::set(&name, None)?;
+            // An elevated КРОТ registers no task: the user's own КРОТ might not delete it later.
+            if !crate::tasks::elevated()
+                && crate::tasks::register(&path, crate::tasks::Kind::Logon).is_ok()
+            {
+                if existing.is_some()
+                    && let Err(error) = registry::set(&name, None)
+                {
+                    // Both would start КРОТ at logon: the Run key, which stays, works alone.
+                    let _ = crate::tasks::unregister(&path, crate::tasks::Kind::Logon, false);
+                    return Err(error);
                 }
-                return Ok(());
+                // A task of another copy that an elevated КРОТ registered stays after `register`.
+                return crate::tasks::unregister_others(&path, crate::tasks::Kind::Logon, true);
             }
-            // Tasks of moved copies must not start a second КРОТ next to the Run key.
-            let _ = crate::tasks::unregister(&path, crate::tasks::Kind::Logon);
+            // Tasks of moved copies, or one that an elevated КРОТ registered, must not start a
+            // second КРОТ next to the Run key. Where the Task Scheduler cannot be read there is
+            // no task to remove.
+            if let Err(error) = crate::tasks::unregister(&path, crate::tasks::Kind::Logon, true)
+                && crate::tasks::registered(&path, crate::tasks::Kind::Logon, true).unwrap_or(false)
+            {
+                return Err(error);
+            }
             let command = windows_command(&launch_command(&path)?);
             ensure!(
                 command.encode_utf16().count() <= 260,
@@ -535,7 +550,7 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
             // Where the Task Scheduler cannot be read no task was created either: turning on
             // fell back to the Run key there. Only a task that is known to remain, of this
             // copy or of a moved one, is an error.
-            if let Err(error) = crate::tasks::unregister(&path, crate::tasks::Kind::Logon)
+            if let Err(error) = crate::tasks::unregister(&path, crate::tasks::Kind::Logon, true)
                 && crate::tasks::registered(&path, crate::tasks::Kind::Logon, true).unwrap_or(false)
             {
                 return Err(error);
@@ -559,8 +574,9 @@ pub fn set_enabled(path: &Path, enabled: bool) -> Result<()> {
     }
 }
 
-/// Moves an older Run-key registration to a logon task. A refusal of the Task Scheduler
-/// leaves the Run key working and is not retried at every start.
+/// Moves an older Run-key registration to a logon task. A refusal of the Task Scheduler or
+/// a Run key that cannot be removed leaves the Run key working alone, and is not retried at
+/// every start. An elevated КРОТ leaves the move to the user's own one.
 pub fn migrate(path: &Path) {
     #[cfg(windows)]
     {
@@ -571,18 +587,52 @@ pub fn migrate(path: &Path) {
         else {
             return;
         };
-        let owned = registry::value(&name)
-            .ok()
-            .flatten()
-            .is_some_and(|value| windows_owned(&value, &path));
-        if !owned || refused.exists() {
+        let value = registry::value(&name).ok().flatten();
+        let owned = value
+            .as_ref()
+            .is_some_and(|value| windows_owned(value, &path));
+        let elevated = crate::tasks::elevated();
+        // After installation autostart moves from a portable copy to the installed one.
+        if crate::service::installed() {
+            use crate::tasks::{Kind, copies, register, unregister_others, unregister_own};
+            // Only another copy's task moves: a task of this copy that the user turned off
+            // stays off. A task that cannot be moved is not retried at every start.
+            if !owned
+                && !elevated
+                && !refused.exists()
+                && copies(&path, Kind::Logon).is_ok_and(|(own, others)| !own && others)
+            {
+                // `register` removes the other copy's task where Windows lets it.
+                let registered = register(&path, Kind::Logon).is_ok();
+                if !registered || unregister_others(&path, Kind::Logon, false).is_err() {
+                    // Two tasks would start КРОТ twice at logon: the other copy's one stays.
+                    if registered {
+                        let _ = unregister_own(&path, Kind::Logon);
+                    }
+                    let _ = std::fs::write(&refused, b"");
+                }
+                return;
+            }
+            if owned
+                && (refused.exists() || elevated)
+                && let Ok(command) = launch_command(&path).map(|command| windows_command(&command))
+                && value.as_ref().is_some_and(|value| value.0 != command)
+            {
+                let _ = registry::set(&name, Some(&command));
+                return;
+            }
+        }
+        if !owned || refused.exists() || elevated {
             return;
         }
         if crate::tasks::register(&path, crate::tasks::Kind::Logon).is_ok() {
-            let _ = registry::set(&name, None);
-        } else {
-            let _ = std::fs::write(refused, b"");
+            if registry::set(&name, None).is_ok() {
+                return;
+            }
+            // Both would start КРОТ at logon: the task, just created, goes again.
+            let _ = crate::tasks::unregister(&path, crate::tasks::Kind::Logon, false);
         }
+        let _ = std::fs::write(refused, b"");
     }
     #[cfg(not(windows))]
     let _ = path;

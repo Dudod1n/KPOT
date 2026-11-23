@@ -34,7 +34,8 @@ class PackageTests(unittest.TestCase):
                 for name in ['krot', 'krot-cli']:
                     (source / (name + suffix)).write_bytes((runner + name).encode())
                 (source / 'THIRD_PARTY_NOTICES.txt').write_text(runner + ' licenses')
-            for name in ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt']:
+            for name in ['WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt',
+                         'krot-1.2.3-windows-x64.msi']:
                 (builds / 'krot-rust-Windows-X64' / name).write_bytes(name.encode())
             # Windows chmod does not set Unix executable permission bits.
             with patch.object(packager, 'ROOT', root), patch.object(Path, 'chmod', autospec=True) as chmod:
@@ -42,7 +43,8 @@ class PackageTests(unittest.TestCase):
             for name in ['krot-linux-x64', 'krot-cli-linux-x64']:
                 chmod.assert_any_call(output / name, 0o755)
             self.assertEqual(notes.read_text(), '### Fixed\n- Port cleanup.\n')
-            self.assertEqual(len(list(output.iterdir())), 13)
+            self.assertEqual(len(list(output.iterdir())), 14)
+            self.assertEqual((output / 'krot-1.2.3-windows-x64.msi').read_bytes(), b'krot-1.2.3-windows-x64.msi')
             self.assertEqual((output / 'WinDivert64.sys').read_bytes(), b'WinDivert64.sys')
             lines = (output / 'SHA256SUMS').read_text().splitlines()
             sums = dict(reversed(line.split('  ', 1)) for line in lines)
@@ -92,6 +94,18 @@ class PackageTests(unittest.TestCase):
                     with self.subTest(tag=tag), self.assertRaises(ValueError):
                         packager.package(tag, root / 'builds', root / 'output', root / 'notes')
                     self.assertFalse((root / 'output').exists())
+
+    def test_release_notes_start_with_the_summary_block_of_the_version(self):
+        entry = ('**Кратко:**\n\n- Установщик MSI.\n- Журнал диагностики.\n\n'
+                 '### Добавлено\n\n- Подробности.\n')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'CHANGELOG.md').write_text(
+                '# Changes\n\n## Не выпущено\n\n**Кратко:**\n\n- Будущее.\n\n'
+                '## 1.2.3 — 2026-12-01\n\n' + entry + '\n## 1.2.2\n\n**Кратко:**\n\n- Старое.\n',
+                encoding='utf-8')
+            with patch.object(packager, 'ROOT', root):
+                self.assertEqual(packager.release_notes('1.2.3'), entry)
 
 
 if __name__ == '__main__':

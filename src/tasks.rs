@@ -97,6 +97,26 @@ fn task_name(registration: &str, kind: Kind, executable: &str) -> String {
     format!("{}{}", prefix(registration, kind), &digest[..8])
 }
 
+/// A task of any configuration and kind that starts `executable`: the uninstaller removes
+/// those of the installed program and leaves the tasks of other copies.
+#[cfg(any(windows, test))]
+fn program_task(name: &str, executable: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("\\krot-") else {
+        return false;
+    };
+    let Some(digest) = rest.get(..16).filter(|digest| {
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) else {
+        return false;
+    };
+    [Kind::Logon, Kind::Divert].into_iter().any(|kind| {
+        task_name(&format!("krot-{digest}"), kind, executable).eq_ignore_ascii_case(name)
+    })
+}
+
 #[cfg(any(windows, test))]
 fn escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -190,7 +210,10 @@ fn listed_names(output: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-pub use system::{elevated, register, registered, run, runas, unregister, user_sid};
+pub use system::{
+    copies, elevated, register, registered, remove_program_tasks, run, runas, unregister,
+    unregister_others, unregister_own, user_sid,
+};
 
 /// Administrator rights exist only on Windows.
 #[cfg(not(windows))]
@@ -411,6 +434,24 @@ mod system {
         Ok(output.status.success() && !disabled(&output.stdout))
     }
 
+    /// Whether a task of this copy exists, enabled or not, and whether tasks of other copies do.
+    pub fn copies(config: &Path, kind: Kind) -> Result<(bool, bool)> {
+        let (prefix, name) = names(config, kind)?;
+        let listed = listed(&prefix)?;
+        let own = listed.iter().any(|task| task.eq_ignore_ascii_case(&name));
+        Ok((own, listed.len() > usize::from(own)))
+    }
+
+    /// Removes the task of this copy only.
+    pub fn unregister_own(config: &Path, kind: Kind) -> Result<()> {
+        let (_, name) = names(config, kind)?;
+        ensure!(
+            schtasks(&["/delete", "/tn", &name, "/f"])?.status.success(),
+            "Не удалось удалить задание планировщика Windows {name}."
+        );
+        Ok(())
+    }
+
     /// Registers the task for the current user and copy, replacing the tasks of other copies.
     /// `Divert` needs administrator rights: call it from an elevated process.
     pub fn register(config: &Path, kind: Kind) -> Result<()> {
@@ -443,8 +484,10 @@ mod system {
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
         file.write_all(&bytes)?;
         file.as_file().sync_all()?;
+        // `schtasks` cannot open a file that is still open for writing: close it and keep
+        // only the path, which removes the file when dropped.
+        let file = file.into_temp_path();
         let path = file
-            .path()
             .to_str()
             .context("Путь временного файла не является корректным Unicode.")?
             .to_owned();
@@ -456,24 +499,34 @@ mod system {
             );
         }
         // The task exists by now: failing to clear the tasks of other copies is no failure.
-        for stale in listed(&prefix).unwrap_or_default() {
-            if !stale.eq_ignore_ascii_case(&name) {
-                let _ = schtasks(&["/delete", "/tn", &stale, "/f"]);
-            }
-        }
+        let _ = remove(&prefix, Some(&name), false);
         Ok(())
     }
 
-    /// Removes the tasks of every copy; an elevated task may need administrator consent.
-    pub fn unregister(config: &Path, kind: Kind) -> Result<()> {
+    /// Removes the tasks of every copy. A task that an elevated process registered may refuse
+    /// the user's deletion: with `consent` Windows then asks for administrator rights. The
+    /// helper's task is always registered so, a logon task when an older КРОТ ran elevated.
+    pub fn unregister(config: &Path, kind: Kind, consent: bool) -> Result<()> {
         let (prefix, _) = names(config, kind)?;
-        for name in listed(&prefix)? {
-            if schtasks(&["/delete", "/tn", &name, "/f"])?.status.success() {
+        remove(&prefix, None, consent)
+    }
+
+    /// Removes the tasks of the other copies, which `register` leaves where they refuse.
+    pub fn unregister_others(config: &Path, kind: Kind, consent: bool) -> Result<()> {
+        let (prefix, name) = names(config, kind)?;
+        remove(&prefix, Some(&name), consent)
+    }
+
+    fn remove(prefix: &str, keep: Option<&str>, consent: bool) -> Result<()> {
+        for name in listed(prefix)? {
+            if keep.is_some_and(|keep| keep.eq_ignore_ascii_case(&name))
+                || schtasks(&["/delete", "/tn", &name, "/f"])?.status.success()
+            {
                 continue;
             }
             ensure!(
-                kind == Kind::Divert,
-                "Не удалось удалить задание автозапуска {name}."
+                consent,
+                "Не удалось удалить задание планировщика Windows {name}."
             );
             runas(
                 schtasks_path().as_os_str(),
@@ -482,6 +535,25 @@ mod system {
             )
             .context("Планировщик заданий Windows не удалил задание.")?;
         }
+        Ok(())
+    }
+
+    /// Removes the tasks of every configuration that start `executable`; for the uninstaller,
+    /// which runs with the rights to delete them all.
+    pub fn remove_program_tasks(executable: &str) -> Result<()> {
+        let mut failed = Vec::new();
+        for name in listed("\\krot-")? {
+            if program_task(&name, executable)
+                && !schtasks(&["/delete", "/tn", &name, "/f"])?.status.success()
+            {
+                failed.push(name);
+            }
+        }
+        ensure!(
+            failed.is_empty(),
+            "Не удалось удалить задания планировщика Windows: {}.",
+            failed.join(", ")
+        );
         Ok(())
     }
 
@@ -577,6 +649,22 @@ mod tests {
         set_remembering(&config, false).unwrap();
         set_remembering(&config, false).unwrap();
         assert!(!remembering(&config));
+    }
+
+    #[test]
+    fn the_uninstaller_finds_the_tasks_of_its_program_only() {
+        let program = "C:\\Program Files\\KROT\\krot.exe";
+        for kind in [Kind::Logon, Kind::Divert] {
+            let name = task_name("krot-0123456789abcdef", kind, program);
+            assert!(program_task(&name, program));
+            assert!(program_task(&name.to_uppercase(), &program.to_lowercase()));
+            assert!(!program_task(
+                &task_name("krot-0123456789abcdef", kind, "D:\\krot\\krot.exe"),
+                program
+            ));
+        }
+        assert!(!program_task("\\krot-xyz-logon-12345678", program));
+        assert!(!program_task("\\Microsoft\\krot", program));
     }
 
     #[test]

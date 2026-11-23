@@ -8,7 +8,7 @@ use crate::{
     autostart,
     background::{self, Client},
     config::{Store, default_config_path},
-    desktop, launcher,
+    desktop, journal, launcher,
 };
 
 #[derive(Parser)]
@@ -73,6 +73,22 @@ enum Command {
         #[arg(long)]
         tunnel: Option<String>,
     },
+    /// Показать путь файла журнала фонового процесса и помощника перехвата
+    Diagnostics,
+    /// Измерить скорость или стабильность работающего туннеля
+    Test {
+        /// ID или имя туннеля
+        tunnel: String,
+        /// Тест стабильности заданной длительности вместо теста скорости: 10m, 30m, 1h
+        #[arg(long, value_name = "ВРЕМЯ")]
+        stability: Option<String>,
+        /// Лимит объёма в каждую сторону, МБ (по умолчанию 100)
+        #[arg(long, value_name = "МБ")]
+        limit: Option<u64>,
+        /// Отчёт в JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Остановить фон и все туннели, сохранив выбор для следующего запуска
     Stop,
     /// Автозапуск после входа в учётную запись
@@ -96,6 +112,21 @@ enum Command {
     },
     #[command(hide = true)]
     ApplyUpdate { manifest: PathBuf },
+    /// Обновление установленной копии через установщик Windows
+    #[command(hide = true)]
+    ApplyPackage { manifest: PathBuf },
+    /// Служба перехвата установленного КРОТа; её запускает диспетчер служб Windows
+    #[command(hide = true)]
+    Service,
+    /// Помощник перехвата, которого запускает служба; задание приходит на стандартный ввод
+    #[command(hide = true)]
+    DivertService,
+    /// Очистка перед удалением установленного КРОТа; её запускает установщик
+    #[command(hide = true)]
+    UninstallCleanup,
+    /// Завершение КРОТа в каталоге установки перед заменой файлов; её запускает установщик
+    #[command(hide = true)]
+    InstallPrepare { directory: PathBuf },
 }
 
 #[cfg(windows)]
@@ -129,8 +160,39 @@ pub fn run() -> Result<()> {
             .enable_all()
             .build()?,
     );
+    // The service, its helper and the uninstaller run as LocalSystem: they never resolve a
+    // configuration path, which would lead into a user's profile.
+    match args.command {
+        Some(Command::Service) => {
+            #[cfg(windows)]
+            return crate::service::run();
+            #[cfg(not(windows))]
+            anyhow::bail!("Служба перехвата есть только в Windows.");
+        }
+        Some(Command::DivertService) => return crate::divert::run_assigned(),
+        Some(Command::UninstallCleanup) => {
+            #[cfg(windows)]
+            return crate::service::cleanup();
+            #[cfg(not(windows))]
+            anyhow::bail!("Установщик есть только в Windows.");
+        }
+        Some(Command::InstallPrepare { directory }) => {
+            #[cfg(windows)]
+            return crate::service::prepare_install(&directory);
+            #[cfg(not(windows))]
+            {
+                let _ = directory;
+                anyhow::bail!("Установщик есть только в Windows.");
+            }
+        }
+        _ => {}
+    }
     let gui = args.update_ready.is_none()
-        && (args.command.is_none() || matches!(args.command, Some(Command::ApplyUpdate { .. })));
+        && (args.command.is_none()
+            || matches!(
+                args.command,
+                Some(Command::ApplyUpdate { .. } | Command::ApplyPackage { .. })
+            ));
     let result = (|| {
         anyhow::ensure!(
             args.update_ready.is_none() || (args.command.is_none() && !args.reuse_running),
@@ -149,8 +211,35 @@ pub fn run() -> Result<()> {
             }
             Some(Command::Check) => { let config = store.load()?; println!("Конфигурация корректна. Туннелей: {}. SSH не запускается.",config.tunnels.len()); Ok(()) }
             Some(Command::Path) => { println!("{}",store.path.display()); Ok(()) }
-            Some(Command::Serve) => runtime.block_on(background::serve(store)),
+            Some(Command::Serve) => {
+                journal::init(journal::background_path(&store));
+                // The start is recorded by the process once it owns the configuration.
+                let result = runtime.block_on(background::serve(store));
+                journal::finished("Фоновый процесс", &result);
+                result
+            }
+            // The elevated helper writes no file: its events reach the background journal.
             Some(Command::Divert { remember }) => crate::divert::run(store, remember),
+            Some(Command::Diagnostics) => {
+                let path = journal::background_path(&store);
+                println!("Журнал фонового процесса и помощника перехвата: {}", path.display());
+                for part in [path.clone(), journal::rotated_path(&path)] {
+                    match std::fs::metadata(&part) {
+                        Ok(metadata) => println!("  {} — {} КиБ", part.display(), metadata.len().div_ceil(1024)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if part == path { println!("  ещё не создан"); }
+                        }
+                        Err(error) => println!("  {}: {error}", part.display()),
+                    }
+                }
+                println!("Пароли, парольные фразы и ключи в журнал не записываются, а имена и адреса серверов и ID туннелей записываются: удалите их перед публикацией, если они личные.");
+                Ok(())
+            }
+            Some(Command::Elevation { .. }) if crate::service::installed() => {
+                // The service gives the rights; the task and the choice belong to portable copies.
+                println!("Перехват без запроса прав: служба перехвата КРОТа установлена вместе с программой.");
+                Ok(())
+            }
             Some(Command::Elevation { action }) => {
                 use crate::tasks::{Kind, registered, remembering, set_remembering};
                 #[cfg(not(windows))]
@@ -166,19 +255,28 @@ pub fn run() -> Result<()> {
                         // The task goes first: if Windows refuses to delete it, remembering stays
                         // on and the status keeps telling that the task still gives the rights.
                         #[cfg(windows)]
-                        crate::tasks::unregister(&store.path, Kind::Divert)?;
+                        // A Task Scheduler that cannot be read has no task to remove.
+                        if let Err(error) = crate::tasks::unregister(&store.path, Kind::Divert, true)
+                            && registered(&store.path, Kind::Divert, true).unwrap_or(false)
+                        {
+                            return Err(error);
+                        }
                         set_remembering(&store.path, false)?;
                     }
                     _ => {}
                 }
-                let enabled = remembering(&store.path) && registered(&store.path, Kind::Divert, false)?;
+                // A Task Scheduler that cannot be read gives no rights either: the status is
+                // "off", not a failure of the command.
+                let enabled = remembering(&store.path) && registered(&store.path, Kind::Divert, false).unwrap_or(false);
                 println!("Перехват без запроса прав: {}.", if enabled {"включён"} else {"выключен"});
-                if !enabled && registered(&store.path, Kind::Divert, true)? {
+                if !enabled && registered(&store.path, Kind::Divert, true).unwrap_or(false) {
                     println!("Задание планировщика с правами администратора осталось. Удалите его: krot-cli elevation disable.");
                 }
                 Ok(())
             }
             Some(Command::ApplyUpdate { manifest }) => runtime.block_on(crate::update::apply_install(&manifest)),
+            Some(Command::ApplyPackage { manifest }) => runtime.block_on(crate::update::apply_package(&manifest)),
+            Some(Command::Service | Command::DivertService | Command::UninstallCleanup | Command::InstallPrepare { .. }) => unreachable!(),
             Some(Command::Autostart {action}) => {
                 if action != "status" { store.load()?; autostart::set_enabled(&store.path,action == "enable")?; }
                 println!("Автозапуск после входа: {}.",if autostart::is_enabled(&store.path)? {"включён"} else {"выключен"});
@@ -208,6 +306,9 @@ pub fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&crate::udp::report::metrics(&snapshot, tunnel.as_deref()))?);
                 Ok(())
             }),
+            Some(Command::Test { tunnel, stability, limit, json }) => {
+                runtime.block_on(crate::quality::cli::run(&store, &tunnel, stability, limit, json))
+            }
             Some(command @ (Command::Background | Command::Status | Command::Stop)) => runtime.block_on(async {
                 if !matches!(command,Command::Background) && !store.sidecar(".background.json").exists() { println!("Фоновый КРОТ не запущен."); return Ok(()); }
                 let client = if matches!(command,Command::Background) { background::ensure_running(&store).await? } else { Client::new(&store) };
@@ -280,6 +381,10 @@ mod tests {
             vec!["krot", "--skip-update-check"],
             vec!["krot", "--update-ready", "/tmp/ready.json"],
             vec!["krot", "apply-update", "/tmp/manifest.json"],
+            vec!["krot", "apply-package", "/tmp/package.json"],
+            vec!["krot", "service"],
+            vec!["krot", "divert-service"],
+            vec!["krot", "uninstall-cleanup"],
         ] {
             assert!(Args::try_parse_from(args).is_ok());
         }
@@ -288,5 +393,8 @@ mod tests {
         assert!(!help.contains("skip-update-check"));
         assert!(!help.contains("apply-update"));
         assert!(!help.contains("update-ready"));
+        for hidden in ["apply-package", "divert-service", "uninstall-cleanup"] {
+            assert!(!help.contains(hidden));
+        }
     }
 }

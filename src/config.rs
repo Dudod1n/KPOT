@@ -560,6 +560,19 @@ pub fn restrict_access(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub fn restrict_access(path: &Path) -> Result<()> {
+    protect(path, "")
+}
+
+/// Like [`restrict_access`], but LocalSystem and administrators may read the file: Windows
+/// Installer reads a package as LocalSystem, or as the administrator who confirmed it.
+#[cfg(windows)]
+pub fn restrict_access_for_installer(path: &Path) -> Result<()> {
+    protect(path, "(A;;FR;;;SY)(A;;FR;;;BA)")
+}
+
+/// Full access for the current user only, plus the `extra` access entries in SDDL.
+#[cfg(windows)]
+fn protect(path: &Path, extra: &str) -> Result<()> {
     use std::{
         ffi::c_void,
         os::windows::{
@@ -623,7 +636,7 @@ pub fn restrict_access(path: &Path) -> Result<()> {
             sid_length += 1;
         }
         let sid_string = String::from_utf16(std::slice::from_raw_parts(sid_text, sid_length))?;
-        let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_string})")
+        let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_string}){extra}")
             .encode_utf16()
             .chain(Some(0))
             .collect();
