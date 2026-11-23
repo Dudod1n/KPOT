@@ -34,6 +34,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --locked --bins
 python scripts/build_icons.py --check
+python scripts/build_mascot.py --check
 python -m unittest discover -s tests -p 'test_*.py' -v
 python scripts/check_rust.py -v
 ```
@@ -76,7 +77,7 @@ SSH и обращения к фоновому процессу выполняю�
 - Сохраняйте защиту паролей, проверку ключей узлов, атомарную запись и освобождение сетевых ресурсов.
 - Пользовательские изменения и исправления добавляйте в раздел «Не выпущено» (создайте его при необходимости) файла [CHANGELOG.md](CHANGELOG.md).
 
-Иконки воспроизводятся командой `python scripts/build_icons.py`. Если изменили генератор, обновите ресурсы в `assets` и выполните проверку с `--check`.
+Иконки воспроизводятся командой `python scripts/build_icons.py`, маскот для медиа в `assets/mascot` — командой `python scripts/build_mascot.py`; маскот берёт каску и очки из иконки. Если изменили генератор, обновите ресурсы и выполните проверку с `--check`.
 
 ## Лицензия
 
