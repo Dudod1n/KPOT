@@ -147,6 +147,40 @@
               Condition="NOT REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
+    <!--
+      Without a UI a double-clicked package shows only «Сбор информации» and closes, so
+      nobody sees whether КРОТ was installed or why it failed. This is WixUI_Minimal without
+      the license page (GPL needs no acceptance): welcome, progress, then the result.
+    -->
+    <UI Id="KrotUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="!(loc.Advanced_Font_FaceName)" Size="!(loc.Advanced_Font_Normal_Size)" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="!(loc.Advanced_Font_FaceName)" Size="!(loc.Advanced_Font_Bigger_Size)" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="!(loc.Advanced_Font_FaceName)" Size="!(loc.Advanced_Font_Title_Size)" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="1"
+               Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2"
+               Condition="Installed" />
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+    </UI>
+    <UIRef Id="WixUI_Common" />
+
     <Feature Id="Main" Title="КРОТ" Level="1">
       <ComponentGroupRef Id="Program" />
       <ComponentRef Id="StartMenu" />
