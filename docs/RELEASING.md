@@ -105,7 +105,7 @@ Workflow [Rust release](../.github/workflows/rust-release.yml) проверяе�
 
 В Windows задача CI также собирает установщик `krot-<версия>-windows-x64.msi` скриптом
 [build_msi.py](../scripts/build_msi.py) из [installer/krot.wxs](../installer/krot.wxs) (WiX Toolset 5.0.2,
-ставится через `dotnet tool`) и проверяет его скриптом [check_installer.py](../scripts/check_installer.py):
+ставится через `dotnet tool`, мастер установки — расширение `WixToolset.UI.wixext` той же версии) и проверяет его скриптом [check_installer.py](../scripts/check_installer.py):
 тихая установка, файлы и их права в Program Files, служба, перехват через службу,
 обновление до пакета старшей версии и удаление без остатков. Установщик входит в артефакт
 Windows и в релиз под этим именем: встроенное обновление установленной копии ищет его по

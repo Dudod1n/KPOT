@@ -23,6 +23,9 @@ class BuildMsiTests(unittest.TestCase):
         command = builder.command('wix', Path('bin'), Path('out.msi'), '0.7.2')
         self.assertEqual(command[:2], ['wix', 'build'])
         self.assertIn('Version=0.7.2', command)
+        # Without the UI extension a double-clicked package shows no wizard.
+        self.assertIn(builder.UI_EXTENSION, command)
+        self.assertIn('ru-RU', command)
         self.assertEqual(builder.package_name('0.7.2'), 'krot-0.7.2-windows-x64.msi')
         # src/update.rs looks the package up by the same name.
         update = (ROOT / 'src/update.rs').read_text(encoding='utf-8')
@@ -36,6 +39,7 @@ class BuildMsiTests(unittest.TestCase):
         self.assertIn('Account="LocalSystem"', source)
         self.assertIn('Arguments="service"', source)
         self.assertIn('ExeCommand="uninstall-cleanup"', source)
+        self.assertIn('<UIRef Id="WixUI_Common" />', source)
         service = (ROOT / 'src/service.rs').read_text(encoding='utf-8')
         self.assertTrue(re.search(r'pub const NAME: &str = "KrotDivert";', service))
 

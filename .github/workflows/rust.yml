@@ -148,6 +148,7 @@ jobs:
         shell: bash
         run: |
           dotnet tool install --tool-path "$RUNNER_TEMP/wix" wix --version 5.0.2
+          "$RUNNER_TEMP/wix/wix.exe" extension add -g WixToolset.UI.wixext/5.0.2
           python scripts/build_msi.py --binaries target/release --wix "$RUNNER_TEMP/wix/wix.exe"
           # The same binaries under a higher version, only to check an upgrade below.
           python scripts/build_msi.py --binaries target/release --wix "$RUNNER_TEMP/wix/wix.exe" \
